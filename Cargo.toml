@@ -1,0 +1,26 @@
+[package]
+name = "mind-the-gap"
+version = "0.1.0"
+authors = ["Florian Franzen <florian@gli.al"]
+edition = "2018"
+
+[dependencies]
+anyhow = "1.0"
+clap = "2.33"
+
+chrono = "0.4"
+humantime = "2.1"
+
+zeroize = "1.1"
+
+# Mnemonic module
+tiny-bip39 = "0.8"
+
+sha2 = "0.8"
+hmac = "0.7.1"
+pbkdf2 = { version = "0.3", default-features = false }
+
+blake2-rfc = "0.2.18"
+
+# OpenPGP module
+sequoia-openpgp = "1.3"
