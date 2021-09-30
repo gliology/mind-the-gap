@@ -1,5 +1,7 @@
 # Mind the Gap
 
+DISCLAIMER: THIS IS WIP! DERIVATION PATHS WILL CHANGE AGAIN WITH ADDITION OF PIV SUPPORT WHICH WILL BREAK COMPATIBLITY BETWEEN VERSIONS.
+
 This repository contains the following:
 
 - command line utility to generate OpenPGP keys from mnemonic phrases
