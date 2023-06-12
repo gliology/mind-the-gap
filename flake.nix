@@ -34,9 +34,11 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
       in pkgs.mkShell {
-        nativeBuildInputs = with pkgs; [ cargo pkg-config clang ];
+        nativeBuildInputs = with pkgs; [ cargo rustc rust-analyzer rustfmt pkg-config clang ];
 
-        buildInputs = [ pkgs.nettle ];
+        buildInputs = with pkgs; [ nettle pcsclite ];
+
+        RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
 
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
       }
@@ -70,7 +72,7 @@
           src = ./.;
 
           nativeBuildInputs = with pkgs; [ pkg-config clang ];
-          buildInputs = [ pkgs.nettle ];
+          buildInputs = with pkgs; [ nettle pcsclite ];
 
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         });
