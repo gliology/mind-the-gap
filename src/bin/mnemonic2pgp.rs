@@ -109,6 +109,12 @@ fn main() -> Result<(), String> {
              .validator(is_valid_duration)
              .help("Validity duration of the subkeys"))
 
+        .arg(Arg::with_name("output-card")
+             .long("output-card")
+             .value_name("ON|OFF|SERIAL")
+             .number_of_values(1)
+             .default_value("on")
+             .help("If and to which smartcard to export the secret keys"))
         .arg(Arg::with_name("output-password")
              .long("output-password")
              .value_name("PASSWORD")
@@ -161,6 +167,10 @@ fn main() -> Result<(), String> {
 
     // Parse output password
     let output_password = matches.value_of("output-password");
+
+    // Parse output smartcard
+    let output_card = matches.value_of("output-card").
+        expect("Default value provided");
 
     // Parse output paths
     let output_public = matches.value_of("output-public")
@@ -235,8 +245,26 @@ fn main() -> Result<(), String> {
         builder = builder.with_password(password);
     }
 
+    // Apply smartcard filter
+    let card_target = match output_card {
+        "on" => Some("auto"),
+        "ON" => Some("auto"),
+        "off" => None,
+        "OFF" => None,
+        value => Some(value),
+    };
+    builder = builder.to_smartcard(card_target);
+
     println!();
 
+    if let Some(serial) = card_target {
+        println!("-> Exporting secret key to smartcard: {}", serial);
+    } else {
+        println!("-> Exporting secret key to file: {}", output_secret);
+    }
+
+    // This row is intentionally left blank.
+    println!();
 
     // Generate and safe result
     let (cert, rev) = builder.generate().map_err_to_string()?;
@@ -247,10 +275,12 @@ fn main() -> Result<(), String> {
               cert.armored().to_vec().map_err_to_string()?
     ).map_err_to_string()?;
 
-    println!("- Saving secret key file: {}", output_secret);
-    fs::write(output_secret,
+    if card_target.is_none() {
+        println!("- Saving secret key file: {}", output_secret);
+        fs::write(output_secret,
               cert.as_tsk().armored().to_vec().map_err_to_string()?
-    ).map_err_to_string()?;
+        ).map_err_to_string()?;
+    }
 
     // TODO: Armor revocation certificate
     println!("- Saving revocation certificate: {}", output_revcert);

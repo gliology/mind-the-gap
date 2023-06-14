@@ -8,7 +8,7 @@ use zeroize::Zeroize;
 use sequoia_openpgp as openpgp;
 use openpgp::{
     Packet,
-    Result,
+    Result as PGPResult,
 };
 use openpgp::cert::{
     Cert,
@@ -22,6 +22,7 @@ use openpgp::packet::{
 };
 use openpgp::packet::key::Key4;
 use openpgp::packet::signature::SignatureBuilder;
+use openpgp::policy::StandardPolicy;
 use openpgp::types::{
     Features,
     HashAlgorithm,
@@ -31,11 +32,22 @@ use openpgp::types::{
     ReasonForRevocation,
 };
 
+
+use openpgp_card_sequoia::{sq_util, Card};
+use openpgp_card_sequoia::state::Open;
+use openpgp_card_sequoia::types::{
+    Error as CardError,
+    KeyType,
+};
+
+use openpgp_card_pcsc::PcscBackend;
+
+
 type SecretPrimaryKey = Key<key::SecretParts, key::PrimaryRole>;
 type SecretSubKey = Key<key::SecretParts, key::SubordinateRole>;
 
 /// Helper to create primary key-based signature builder including metadata.
-fn new_primary_sbuilder(stype: SignatureType, ctime: SystemTime) -> Result<SignatureBuilder>
+fn new_primary_sbuilder(stype: SignatureType, ctime: SystemTime) -> PGPResult<SignatureBuilder>
 {
     SignatureBuilder::new(stype)
         .set_features(Features::sequoia())?
@@ -75,6 +87,9 @@ pub struct SeededEd25519Cert<S: Seed256> {
 
     /// List of user ids to include in cert
     userids: Vec<packet::UserID>,
+
+    /// Smartcard serial to which to export (or auto)
+    card_target: Option<String>,
 }
 
 impl<S: Seed256> SeededEd25519Cert<S> {
@@ -87,7 +102,8 @@ impl<S: Seed256> SeededEd25519Cert<S> {
             creation_time: None,
             subkey_creation_time: None,
             subkey_validity: None,
-            userids: vec![]
+            userids: vec![],
+            card_target: None,
         }
     }
 
@@ -121,8 +137,15 @@ impl<S: Seed256> SeededEd25519Cert<S> {
         self
     }
 
+    /// Set serial of smartcard to which to export
+    pub fn to_smartcard(mut self, target: Option<&str>) -> Self {
+        self.card_target = target.map(ToString::to_string);
+        self
+    }
+
     /// Generate certificate and revocation signature
-    pub fn generate(self) -> Result<(Cert, Packet)> {
+    pub fn generate(self) -> PGPResult<(Cert, Packet)> {
+
         // Determine creation time
         let creation_time = self.creation_time.unwrap_or(
             SystemTime::UNIX_EPOCH + Duration::from_secs(1)
@@ -142,7 +165,7 @@ impl<S: Seed256> SeededEd25519Cert<S> {
         let mut cert = Cert::try_from(vec![
             Packet::SecretKey({
                 let mut primary = primary.clone();
-                if let Some(ref password) = self.password {
+                if let Some(ref password) = self.password.as_ref() {
                     primary.secret_mut().encrypt_in_place(password)?;
                 }
                 primary
@@ -214,7 +237,7 @@ impl<S: Seed256> SeededEd25519Cert<S> {
             let signature = subkey.bind(&mut signer, &cert, builder)?;
 
             // Apply password protection
-            if let Some(ref password) = self.password {
+            if let Some(ref password) = self.password.as_ref() {
                 subkey.secret_mut().encrypt_in_place(password)?;
             }
 
@@ -228,6 +251,61 @@ impl<S: Seed256> SeededEd25519Cert<S> {
             .set_signature_creation_time(creation_time)?
             .set_reason_for_revocation(ReasonForRevocation::Unspecified, b"Unspecified")?
             .build(&mut signer, &cert, None)?.into();
+
+
+        // Only export to smartcard if targetted
+        if let Some(ref target) = self.card_target {
+
+            // Determine if smartcard is available
+            let mut card: Card<Open> = match &target[..] {
+                "auto" => {
+                    let mut cards = PcscBackend::cards(None)?;
+
+                    if cards.len() == 1 {
+                        cards.pop().unwrap().into()
+                    } else if cards.is_empty() {
+                        Err(CardError::InternalError(
+                            "No card detected, please insert card".to_string()
+                        ))?
+                    } else {
+                        Err(CardError::InternalError(format!(
+                            "Multiple cards ({}) detected, please specify card by serial",
+                            cards.len()
+                        )))?
+                    }
+                },
+                serial => {
+                    let backend = PcscBackend::open_by_ident(serial, None)?;
+                    backend.into()
+                },
+            };
+
+            // Establish connection and receive metadata
+            let mut transaction = card.transaction()?;
+            println!("Connecting to smartcard '{}'", transaction.application_identifier()?.ident());
+
+            // Authenticate TODO: Try provided pass too
+            transaction.verify_admin(b"12345678")?;
+            let mut admin = transaction.admin_card().expect("This should not fail");
+
+            // TODO: Set new admin and user pin
+            //admin.reset_user_pin();
+
+            // TODO: Set owner and pin policy
+            //admin.set_name();
+            admin.set_lang(&[['e', 'n'].into()])?;
+            //admin.set_uif();
+
+            // Upload keys to smartcard
+            let p = &StandardPolicy::new();
+            for kt in &[KeyType::Signing, KeyType::Decryption, KeyType::Authentication] {
+                if let Some(vka) = sq_util::subkey_by_type(&cert, p, *kt)? {
+                    println!("- Uploading {:?} key: {}", *kt, vka.key());
+                    admin.upload_key(vka, *kt, None)?;
+                }
+            }
+            println!();
+        }
 
         Ok((cert, revocation))
     }

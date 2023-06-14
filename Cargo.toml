@@ -23,4 +23,9 @@ pbkdf2 = { version = "0.3", default-features = false }
 blake2-rfc = "0.2.18"
 
 # OpenPGP module
-sequoia-openpgp = "1.3"
+sequoia-openpgp = "1.16"
+openpgp-card-sequoia = "0.1"
+openpgp-card-pcsc = "0.3"
+
+# Yubikey PIV module
+yubikey = { version = "0.7", features = [ "untested" ] }
