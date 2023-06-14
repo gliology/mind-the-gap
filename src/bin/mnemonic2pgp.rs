@@ -80,14 +80,21 @@ fn main() -> Result<(), String> {
              .number_of_values(1)
              .help("Password to protect subkey mnemonic"))
 
-         .arg(Arg::with_name("userids")
-            .short("i")
-            .long("id")
-            .value_name("USERID")
+        .arg(Arg::with_name("name")
+            .short("n")
+            .long("name")
+            .value_name("FIRST M. LAST")
+            .number_of_values(1)
+            .required(true)
+            .help("Name to use on the cert and smartcard"))
+          .arg(Arg::with_name("email")
+            .short("m")
+            .long("email")
+            .value_name("FIRST.LAST@DOMAIN.COM")
             .number_of_values(1)
             .required(true)
             .multiple(true)
-            .help("User id to add to cert, allows multiple"))
+            .help("Email addresses to add to cert, allows multiple"))
        .arg(Arg::with_name("date")
              .short("d")
              .long("date")
@@ -151,7 +158,8 @@ fn main() -> Result<(), String> {
 
 
     // Parse user identifier
-    let userids = matches.values_of("userids").expect("Required argument");
+    let name = matches.value_of("name").expect("Required argument");
+    let emails = matches.values_of("email").expect("Required argument");
 
     // Parse creation dates
     let date = matches.value_of("date")
@@ -213,8 +221,8 @@ fn main() -> Result<(), String> {
 
 
     // Prepare openpgp cert
-    println!("Generating OpenPGP Ed25519/Cv25519 certificate...");
-    let mut builder = SeededEd25519Cert::new(seed, subseed);
+    println!("Generating OpenPGP Ed/Cv25519 certificate for '{}' ...", name);
+    let mut builder = SeededEd25519Cert::new(seed, name, subseed);
 
     // Set creation date
     if let Some(date) = date {
@@ -234,9 +242,9 @@ fn main() -> Result<(), String> {
     }
 
     // Add user identities
-    for id in userids.into_iter() {
-        println!("- Adding user identifier: {}", id);
-        builder = builder.add_userid(id);
+    for address in emails.into_iter() {
+        println!("- Adding email identifier: {}", address);
+        builder = builder.add_email(address);
     }
 
     // Apply password to cert

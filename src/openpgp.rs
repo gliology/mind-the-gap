@@ -19,6 +19,7 @@ use openpgp::packet::{
     self,
     key,
     Key,
+    UserID,
 };
 use openpgp::packet::key::Key4;
 use openpgp::packet::signature::SignatureBuilder;
@@ -70,6 +71,9 @@ pub struct SeededEd25519Cert<S: Seed256> {
     /// Seed used for primary key
     seed: S,
 
+    /// Name of the owner of the cert
+    name: String,
+
     /// Seed used for subkeys
     subseed: S,
 
@@ -94,9 +98,10 @@ pub struct SeededEd25519Cert<S: Seed256> {
 
 impl<S: Seed256> SeededEd25519Cert<S> {
 
-    pub fn new(seed: S, subseed: S) -> Self {
+    pub fn new(seed: S, name: &str, subseed: S) -> Self {
         SeededEd25519Cert {
             seed,
+            name: name.to_string(),
             subseed,
             password: None,
             creation_time: None,
@@ -132,8 +137,9 @@ impl<S: Seed256> SeededEd25519Cert<S> {
     }
 
     /// Add userid to certificate
-    pub fn add_userid(mut self, id: &str) -> Self {
-        self.userids.push(id.into());
+    pub fn add_email(mut self, email: &str) -> Self {
+        let userid = UserID::from_address(Some(&self.name[..]), None, email).unwrap();
+        self.userids.push(userid);
         self
     }
 
@@ -292,7 +298,7 @@ impl<S: Seed256> SeededEd25519Cert<S> {
             //admin.reset_user_pin();
 
             // TODO: Set owner and pin policy
-            //admin.set_name();
+            admin.set_name(&self.name)?;
             admin.set_lang(&[['e', 'n'].into()])?;
             //admin.set_uif();
 
