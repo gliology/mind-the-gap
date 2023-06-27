@@ -1,28 +1,26 @@
-use crate::{SEED256_DERIVATION_ID, Seed256};
+use crate::seed::{argon2id_256, Seed256, Seed256Derive};
 
 use anyhow::Error;
 
 use bip39::{Language, Mnemonic, MnemonicType};
 
-use sha2::Sha256;
-use hmac::Hmac;
-use pbkdf2::pbkdf2;
-
-use zeroize::Zeroize;
-
-/// Simple helper to generate a fixed length blake2b output
-fn blake2b_256(input: &[u8]) -> [u8; 32] {
-    let mut res = [0u8; 32];
-    res.copy_from_slice(blake2_rfc::blake2b::blake2b(32, &[], input).as_bytes());
-    res
-}
+// FIXME: use zeroize::{Zeroize, Zeroizig};
 
 /// Simple wrapper to add password and derivation support to mnemonics
-#[derive(Zeroize)]
-#[zeroize(drop)]
+//#[derive(Zeroize)]
+//#[zeroize(drop)]
+#[derive(Clone)]
 pub struct MnemonicSeed {
     mnemonic: Mnemonic,
     password: String,
+    source: MnemonicSource,
+}
+
+///Enum to track source of mnemonic seed
+#[derive(Copy, Clone)]
+pub enum MnemonicSource {
+    Random,
+    Phrase,
 }
 
 impl MnemonicSeed {
@@ -31,6 +29,7 @@ impl MnemonicSeed {
         MnemonicSeed {
             mnemonic: Mnemonic::new(MnemonicType::Words24, Language::English),
             password: String::new(),
+            source: MnemonicSource::Random,
         }
     }
 
@@ -39,6 +38,7 @@ impl MnemonicSeed {
         Ok(MnemonicSeed {
             mnemonic: Mnemonic::from_phrase(phrase, Language::English)?,
             password: String::new(),
+            source: MnemonicSource::Phrase,
         })
     }
 
@@ -52,30 +52,18 @@ impl MnemonicSeed {
     pub fn phrase(&self) -> String {
         String::from(self.mnemonic.phrase())
     }
-}
 
-impl Seed256 for MnemonicSeed {
     /// Process and return seed
-    fn seed(&self, path: Option<&str>) -> [u8; 32] {
-        // Run seed through pbkdf2 and optionally apply password
-        let mut salt = String::with_capacity(8 + self.password.len());
-        salt.push_str("mnemonic");
-        salt.push_str(&self.password);
+    pub fn seed(&self) -> Seed256 {
+        argon2id_256(self.mnemonic.entropy(), Some(self.password.as_bytes()))
+    }
 
-        let mut seed = [0u8; 32];
-        pbkdf2::<Hmac<Sha256>>(self.mnemonic.entropy(), salt.as_bytes(), 2048, &mut seed);
+    /// Process, derive and return seed
+    pub fn derive(&self, path: Option<&[u8]>) -> Seed256 {
+        self.seed().derive(path)
+    }
 
-        salt.zeroize();
-
-        // Apply optional hard derivation
-        if let Some(path) = path {
-            blake2b_256(&[
-                SEED256_DERIVATION_ID,
-                &seed,
-                &blake2b_256(path.as_bytes())
-            ].concat())
-        } else {
-            seed
-        }
+    pub fn source(&self) ->MnemonicSource {
+        self.source
     }
 }

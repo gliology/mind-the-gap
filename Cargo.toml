@@ -1,31 +1,43 @@
 [package]
 name = "mind-the-gap"
-version = "0.1.0"
+description = "Derive smart card keys and certs from mnemonic seeds"
+version = "0.2.0"
 authors = ["Florian Franzen <florian@gli.al"]
 edition = "2021"
+#build = "build.rs"
 
 [dependencies]
-anyhow = "1.0"
-clap = "2.33"
+# Command line interface
+clap = { version = "4.3", features = [ "cargo", "env" ]}
+env_logger = "0.10"
 
+# Error handling
+anyhow = "1.0"
+
+# To parse dates and times
 chrono = "0.4"
 humantime = "2.1"
 
+# Clear sensitive data
 zeroize = "1.1"
+rand_core = "0.6"
 
-# Mnemonic module
+# Mnemonic handling
 tiny-bip39 = "0.8"
 
-sha2 = "0.8"
-hmac = "0.7.1"
-pbkdf2 = { version = "0.3", default-features = false }
+# Key Derivation
+argon2 = "0.5"
+base64 = "0.21"
 
-blake2-rfc = "0.2.18"
-
-# OpenPGP module
+# OpenPGP and Smartcard modules
 sequoia-openpgp = "1.16"
+openpgp-card = "0.3"
 openpgp-card-sequoia = "0.1"
 openpgp-card-pcsc = "0.3"
 
 # Yubikey PIV module
-yubikey = { version = "0.7", features = [ "untested" ] }
+yubikey = { git = "https://github.com/iqlusioninc/yubikey.rs.git", features = [ "untested" ] }
+x509 = "0.2"
+x509-cert = "0.2"
+der = "0.7"
+sha2 = "0.10"
