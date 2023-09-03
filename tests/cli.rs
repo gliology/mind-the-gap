@@ -1,4 +1,4 @@
-use mind_the_gap::cli::cmd;
+use mind_the_gap::cli::command;
 
 #[cfg(test)]
 mod cli {
@@ -6,6 +6,6 @@ mod cli {
 
     #[test]
     fn cmd_debub_assert() {
-        cmd().debug_assert()
+        command().debug_assert()
     }
 }

@@ -1,49 +1,80 @@
-use crate::seed::{base64_encode, Seed256, Seed256Derive};
+use crate::seed::{Seed256, Seed256Derive};
 
 use std::convert::TryFrom;
 use std::time::{Duration, SystemTime};
 
-use anyhow::anyhow;
+use anyhow::{bail, Result};
 
 use zeroize::{Zeroize, Zeroizing};
 
+use sequoia_openpgp as openpgp;
+use openpgp::{Packet, Result as PGPResult};
 use openpgp::cert::{Cert, CertRevocationBuilder};
 use openpgp::crypto::Password;
+use openpgp::packet::{self, key, Key, UserID};
 use openpgp::packet::key::Key4;
 use openpgp::packet::signature::SignatureBuilder;
-use openpgp::packet::{self, key, Key, UserID};
 use openpgp::policy::StandardPolicy;
 use openpgp::types::{
     Features, HashAlgorithm, KeyFlags, ReasonForRevocation, SignatureType, SymmetricAlgorithm,
 };
-use openpgp::{Packet, Result as PGPResult};
-use sequoia_openpgp as openpgp;
 
-use openpgp_card_sequoia::state::Open;
-use openpgp_card_sequoia::types::{Error as CardError, KeyType, TouchPolicy};
-use openpgp_card_sequoia::{sq_util, Card};
-
+use openpgp_card::{Error as CardError, SmartcardError};
 use openpgp_card_pcsc::PcscBackend;
 
+use openpgp_card_sequoia::sq_util;
+use openpgp_card_sequoia::state::Open;
+use openpgp_card_sequoia::types::{KeyType, TouchPolicy};
+use openpgp_card_sequoia::Card;
+
+// Some use type shorthands
 type SecretPrimaryKey = Key<key::SecretParts, key::PrimaryRole>;
 type SecretSubKey = Key<key::SecretParts, key::SubordinateRole>;
 
-///Subkeys to export
-pub const DEFAULT_KEY_TYPES: [KeyType; 3] = [KeyType::Signing, KeyType::Decryption, KeyType::Authentication];
+/// Subkeys to export
+pub const DEFAULT_KEY_TYPES: [KeyType; 3] = [
+    KeyType::Signing,
+    KeyType::Decryption,
+    KeyType::Authentication,
+];
 
-/// Helper to create primary key-based signature builder including metadata.
-fn new_primary_sbuilder(stype: SignatureType, ctime: SystemTime) -> PGPResult<SignatureBuilder> {
-    SignatureBuilder::new(stype)
-        .set_features(Features::sequoia())?
-        .set_hash_algo(HashAlgorithm::SHA512)
-        .set_key_flags(KeyFlags::empty().set_certification())?
-        .set_key_validity_period(None)?
-        .set_preferred_hash_algorithms(vec![HashAlgorithm::SHA512, HashAlgorithm::SHA256])?
-        .set_preferred_symmetric_algorithms(vec![
-            SymmetricAlgorithm::AES256,
-            SymmetricAlgorithm::AES128,
-        ])?
-        .set_signature_creation_time(ctime)
+/// Print list of currently available OpenPGP cards
+pub fn status() -> Result<()> {
+    println!("Available OpenPGP cards:");
+
+    let cards = match PcscBackend::cards(None) {
+        // Ignore missing reader and return empty list instead
+        Err(CardError::Smartcard(SmartcardError::NoReaderFoundError)) => {
+            Ok(Vec::<PcscBackend>::new())
+        }
+        other => other,
+    }?;
+
+    if cards.is_empty() {
+        println!(" - None");
+        println!();
+    }
+
+    for backend in cards {
+        let mut card: Card<Open> = backend.into();
+        let mut transaction = card.transaction()?;
+
+        println!(" - Card {}", transaction.application_identifier()?.ident(),);
+
+        if let Some(name) = transaction.cardholder_name()? {
+            println!("   Cardholder: {}", name);
+        }
+
+        for kt in DEFAULT_KEY_TYPES {
+            if let Some(sign) = transaction.public_key(kt)? {
+                println!("   {:?} key: {}", kt, sign.fingerprint());
+            }
+        }
+
+        println!();
+    }
+
+    Ok(())
 }
 
 /// Config to create an ed25519/cv25519 user cert
@@ -51,8 +82,8 @@ pub struct SeededSmartcard {
     /// Seed used for primary key
     seed: Seed256,
 
-    /// Identifier of the subkey set to generate
-    subkey: Option<Zeroizing<String>>,
+    /// Seed used for all subkeys
+    subseed: Seed256,
 
     /// Name of the owner of the cert
     name: String,
@@ -71,23 +102,27 @@ pub struct SeededSmartcard {
 
     /// List of user ids to include in cert
     userids: Vec<packet::UserID>,
-
-    /// Smartcard serial to which to export (or auto)
-    card_target: Option<String>,
 }
 
 impl SeededSmartcard {
+    /// Initialize an new seeded smartcard config
     pub fn new(seed: Seed256, subkey: Option<Zeroizing<String>>, name: String) -> Self {
+        // Derive application specific root seed
+        let root = seed.derive(Some(b"openpgp"));
+
+        // Derive seed for primary and subkeys
+        let seed = root.derive(Some(&[0x01]));
+        let subseed = root.derive(subkey.as_ref().map(|k| k.as_bytes()));
+
         SeededSmartcard {
             seed,
-            subkey,
+            subseed,
             name,
             pin: None,
             creation_time: None,
             subkey_creation_time: None,
             subkey_validity: None,
             userids: vec![],
-            card_target: None,
         }
     }
 
@@ -122,14 +157,74 @@ impl SeededSmartcard {
         self
     }
 
-    /// Set serial of smartcard to which to export
-    pub fn to_smartcard(mut self, target: Option<&str>) -> Self {
-        self.card_target = target.map(ToString::to_string);
-        self
+    // PUBLIC OUTPUT API
+
+    /// Check smartcard access and export
+    pub fn check(&self, target: Option<String>) -> Result<()> {
+        todo!()
     }
 
-    /// Generate certificate and revocation signature
-    pub fn generate(self) -> PGPResult<(Cert, Packet)> {
+    /// Certify subkeys or external keys
+    pub fn certify(&self, other: Option<Cert>) -> Result<Cert> {
+        if let Some(cert) = other {
+            self.primsign_cert(cert)
+        } else {
+            let cert = self.generate_primcert()?;
+
+            // FIXME: Only add signatures here
+            self.append_subcerts(cert)
+        }
+    }
+
+    /// Upload secret subkeys
+    pub fn upload(&self, target: Option<String>) -> Result<Cert> {
+        let mut cert = self.generate_primcert()?;
+
+        cert = self.append_subcerts(cert)?;
+
+        self.upload_subkeys(&cert, target)?;
+
+        Ok(cert)
+    }
+
+    /// Export all secret keys
+    pub fn export(&self) -> Result<Cert> {
+        let cert = self.generate_primcert()?;
+
+        self.append_subcerts(cert)
+    }
+
+    /// Generate and sign revoaction certificate
+    pub fn revoke(&self) -> Result<Packet> {
+        let mut cert = self.generate_primcert()?;
+
+        self.generate_revcert(&mut cert)
+    }
+
+    // INTERNAL API
+
+    /// Helper to create primary key-based signature builder including metadata.
+    fn new_primary_sbuilder(&self, stype: SignatureType) -> PGPResult<SignatureBuilder> {
+        // Determine creation time
+        let creation_time = self
+            .creation_time
+            .unwrap_or(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+
+        SignatureBuilder::new(stype)
+            .set_features(Features::sequoia())?
+            .set_hash_algo(HashAlgorithm::SHA512)
+            //.set_key_flags(KeyFlags::empty().set_certification())?
+            .set_key_validity_period(None)?
+            .set_preferred_hash_algorithms(vec![HashAlgorithm::SHA512, HashAlgorithm::SHA256])?
+            .set_preferred_symmetric_algorithms(vec![
+                SymmetricAlgorithm::AES256,
+                SymmetricAlgorithm::AES128,
+            ])?
+            .set_signature_creation_time(creation_time)
+    }
+
+    /// Sign a certificate with our primary key
+    fn primsign_cert(&self, mut cert: Cert) -> PGPResult<Cert> {
         // Determine creation time
         let creation_time = self
             .creation_time
@@ -137,14 +232,48 @@ impl SeededSmartcard {
 
         // Generate and self-sign primary key.
         let primary: SecretPrimaryKey =
-            Key4::import_secret_ed25519(&self.seed.derive(Some(&[0x01])), creation_time)?.into();
-
-        let sig = new_primary_sbuilder(SignatureType::DirectKey, creation_time)?;
+            Key4::import_secret_ed25519(&self.seed, creation_time)?.into();
 
         let mut signer = primary
             .clone()
             .into_keypair()
             .expect("key generated above has a secret");
+
+        let policy = &StandardPolicy::new();
+        let cc = cert.clone();
+        let vc = cc.with_policy(policy, None)?;
+
+        for ref uid in vc.userids() {
+            log::info!("Signing userid '{}'", uid.userid());
+
+            let sig = self.new_primary_sbuilder(SignatureType::GenericCertification)?;
+
+            let signature = uid.userid().bind(&mut signer, &cert, sig)?;
+
+            // FIXME: Currently does not end up in export
+            cert = cert.insert_packets(signature.clone())?;
+        }
+
+        Ok(cert)
+    }
+
+    /// Generate primary certificate
+    fn generate_primcert(&self) -> PGPResult<Cert> {
+        // Determine creation time
+        let creation_time = self
+            .creation_time
+            .unwrap_or(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+
+        // Generate and self-sign primary key.
+        let primary: SecretPrimaryKey =
+            Key4::import_secret_ed25519(&self.seed, creation_time)?.into();
+
+        let mut signer = primary
+            .clone()
+            .into_keypair()
+            .expect("key generated above has a secret");
+
+        let sig = self.new_primary_sbuilder(SignatureType::DirectKey)?;
         let sig = sig.sign_direct_key(&mut signer, primary.parts_as_public())?;
 
         let mut cert = Cert::try_from(vec![
@@ -159,17 +288,35 @@ impl SeededSmartcard {
         ])?;
 
         // Sign and add user ids
-        for (i, uid) in self.userids.into_iter().enumerate() {
-            let mut sig =
-                new_primary_sbuilder(SignatureType::PositiveCertification, creation_time)?;
+        for (i, uid) in self.userids.iter().enumerate() {
+            let mut sig = self.new_primary_sbuilder(SignatureType::PositiveCertification)?;
 
             if i == 0 {
                 sig = sig.set_primary_userid(true)?;
             }
 
             let signature = uid.bind(&mut signer, &cert, sig)?;
-            cert = cert.insert_packets(vec![Packet::from(uid), signature.into()])?;
+            cert = cert.insert_packets(vec![Packet::from(uid.clone()), signature.into()])?;
         }
+
+        Ok(cert)
+    }
+
+    /// Append subkeys to a primary certificate
+    fn append_subcerts(&self, mut cert: Cert) -> PGPResult<Cert> {
+        // Determine creation time
+        let creation_time = self
+            .creation_time
+            .unwrap_or(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+
+        // Generate and self-sign primary key.
+        let primary: SecretPrimaryKey =
+            Key4::import_secret_ed25519(&self.seed, creation_time)?.into();
+
+        let mut signer = primary
+            .clone()
+            .into_keypair()
+            .expect("key generated above has a secret");
 
         // Create and sign subkeys
         let subkey_creation_time = self.subkey_creation_time.unwrap_or(creation_time);
@@ -185,11 +332,9 @@ impl SeededSmartcard {
             (KeyFlags::empty().set_authentication(), 0x20),
         ];
 
-        let mut subseed = self.seed.derive(self.subkey.as_ref().map(|k| k.as_bytes()));
-
         for (flags, code) in subkeys.iter() {
             // Derive subkey specific seed and turn into key
-            let mut seed = subseed.derive(Some(&code.to_le_bytes()));
+            let mut seed = self.subseed.derive(Some(&code.to_le_bytes()));
 
             let mut subkey: SecretSubKey =
                 if flags.for_transport_encryption() || flags.for_storage_encryption() {
@@ -236,91 +381,109 @@ impl SeededSmartcard {
             cert = cert.insert_packets(vec![Packet::SecretSubkey(subkey), signature.into()])?;
         }
 
-        subseed.zeroize();
+        Ok(cert)
+    }
 
-        // Generate and sign revoaction certificate
+    /// Upload subkeys to a smartcard and reset and lock smartcard in the process
+    fn upload_subkeys(&self, cert: &Cert, target: Option<String>) -> PGPResult<()> {
+        // Determine smartcard to which to connect
+        let mut card: Card<Open> = match target {
+            Some(serial) => {
+                let backend = PcscBackend::open_by_ident(&serial, None)?;
+                backend.into()
+            }
+            None => {
+                let mut cards = PcscBackend::cards(None)?;
+
+                if cards.len() == 1 {
+                    cards.pop().unwrap().into()
+                } else if cards.is_empty() {
+                    Err(CardError::InternalError(
+                        "No card detected, please insert card".to_string(),
+                    ))?
+                } else {
+                    Err(CardError::InternalError(format!(
+                        "Multiple cards ({}) detected, please specify card by serial",
+                        cards.len()
+                    )))?
+                }
+            }
+        };
+
+        // Establish connection and receive metadata
+        let mut transaction = card.transaction()?;
+        log::info!(
+            "Connected to smartcard '{}'",
+            transaction.application_identifier()?.ident()
+        );
+
+        // Factory reset smartcard
+        transaction.factory_reset()?;
+
+        // Change user pin if it was specified
+        if let Some(ref pin) = self.pin.as_ref() {
+            pin.map(|p| transaction.change_user_pin(b"123456", p))?;
+        }
+
+        // Set new admin and pin TODO: derivation path debatable
+        let admin_pin = self.subseed.base64(Some(b"admin"));
+        transaction.change_admin_pin(b"12345678", &admin_pin.as_bytes())?;
+
+        // Authenticate as admin
+        transaction.verify_admin(admin_pin.as_bytes())?;
+        let mut admin = transaction.admin_card().expect("verify admin did not fail");
+
+        // TODO: Set language, gender, etc.
+        admin.set_name(&self.name)?;
+        admin.set_lang(&[['e', 'n'].into()])?;
+
+        // For each subkey...
+        let p = &StandardPolicy::new();
+        for kt in &DEFAULT_KEY_TYPES {
+            if let Some(vka) = sq_util::subkey_by_type(&cert, p, *kt)? {
+                // ... upload keys to smartcard ...
+                log::info!("Uploading {:?} key: {}", *kt, vka.key());
+                if let Some(ref pin) = self.pin.as_ref() {
+                    let decrypted: Zeroizing<String> =
+                        pin.map(|p| String::from_utf8_lossy(p).to_string()).into();
+                    admin.upload_key(vka, *kt, Some(decrypted.to_string()))?;
+                } else {
+                    admin.upload_key(vka, *kt, None)?;
+                }
+
+                // ... and set pin policy
+                admin.set_uif(*kt, TouchPolicy::Fixed)?;
+            } else {
+                bail!("{:?} key could not be found", *kt)
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Generate revocation certificate
+    fn generate_revcert(&self, cert: &mut Cert) -> PGPResult<Packet> {
+        // Determine creation time
+        let creation_time = self
+            .creation_time
+            .unwrap_or(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+
+        // Derive signing key
+        let primary: SecretPrimaryKey =
+            Key4::import_secret_ed25519(&self.seed, creation_time)?.into();
+
+        let mut signer = primary
+            .clone()
+            .into_keypair()
+            .expect("key generated above has a secret");
+
+        // Sign revocation certificate
         let revocation: Packet = CertRevocationBuilder::new()
             .set_signature_creation_time(creation_time)?
             .set_reason_for_revocation(ReasonForRevocation::Unspecified, b"Unspecified")?
             .build(&mut signer, &cert, None)?
             .into();
 
-        // Only export to smartcard if targetted
-        if let Some(ref target) = self.card_target {
-            // Determine if smartcard is available
-            let mut card: Card<Open> = match &target[..] {
-                "auto" => {
-                    let mut cards = PcscBackend::cards(None)?;
-
-                    if cards.len() == 1 {
-                        cards.pop().unwrap().into()
-                    } else if cards.is_empty() {
-                        Err(CardError::InternalError(
-                            "No card detected, please insert card".to_string(),
-                        ))?
-                    } else {
-                        Err(CardError::InternalError(format!(
-                            "Multiple cards ({}) detected, please specify card by serial",
-                            cards.len()
-                        )))?
-                    }
-                }
-                serial => {
-                    let backend = PcscBackend::open_by_ident(serial, None)?;
-                    backend.into()
-                }
-            };
-
-            // Establish connection and receive metadata
-            let mut transaction = card.transaction()?;
-            println!(
-                "Connecting to smartcard '{}'",
-                transaction.application_identifier()?.ident()
-            );
-
-            // Factory reset smartcard
-            transaction.factory_reset()?;
-
-            // Change user pin if it was specified
-            if let Some(ref pin) = self.pin.as_ref() {
-                pin.map(|p| transaction.change_user_pin(b"123456", p))?;
-            }
-
-            // Set new admin and user pin TODO: derivation path debatable
-            let admin_pin = base64_encode(&self.seed.derive(Some(b"admin")));
-            transaction.change_admin_pin(b"12345678", &admin_pin.as_bytes())?;
-
-            // Authenticate as admin
-            transaction.verify_admin(admin_pin.as_bytes())?;
-            let mut admin = transaction.admin_card().expect("verify admin did not fail");
-
-            // TODO: Set language, gender, etc.
-            admin.set_name(&self.name)?;
-            admin.set_lang(&[['e', 'n'].into()])?;
-
-            //For each subkey...
-            let p = &StandardPolicy::new();
-            for kt in &DEFAULT_KEY_TYPES {
-                if let Some(vka) = sq_util::subkey_by_type(&cert, p, *kt)? {
-                    // ... upload keys to smartcard ...
-                    println!("- Uploading {:?} key: {}", *kt, vka.key());
-                    if let Some(ref pin) = self.pin.as_ref() {
-                        let decrypted: Zeroizing<String> =
-                            pin.map(|p| String::from_utf8_lossy(p).to_string()).into();
-                        admin.upload_key(vka, *kt, Some(decrypted.to_string()))?;
-                    } else {
-                        admin.upload_key(vka, *kt, None)?;
-                    }
-
-                    // ... and set pin policy
-                    admin.set_uif(*kt, TouchPolicy::Fixed)?;
-                } else {
-                    Err(anyhow!("{:?} key could not be found", *kt))?
-                }
-            }
-            println!();
-        }
-
-        Ok((cert, revocation))
+        Ok(revocation)
     }
 }

@@ -13,7 +13,7 @@ pub type Seed256 = [u8; 32];
 const DERIVATION_CONTEXT: &[u8] = b"MINDTHEGAP256HDKD";
 
 /// Simple wrapper around argon2 crate to hash byte inputs
-pub fn argon2id_256(input: &[u8], salt: Option<&[u8]>) -> Seed256 {
+pub(crate) fn argon2id_256(input: &[u8], salt: Option<&[u8]>) -> Seed256 {
     // Default setting for memory-constrained environments
     let params = Params::new(64 * 1024, 3, 1, None).unwrap();
 
@@ -29,13 +29,18 @@ pub fn argon2id_256(input: &[u8], salt: Option<&[u8]>) -> Seed256 {
 }
 
 /// Simple wrapper around base64 crate to turn bytes into ascii strings
-pub(crate) fn base64_encode(input: &[u8]) -> String {
+fn base64_encode(input: &[u8]) -> String {
     BASE64_STANDARD_NO_PAD.encode(input)
 }
 
 // Abstract derivation step ...
 pub trait Seed256Derive {
     fn derive(&self, path: Option<&[u8]>) -> Seed256;
+
+    // ... with additional base64 support
+    fn base64(&self, path: Option<&[u8]>) -> String {
+        base64_encode(&self.derive(path))
+    }
 }
 
 // ... and implement it using argon2

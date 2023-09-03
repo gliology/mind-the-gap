@@ -1,9 +1,17 @@
-use mind_the_gap::cli::{cmd, run, ResultErrToString};
+use env_logger::Env;
 
+fn main() {
 
-/// Command line parse and execute
-fn main() -> Result<(), String> {
-    env_logger::init();
+    // Parse logging config and init logger
+    let env = Env::default()
+        .filter_or("MIND_THE_LOG_LEVEL", "mind_the_gap=info")
+        .write_style_or("MIND_THE_LOG_STYLE", "auto");
 
-    run(&cmd().get_matches()).map_err_to_string()
+    env_logger::init_from_env(env);
+
+    // Parse command line and execute
+    match mind_the_gap::cli::run() {
+        Err(err) => log::error!("{}", err.to_string()),
+        Ok(()) => (),
+    }
 }

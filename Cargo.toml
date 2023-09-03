@@ -8,7 +8,8 @@ edition = "2021"
 
 [dependencies]
 # Command line interface
-clap = { version = "4.3", features = [ "cargo", "env" ]}
+clap = { version = "4.3", features = [ "derive", "cargo", "env" ]}
+log = "0.4"
 env_logger = "0.10"
 
 # Error handling

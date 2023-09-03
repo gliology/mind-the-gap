@@ -1,23 +1,23 @@
 use crate::seed::{argon2id_256, Seed256, Seed256Derive};
 
+use std::str::FromStr;
+
 use anyhow::Error;
 
 use bip39::{Language, Mnemonic, MnemonicType};
 
-// FIXME: use zeroize::{Zeroize, Zeroizig};
+use zeroize::Zeroizing;
 
 /// Simple wrapper to add password and derivation support to mnemonics
-//#[derive(Zeroize)]
-//#[zeroize(drop)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MnemonicSeed {
     mnemonic: Mnemonic,
-    password: String,
+    password: Zeroizing<String>,
     source: MnemonicSource,
 }
 
-///Enum to track source of mnemonic seed
-#[derive(Copy, Clone)]
+/// Enum to track source of mnemonic seed
+#[derive(Copy, Clone, Debug)]
 pub enum MnemonicSource {
     Random,
     Phrase,
@@ -28,7 +28,7 @@ impl MnemonicSeed {
     pub fn new() -> Self {
         MnemonicSeed {
             mnemonic: Mnemonic::new(MnemonicType::Words24, Language::English),
-            password: String::new(),
+            password: String::new().into(),
             source: MnemonicSource::Random,
         }
     }
@@ -37,14 +37,14 @@ impl MnemonicSeed {
     pub fn from_phrase(phrase: &str) -> Result<Self, Error> {
         Ok(MnemonicSeed {
             mnemonic: Mnemonic::from_phrase(phrase, Language::English)?,
-            password: String::new(),
+            password: String::new().into(),
             source: MnemonicSource::Phrase,
         })
     }
 
     /// Protect seed with password
     pub fn with_password(mut self, password: &str) -> Self {
-        self.password = String::from(password);
+        self.password = String::from(password).into();
         self
     }
 
@@ -63,7 +63,17 @@ impl MnemonicSeed {
         self.seed().derive(path)
     }
 
-    pub fn source(&self) ->MnemonicSource {
+    /// Return source of the mnemonic
+    pub fn source(&self) -> MnemonicSource {
         self.source
+    }
+}
+
+/// Support parsing from string e.g. in clap
+impl FromStr for MnemonicSeed {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        MnemonicSeed::from_phrase(s)
     }
 }
