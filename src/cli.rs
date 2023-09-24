@@ -70,6 +70,14 @@ enum Backend {
     },
     /// Generate and export PIV keys and certs
     PIV {
+        /// Creation date of certificates (current timestamp by default)
+        #[arg(short, long, value_name = "YYYY-MM-DD", global = true, env = "MIND_THE_DATE", value_parser = common::parse_date)]
+        date: Option<DateTime<Utc>>,
+
+        /// Validity duration of certificates (infinite by default)
+        #[arg(short, long, value_name = "DURATION", global = true, env = "MIND_THE_VALIDITY", value_parser = common::parse_duration)]
+        validity: Option<Duration>,
+
         #[command(subcommand)]
         command: PIVCommand,
     },
@@ -408,7 +416,7 @@ pub fn run() -> Result<()> {
             }
         }
         // ... then command
-        Some(Backend::PIV { command }) => {
+        Some(Backend::PIV { date, validity, command }) => {
             let builder = if command != PIVCommand::Status {
                 let name = name.ok_or(anyhow!("Requires name to be specified"))?;
 
@@ -456,6 +464,24 @@ pub fn run() -> Result<()> {
                     if let Some(ref pin) = pin.as_ref() {
                         log::info!("Setting smartcard user pin: {}", pin.as_str());
                         builder = builder.with_pin((*pin).clone());
+                    }
+
+                    // Set validity period
+                    if let Some(date) = date {
+                        log::info!(
+                            "Setting certificate creation time: {}",
+                            date.format("%Y-%m-%d %T")
+                        );
+                        builder = builder.with_creation_time(date.into());
+                    }
+
+                    // Set validity period
+                    if let Some(validity) = validity {
+                        log::info!(
+                            "Setting certificate validity duration: {}",
+                            humantime::format_duration(validity)
+                        );
+                       builder = builder.with_validity_duration(validity);
                     }
 
                     // Show info about target card

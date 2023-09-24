@@ -37,8 +37,8 @@ openpgp-card-sequoia = "0.1"
 openpgp-card-pcsc = "0.3"
 
 # Yubikey PIV module
-yubikey = { git = "https://github.com/iqlusioninc/yubikey.rs.git", features = [ "untested" ] }
-x509 = "0.2"
+yubikey = { version = "0.8",  features = [ "untested" ]}
 x509-cert = "0.2"
 der = "0.7"
 sha2 = "0.10"
+p256 = "0.13.2"
