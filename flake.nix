@@ -53,12 +53,13 @@
       let
         pkgs = self.packages.${system};
       in {
-        mnemonic2pgp = {
+        mind-the-gap = {
           type = "app";
-          program = "${pkgs.mind-the-gap}/bin/mnemonic2pgp";
+          program = "${pkgs.mind-the-gap}/bin/mind-the-gap";
         };
     });
-    defaultApp = forEachSystem (system: self.apps.${system}.mnemonic2pgp);
+
+    defaultApp = forEachSystem (system: self.apps.${system}.mind-the-gap);
 
     packages = forEachSystem (system: {
       # Provide iso derivation
