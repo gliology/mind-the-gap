@@ -75,6 +75,11 @@
           buildInputs = with pkgs; [ nettle pcsclite ];
 
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+
+          postInstall = ''
+            $out/bin/mind-the-build $out
+            rm $out/bin/mind-the-build
+          '';
         });
     });
 
