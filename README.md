@@ -40,8 +40,8 @@ The salt is always set to at least `MINDTHEGAP256HDKD` and optional followed by 
 └── (optional password)/
     ├── app identifier/
     │   ├── primary key
-    │   ├── mgmnt key
     │   ├── (optional subkey id)/
+    │   │   ├── mgmnt key
     │   │   ├── signing subkey
     │   │   ├── decryption subkey
     │   │   └── authentication subkey
@@ -49,8 +49,8 @@ The salt is always set to at least `MINDTHEGAP256HDKD` and optional followed by 
     │       └── any other subkey type
     └── app identifier/
         ├── primary key
-        ├── mgmnt key
         ├── (optional subkey id)/
+        │   ├── mgmnt key
         │   ├── signing subkey
         │   ├── decryption subkey
         │   └── authentication subkey
@@ -60,7 +60,6 @@ The salt is always set to at least `MINDTHEGAP256HDKD` and optional followed by 
 
 ## Future goals:
 
-- Cleanup and refactor code
 - Zerorize secrets properly and consistently
 - Add PIV primary certificate
 - Test and support other keys (i.e. Solo 2, Nitrokey 3)
