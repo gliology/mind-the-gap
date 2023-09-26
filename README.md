@@ -63,7 +63,6 @@ The salt is always set to at least `MINDTHEGAP256HDKD` and optional followed by 
 - Zerorize secrets properly and consistently
 - Add PIV primary certificate
 - Test and support other keys (i.e. Solo 2, Nitrokey 3)
-- Move away from installer to pure live image
 - Investigate use of sequoia piv wrapper `openpgp-piv-sequoia`
 - Investigate u2f integration
 
