@@ -3,6 +3,7 @@ use crate::mnemonic::{MnemonicSeed, MnemonicSource};
 use crate::common;
 use crate::openpgp;
 use crate::piv;
+use crate::qr;
 
 use std::{path::PathBuf, time::Duration};
 
@@ -13,8 +14,9 @@ use anyhow::{anyhow, bail, Result};
 
 use chrono::{DateTime, Utc};
 
-use clap::{Command, CommandFactory, Parser, Subcommand};
+use clap::{ArgGroup, Command, CommandFactory, Parser, Subcommand};
 
+use sequoia_openpgp::armor;
 use sequoia_openpgp::cert::Cert;
 use sequoia_openpgp::parse::Parse;
 use sequoia_openpgp::serialize::SerializeInto;
@@ -127,6 +129,10 @@ enum OpenPGPCommand {
         /// Optional output path of public cert
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Show output as QR code on terminal
+        #[arg(short, long)]
+        qr: bool,
     },
 
     /// Export primary-signed certificates for subkeys or external keys
@@ -135,27 +141,32 @@ enum OpenPGPCommand {
         #[arg(short, long)]
         input: Option<PathBuf>,
 
-        /// Public certificate output path
-        #[arg(short, long, default_value = "public.mtg.asc")]
-        output: PathBuf,
+        /// Public certificate output path (QR code shown when omitted)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
 
     /// Export secret keys to file
+    #[command(group(ArgGroup::new("dest").required(true).args(["output", "qr"])))]
     Export {
         /// Pin to protect exported keys in file
         #[arg(short = 'i', long, env = "MIND_THE_PIN")]
         pin: Option<Zeroizing<String>>,
 
         /// Secret key output path
-        #[arg(short, long, default_value = "secret.mtg.asc")]
-        output: PathBuf,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Show output as QR code on terminal
+        #[arg(short, long)]
+        qr: bool,
     },
 
     /// Generate revocation certificate
     Revoke {
-        /// Revocation certificate output path
-        #[arg(short, long, default_value = "revocation.mtg.asc")]
-        output: PathBuf,
+        /// Revocation certificate output path (QR code shown when omitted)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -323,7 +334,7 @@ pub fn run() -> Result<()> {
 
                     builder.check(card)
                 }
-                OpenPGPCommand::Upload { pin, card, yes, output } => {
+                OpenPGPCommand::Upload { pin, card, yes, output, qr: show_qr } => {
                     // Retrieve initialized builder
                     let mut builder = builder.unwrap();
 
@@ -348,13 +359,17 @@ pub fn run() -> Result<()> {
                         confirm("OpenPGP")?;
                     }
 
-                    // Generate and safe result
+                    // Generate and save result
                     let cert = builder.upload(card)?;
                     log::info!("Uploaded OpenPGP certificate '{}'", cert);
 
+                    let armored = cert.armored().to_vec()?;
                     if let Some(path) = output {
                         log::info!("Saving certificate to file: {}", path.display());
-                        fs::write(path, cert.armored().to_vec()?)?;
+                        fs::write(path, &armored)?;
+                    }
+                    if show_qr {
+                        qr::print_qr(&armored)?;
                     }
 
                     Ok(())
@@ -375,12 +390,17 @@ pub fn run() -> Result<()> {
 
                     // Generate public certificate and save result
                     log::info!("Generated OpenPGP certificate '{}'", cert);
-                    log::info!("Saving certificate to file: {}", output.display());
-                    fs::write(output, cert.armored().to_vec()?)?;
+                    let armored = cert.armored().to_vec()?;
+                    if let Some(path) = output {
+                        log::info!("Saving certificate to file: {}", path.display());
+                        fs::write(path, &armored)?;
+                    } else {
+                        qr::print_qr(&armored)?;
+                    }
 
                     Ok(())
                 }
-                OpenPGPCommand::Export { pin, output } => {
+                OpenPGPCommand::Export { pin, output, qr: show_qr } => {
                     // Retrieve initialized builder
                     let mut builder = builder.unwrap();
 
@@ -394,8 +414,14 @@ pub fn run() -> Result<()> {
                     let cert = builder.export()?;
                     log::info!("Generated OpenPGP secret keys for {}", cert);
 
-                    log::info!("Saving secret keys to file: {}", output.display());
-                    fs::write(output, cert.as_tsk().armored().to_vec()?)?;
+                    let tsk_bytes = cert.as_tsk().armored().to_vec()?;
+                    if let Some(path) = output {
+                        log::info!("Saving secret keys to file: {}", path.display());
+                        fs::write(path, &tsk_bytes)?;
+                    }
+                    if show_qr {
+                        qr::print_qr(&tsk_bytes)?;
+                    }
 
                     Ok(())
                 }
@@ -407,9 +433,20 @@ pub fn run() -> Result<()> {
                     let cert = builder.revoke()?;
                     log::info!("Generated OpenPGP revocation certificate");
 
-                    // TODO: Armor revocation certificate
-                    log::info!("Saving revocation certificate to file: {}", output.display());
-                    fs::write(output, cert.to_vec()?)?;
+                    // Armor the revocation packet (gnupg convention: Kind::PublicKey)
+                    let raw = cert.to_vec()?;
+                    let mut armored = Vec::new();
+                    {
+                        let mut w = armor::Writer::new(&mut armored, armor::Kind::PublicKey)?;
+                        w.write_all(&raw)?;
+                        w.finalize()?;
+                    }
+                    if let Some(path) = output {
+                        log::info!("Saving revocation certificate to file: {}", path.display());
+                        fs::write(path, &armored)?;
+                    } else {
+                        qr::print_qr(&armored)?;
+                    }
 
                     Ok(())
                 }

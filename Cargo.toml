@@ -33,6 +33,9 @@ tiny-bip39 = "2.0"
 argon2 = "0.5"
 base64 = "0.22"
 
+# QR code output
+qrcode = { version = "0.14", default-features = false }
+
 # OpenPGP and Smartcard modules
 sequoia-openpgp = "2"
 openpgp-card = "0.5"
