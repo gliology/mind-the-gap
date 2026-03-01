@@ -45,14 +45,17 @@
         pkgs = nixpkgs.legacyPackages.${system};
         rust = toolchain system;
       in pkgs.mkShell {
-        nativeBuildInputs = (with pkgs; [ pkg-config clang ])
+        nativeBuildInputs = (with pkgs; [ pkg-config rustPlatform.bindgenHook sequoia-sq gnupg ])
           ++ (with rust; [ cargo rustc rust-analyzer rustfmt ]);
 
         buildInputs = with pkgs; [ nettle pcsclite ];
 
         RUST_SRC_PATH = "${rust.rust-src}/lib/rustlib/src/rust/library";
 
-        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        # Expose shared libraries so `cargo test` can load them at runtime
+        shellHook = ''
+          export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath (with pkgs; [ nettle pcsclite gmp ])}:$LD_LIBRARY_PATH
+        '';
       }
     );
 

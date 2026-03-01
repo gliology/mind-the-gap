@@ -5,5 +5,5 @@ pub mod seed;
 pub mod common;
 pub mod cli;
 // Import backends
-mod openpgp;
+pub mod openpgp;
 mod piv;
