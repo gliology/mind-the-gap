@@ -134,7 +134,7 @@ impl SeededSmartcard {
 
     // PUBLIC OUTPUT API
 
-    pub fn check(self, target: Option<String>) -> Result<()> {
+    pub fn check(self, _target: Option<String>) -> Result<()> {
         todo!()
     }
 

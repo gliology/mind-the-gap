@@ -13,7 +13,7 @@ use anyhow::{anyhow, bail, Result};
 
 use chrono::{DateTime, Utc};
 
-use clap::{command, Command, CommandFactory, Parser, Subcommand};
+use clap::{Command, CommandFactory, Parser, Subcommand};
 
 use sequoia_openpgp::cert::Cert;
 use sequoia_openpgp::parse::Parse;
