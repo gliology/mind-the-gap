@@ -19,7 +19,7 @@ use der::Encode;
 use der::asn1::Ia5String;
 
 use sha2::{Digest, Sha256};
-use rand_core::{OsRng, RngCore};
+use rand_core::{OsRng, TryRngCore};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Configuration of key slots to be generated and uploaded
@@ -243,7 +243,7 @@ impl SeededSmartcard {
 
         // Generate random serial number
         let mut serial = [0u8; 20];
-        OsRng.fill_bytes(&mut serial);
+        OsRng.try_fill_bytes(&mut serial).expect("OS RNG failed");
         serial[0] &= 0x7f; // MSB has to be zero
         let serial = SerialNumber::new(&serial).unwrap();
 

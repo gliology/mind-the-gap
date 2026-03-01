@@ -13,7 +13,7 @@ clap_complete = "4.4"
 clap_mangen = "0.2"
 
 log = "0.4"
-env_logger = "0.10"
+env_logger = "0.11"
 
 # Error handling
 anyhow = "1.0"
@@ -24,17 +24,17 @@ humantime = "2.1"
 
 # Clear sensitive data
 zeroize = "1.1"
-rand_core = "0.6"
+rand_core = { version = "0.9", features = ["os_rng"] }
 
 # Mnemonic handling
-tiny-bip39 = "0.8"
+tiny-bip39 = "2.0"
 
 # Key Derivation
 argon2 = "0.5"
-base64 = "0.21"
+base64 = "0.22"
 
 # OpenPGP and Smartcard modules
-sequoia-openpgp = "1.16"
+sequoia-openpgp = "1"
 openpgp-card = "0.3"
 openpgp-card-sequoia = "0.1"
 openpgp-card-pcsc = "0.3"
