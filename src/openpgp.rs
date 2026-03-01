@@ -243,15 +243,21 @@ impl SeededSmartcard {
         let cc = cert.clone();
         let vc = cc.with_policy(policy, None)?;
 
-        for ref uid in vc.userids() {
+        for uid in vc.userids() {
             log::info!("Signing userid '{}'", uid.userid());
 
-            let sig = self.new_primary_sbuilder(SignatureType::GenericCertification)?;
+            // Use a minimal builder without subpackets
+            let sig = SignatureBuilder::new(SignatureType::GenericCertification)
+                .set_hash_algo(HashAlgorithm::SHA512)
+                .set_signature_creation_time(creation_time)?;
 
             let signature = uid.userid().bind(&mut signer, &cert, sig)?;
 
-            // FIXME: Currently does not end up in export
-            cert = cert.insert_packets(signature.clone()).map(|(c, _)| c)?;
+            // Insert each signed UserID with its signature to associate them
+            cert = cert.insert_packets(vec![
+                Packet::from(uid.userid().clone()),
+                signature.into(),
+            ]).map(|(c, _)| c)?;
         }
 
         Ok(cert)
