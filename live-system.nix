@@ -18,13 +18,13 @@
     # Make iso partition easily identifiable
     edition = lib.mkForce "mind_the_gap";
 
-    # Differentiate image from install iso
-    isoName = "mind_the_gap-${pkgs.mind-the-gap.version}-${config.system.nixos.label}-${pkgs.stdenv.hostPlatform.system}.iso";
-
     # Enable EFI and USB booting
     makeEfiBootable = true;
     makeUsbBootable = true;
   };
+
+  # Differentiate image from install iso
+  image.fileName = "mind_the_gap-${pkgs.mind-the-gap.version}-${config.system.nixos.label}-${pkgs.stdenv.hostPlatform.system}.iso";
 
   # An installation media cannot tolerate a host config defined file
   # system layout on a fresh machine, before it has been formatted.
@@ -53,9 +53,6 @@
     [PStore]
     Unlink=no
   '';
-
-  # Ensure xlibs are not disabled
-  environment.noXlibs = lib.mkForce false;
 
   # Add any tools we might need
   environment.systemPackages = with pkgs; [
@@ -88,7 +85,9 @@
     ssh.startAgent = false;
 
     # Install sensible default editor
-    vim.defaultEditor = true;
+    neovim.defaultEditor = true;
+    neovim.enable = true;
+    neovim.vimAlias = true;
   };
 
   # Default user to use to run mind-the-gap
@@ -118,10 +117,9 @@
     ╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚═════╝        ╚═╝   ╚═╝  ╚═╝╚══════╝     ╚═════╝ ╚═╝  ╚═╝╚═╝
   '';
 
-   # Mark nixos variant
+  # Mark nixos variant
   system.nixos.variant_id = "mind-the-gap";
 
   # Use current state version
   system.stateVersion = lib.mkDefault lib.trivial.release;
 }
-

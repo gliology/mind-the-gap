@@ -3,7 +3,7 @@
 
   inputs = {
     # Pinned, as current unstable iso with grub does not boot
-    nixpkgs.url = "github:NixOS/nixpkgs/release-24.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/release-25.11";
 
     # Pinned nixpkgs rust is to currently to old
     fenix.url = "github:nix-community/fenix";
@@ -82,11 +82,9 @@
         in {
           src = ./.;
 
-          nativeBuildInputs = with pkgs; [ pkg-config clang ];
+          nativeBuildInputs = with pkgs; [ pkg-config rustPlatform.bindgenHook ];
 
           buildInputs = with pkgs; [ nettle pcsclite ];
-
-          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
           # Man pages and completion support are provided by additional binary
           postInstall = ''
