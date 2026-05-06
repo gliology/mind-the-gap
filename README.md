@@ -15,17 +15,17 @@ Install a flake enabled nix (e.g. by following the beginning of [this guide](htt
 nix build github:gliology/mind-the-gap#iso
 ```
 
-The resulting live image can then be found in `result/iso` and copied to an install media of your chosing.
+The resulting live image can then be found in `result/iso` and copied to an install media of your choosing.
 
 Once booted you can now uses the `mind-the-gap` command line tool to generate and export any keys you might need. The command line client comes with built-in help and man pages, as well as shell completion to guide you through the process. We recommend the use of the `MIND_THE_...` environment variables to pass parameters to the utility.
 
-To just build and run the `mind-the-gap` tool in your current online environement you can also just run:
+To just build and run the `mind-the-gap` tool in your current online environment you can also just run:
 
 ```
 nix run github:gliology/mind-the-gap
 ```
 
-While this is a great way to test functionality, it is strongly recommended to use an airgapped environment for any production level keys.
+While this is a great way to test functionality, it is strongly recommended to use an air-gapped environment for any production level keys.
 
 ## How to develop
 
@@ -64,7 +64,6 @@ The salt is always set to at least `MINDTHEGAP256HDKD` and optionally followed b
 
 ## Open issues:
 
-- Fix sigining of external keys
 - Implement check command to verify inputs and uploads
 - Zerorize secrets properly and consistently
 - Add PIV primary certificate
