@@ -14,97 +14,115 @@
     naersk.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, fenix, naersk }:
-  let
-    # List of all supported system architectures
-    allSystems = [ "x86_64-linux" "aarch64-linux" ];
+  outputs =
+    {
+      self,
+      nixpkgs,
+      fenix,
+      naersk,
+    }:
+    let
+      # List of all supported system architectures
+      allSystems = [ "x86_64-linux" "aarch64-linux" ];
 
-    # Helper to generate attrset entry for each system
-    forEachSystem = nixpkgs.lib.genAttrs allSystems;
+      # Helper to generate attrset entry for each system
+      forEachSystem = nixpkgs.lib.genAttrs allSystems;
 
-    # Helper to generate nameable attrset entry for each system
-    forEachSystem' = f: builtins.listToAttrs (map f allSystems);
+      # Helper to generate nameable attrset entry for each system
+      forEachSystem' = f: builtins.listToAttrs (map f allSystems);
 
-    # Provide newer version of rust
-    toolchain = system: fenix.packages.${system}.stable;
+      # Provide newer version of rust
+      mkToolchain = system: fenix.packages.${system}.stable;
 
-    # Wrapper to turn config module to system config
-    liveConfig = system: nixpkgs.lib.nixosSystem {
-      inherit system;
-      modules = [
-        # Add mind-the-gap through a nixpkgs overlay
-        { nixpkgs.overlays = [ (_: _: { inherit (self.packages.${system}) mind-the-gap; }) ]; }
-        # Add live system config module
-        (import ./live-system.nix)
-      ];
-    };
-  in {
-    # Shells to be used for development
-    devShells = forEachSystem (system:
-      let
-        pkgs = nixpkgs.legacyPackages.${system};
-        rust = toolchain system;
-      in {
-	default = pkgs.mkShell {
-          nativeBuildInputs = (with pkgs; [ pkg-config rustPlatform.bindgenHook sequoia-sq gnupg ])
-            ++ (with rust; [ cargo rustc rust-analyzer rustfmt ]);
-
-          buildInputs = with pkgs; [ nettle pcsclite ];
-
-          RUST_SRC_PATH = "${rust.rust-src}/lib/rustlib/src/rust/library";
-
-          # Expose shared libraries so `cargo test` can load them at runtime
-          shellHook = ''
-            export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath (with pkgs; [ nettle pcsclite gmp ])}:$LD_LIBRARY_PATH
-          '';
-        };
-      }
-    );
-
-    # Bootable iso with live system to run on air-gapped device
-    nixosConfigurations = forEachSystem' (system: {
-      name = "live-${system}";
-      value = liveConfig system;
-    });
-
-    # Buildable outputs
-    packages = forEachSystem (system: {
-      # - Provide command line interface as default package
-      default = self.packages.${system}.mind-the-gap;
-
-      # - Provide live iso image as derivation
-      iso = self.nixosConfigurations."live-${system}".config.system.build.isoImage;
-
-      # = Build the command line interface with naersk
-      mind-the-gap = (naersk.lib.${system}.override {
-        inherit (toolchain system) cargo rustc;
-      }).buildPackage (
+      # Provide naersk with newer version of rust
+      mkNaersk = system: naersk.lib.${system}.override {
+        inherit (mkToolchain system) cargo rustc;
+      };
+        
+      # Wrapper to turn config module to system config
+      mkNixosConfig = system: nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          # Add mind-the-gap through a nixpkgs overlay
+          { nixpkgs.overlays = [ (_: _: { inherit (self.packages.${system}) mind-the-gap; }) ]; }
+          # Add live system config module
+          (import ./live-system.nix)
+        ];
+      };
+    in
+    {
+      # Shell used for development
+      devShells = forEachSystem (
+        system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-        in {
-          src = ./.;
+          toolchain = mkToolchain system;
+        in
+        {
+          default = pkgs.mkShell {
+            nativeBuildInputs =
+              (with pkgs; [ pkg-config rustPlatform.bindgenHook sequoia-sq gnupg ])
+                ++ (with toolchain; [ cargo rustc rust-analyzer rustfmt ]);
 
-          nativeBuildInputs = with pkgs; [ pkg-config rustPlatform.bindgenHook ];
+            buildInputs = with pkgs; [ nettle pcsclite ];
 
-          buildInputs = with pkgs; [ nettle pcsclite ];
+            # Provide rust-src to language server
+            RUST_SRC_PATH = "${toolchain.rust-src}/lib/rustlib/src/rust/library";
 
-          # Run tests with needed command line tools
-          doCheck = true;
+            # Expose shared libraries so `cargo test` can load them at runtime
+            shellHook = with pkgs; ''
+              export LD_LIBRARY_PATH=${lib.makeLibraryPath [ nettle pcsclite gmp ]}:$LD_LIBRARY_PATH
+            '';
+          };
+        }
+      );
 
-          checkInputs = with pkgs; [ sequoia-sq gnupg ];
+      # Bootable iso with live system to run on air-gapped device
+      nixosConfigurations = forEachSystem' (system: {
+        name = "live-${system}";
+        value = mkNixosConfig system;
+      });
 
-          # Expose shared libraries so `cargo test` can load them at runtime
-          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [ nettle pcsclite gmp ]);
+      # Buildable outputs
+      packages = forEachSystem (system: {
+        # - Provide command line interface as default package
+        default = self.packages.${system}.mind-the-gap;
 
-          # GnuPG can not be run without access to its home dir
-          GNUPGHOME = "/tmp";
+        # - Provide live iso image as derivation
+        iso = self.nixosConfigurations."live-${system}".config.system.build.isoImage;
 
-          # Man pages and completion support are provided by additional binary
-          postInstall = ''
-            $out/bin/mind-the-build $out
-            rm $out/bin/mind-the-build
-          '';
-        });
-    });
-  };
+        # - Build the command line interface with naersk
+        mind-the-gap = (mkNaersk system).buildPackage (
+          let
+            pkgs = nixpkgs.legacyPackages.${system};
+          in
+          {
+            src = ./.;
+
+            nativeBuildInputs = with pkgs; [ pkg-config rustPlatform.bindgenHook ];
+
+            buildInputs = with pkgs; [ nettle pcsclite ];
+
+            # Run tests with needed command line tools
+            doCheck = true;
+
+            checkInputs = with pkgs; [ sequoia-sq gnupg ];
+
+            # Expose shared libraries so `cargo test` can load them at runtime
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (
+              with pkgs; [ nettle pcsclite gmp ]
+            );
+
+            # GnuPG can not be run without access to its home dir
+            GNUPGHOME = "/tmp";
+
+            # Man pages and completion support are provided by additional binary
+            postInstall = ''
+              $out/bin/mind-the-build $out
+              rm $out/bin/mind-the-build
+            '';
+          }
+        );
+      });
+    };
 }
