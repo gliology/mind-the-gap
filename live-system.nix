@@ -56,8 +56,9 @@
 
   # Add any tools we might need
   environment.systemPackages = with pkgs; [
-    mind-the-gap
     gnupg
+    man
+    mind-the-gap
     openssl
     paperkey
     pwgen
@@ -66,6 +67,9 @@
     xkcdpass
     yubikey-manager
   ];
+
+  # Link common completion files
+  environment.pathsToLink = [ "/share/bash" "/share/man" ];
 
   # Disable font config
   fonts.fontconfig.enable = false;
