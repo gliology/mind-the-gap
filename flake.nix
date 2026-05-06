@@ -88,6 +88,17 @@
 
           buildInputs = with pkgs; [ nettle pcsclite ];
 
+          # Run tests with needed command line tools
+          doCheck = true;
+
+          checkInputs = with pkgs; [ sequoia-sq gnupg ];
+
+          # Expose shared libraries so `cargo test` can load them at runtime
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [ nettle pcsclite gmp ]);
+
+          # GnuPG can not be run without access to its home dir
+          GNUPGHOME = "/tmp";
+
           # Man pages and completion support are provided by additional binary
           postInstall = ''
             $out/bin/mind-the-build $out

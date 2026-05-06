@@ -48,3 +48,6 @@ x509-cert = "0.2"
 der = "0.7"
 sha2 = "0.10"
 p256 = "0.13.2"
+
+[lib]
+doctest = false
