@@ -39,23 +39,25 @@
       ];
     };
   in {
-    # Shell to be used for development
-    devShell = forEachSystem (system:
+    # Shells to be used for development
+    devShells = forEachSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
         rust = toolchain system;
-      in pkgs.mkShell {
-        nativeBuildInputs = (with pkgs; [ pkg-config rustPlatform.bindgenHook sequoia-sq gnupg ])
-          ++ (with rust; [ cargo rustc rust-analyzer rustfmt ]);
+      in {
+	default = pkgs.mkShell {
+          nativeBuildInputs = (with pkgs; [ pkg-config rustPlatform.bindgenHook sequoia-sq gnupg ])
+            ++ (with rust; [ cargo rustc rust-analyzer rustfmt ]);
 
-        buildInputs = with pkgs; [ nettle pcsclite ];
+          buildInputs = with pkgs; [ nettle pcsclite ];
 
-        RUST_SRC_PATH = "${rust.rust-src}/lib/rustlib/src/rust/library";
+          RUST_SRC_PATH = "${rust.rust-src}/lib/rustlib/src/rust/library";
 
-        # Expose shared libraries so `cargo test` can load them at runtime
-        shellHook = ''
-          export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath (with pkgs; [ nettle pcsclite gmp ])}:$LD_LIBRARY_PATH
-        '';
+          # Expose shared libraries so `cargo test` can load them at runtime
+          shellHook = ''
+            export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath (with pkgs; [ nettle pcsclite gmp ])}:$LD_LIBRARY_PATH
+          '';
+        };
       }
     );
 
