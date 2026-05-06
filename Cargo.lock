@@ -1115,7 +1115,7 @@ checksum = "c797b9d6bb23aab2fc369c65f871be49214f5c759af65bde26ffaaa2b646b492"
 
 [[package]]
 name = "mind-the-gap"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "argon2",
