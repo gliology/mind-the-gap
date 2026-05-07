@@ -167,6 +167,14 @@ enum OpenPGPCommand {
         /// Revocation certificate output path (QR code shown when omitted)
         #[arg(short, long)]
         output: Option<PathBuf>,
+        
+        /// Reason code of revocation 
+        #[arg(short, long, default_value = "0")]
+        code: u8,
+        
+        /// Reason string of revocation
+        #[arg(short, long, default_value = "Unspecified")]
+        text: String,
     },
 }
 
@@ -425,12 +433,12 @@ pub fn run() -> Result<()> {
 
                     Ok(())
                 }
-                OpenPGPCommand::Revoke { output } => {
+                OpenPGPCommand::Revoke { output, code, text } => {
                     // Retrieve initialized builder
                     let builder = builder.unwrap();
 
                     // Generate rev cert and save result
-                    let cert = builder.revoke()?;
+                    let cert = builder.revoke(code, &text)?;
                     log::info!("Generated OpenPGP revocation certificate");
 
                     // Armor the revocation packet (gnupg convention: Kind::PublicKey)

@@ -195,10 +195,10 @@ impl SeededSmartcard {
     }
 
     /// Generate and sign revoaction certificate
-    pub fn revoke(&self) -> Result<Packet> {
+    pub fn revoke(&self, code: u8, text: &str) -> Result<Packet> {
         let mut cert = self.generate_primcert()?;
 
-        self.generate_revcert(&mut cert)
+        self.generate_revcert(&mut cert, code, text)
     }
 
     // INTERNAL API
@@ -554,7 +554,7 @@ impl SeededSmartcard {
     }
 
     /// Generate revocation certificate
-    fn generate_revcert(&self, cert: &mut Cert) -> PGPResult<Packet> {
+    fn generate_revcert(&self, cert: &mut Cert, code: u8, text: &str) -> PGPResult<Packet> {
         // Determine creation time
         let creation_time = self
             .creation_time
@@ -569,10 +569,21 @@ impl SeededSmartcard {
             .into_keypair()
             .expect("key generated above has a secret");
 
+        // Parse revocation code
+        let reason = match code {
+            0 => ReasonForRevocation::Unspecified,
+            1 => ReasonForRevocation::KeySuperseded,
+            2 => ReasonForRevocation::KeyCompromised,
+            3 => ReasonForRevocation::KeyRetired,
+            32 => ReasonForRevocation::UIDRetired,
+            100..=110 => ReasonForRevocation::Private(code),
+            _ => ReasonForRevocation::Unknown(code),
+        };
+
         // Sign revocation certificate
         let revocation: Packet = CertRevocationBuilder::new()
             .set_signature_creation_time(creation_time)?
-            .set_reason_for_revocation(ReasonForRevocation::Unspecified, b"Unspecified")?
+            .set_reason_for_revocation(reason, text.as_bytes())?
             .build(&mut signer, &cert, None)?
             .into();
 

@@ -207,7 +207,7 @@ fn certify_primary_uses_ed25519() {
 #[test]
 fn revoke_packet_is_key_revocation() {
     let packet = builder(SEED_A, "Alice", "alice@example.com")
-        .revoke()
+        .revoke(0, "Unspecified")
         .unwrap();
     match packet {
         Packet::Signature(sig) => assert_eq!(sig.typ(), SignatureType::KeyRevocation),
