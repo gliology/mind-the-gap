@@ -12,6 +12,7 @@
     # Cargo nix integration
     naersk.url = "github:nix-community/naersk";
     naersk.inputs.nixpkgs.follows = "nixpkgs";
+    naersk.inputs.fenix.follows = "fenix";
   };
 
   outputs = { self, nixpkgs, fenix, naersk }:

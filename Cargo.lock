@@ -187,8 +187,7 @@ dependencies = [
 [[package]]
 name = "buffered-reader"
 version = "1.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db26bf1f092fd5e05b5ab3be2f290915aeb6f3f20c4e9f86ce0f07f336c2412f"
+source = "git+https://gitlab.com/gli.al/sequoia.git?tag=openpgp%2Fv2.2.0-mtg0#8ea683342764b6dedbf86e8d106d026266412e4d"
 dependencies = [
  "bzip2",
  "flate2",
@@ -1703,8 +1702,7 @@ checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
 [[package]]
 name = "sequoia-openpgp"
 version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0620e44a7d514adf7df87b44db235f13b81fed7ddc265adb26f014d42626ac47"
+source = "git+https://gitlab.com/gli.al/sequoia.git?tag=openpgp%2Fv2.2.0-mtg0#8ea683342764b6dedbf86e8d106d026266412e4d"
 dependencies = [
  "anyhow",
  "argon2",

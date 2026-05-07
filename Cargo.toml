@@ -37,7 +37,7 @@ base64 = "0.22"
 qrcode = { version = "0.14", default-features = false }
 
 # OpenPGP and Smartcard modules
-sequoia-openpgp = "2"
+sequoia-openpgp = { git = "https://gitlab.com/gli.al/sequoia.git", tag = "openpgp/v2.2.0-mtg0" }
 openpgp-card = "0.5"
 card-backend-pcsc = "0.5"
 secrecy = "0.8"

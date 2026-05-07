@@ -23,16 +23,19 @@
     },
     "naersk": {
       "inputs": {
+        "fenix": [
+          "fenix"
+        ],
         "nixpkgs": [
           "nixpkgs"
         ]
       },
       "locked": {
-        "lastModified": 1718727675,
-        "narHash": "sha256-uFsCwWYI2pUpt0awahSBorDUrUfBhaAiyz+BPTS2MHk=",
+        "lastModified": 1778151388,
+        "narHash": "sha256-lldMJPUeouEjO8/7aLuwhcsIw29vVihm2ZALzjiqfec=",
         "owner": "nix-community",
         "repo": "naersk",
-        "rev": "941ce6dc38762a7cfb90b5add223d584feed299b",
+        "rev": "efdddff9ff4d8e7d0056d57ec67dac50f75ab8f6",
         "type": "github"
       },
       "original": {
