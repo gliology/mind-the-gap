@@ -11,6 +11,7 @@ use sequoia_openpgp as openpgp;
 use openpgp::{Packet, Result as PGPResult};
 use openpgp::cert::{Cert, CertRevocationBuilder};
 use openpgp::crypto::{mpi, Password};
+use openpgp::fmt::hex;
 use openpgp::packet::{self, key, Key, UserID};
 use openpgp::packet::key::Key4;
 use openpgp::packet::signature::SignatureBuilder;
@@ -39,6 +40,13 @@ pub const DEFAULT_KEY_TYPES: [KeyType; 3] = [
     KeyType::Signing,
     KeyType::Decryption,
     KeyType::Authentication,
+];
+
+/// Map of how to generate subkeys (KeyType, is_encryption, seed_code)
+pub const DEFAULT_KEY_MAP: [(KeyType, bool, u8); 3] = [
+    (KeyType::Signing, false, 0x02),
+    (KeyType::Decryption, true, 0x0C),
+    (KeyType::Authentication, false, 0x20),
 ];
 
 /// Print list of currently available OpenPGP cards
@@ -75,6 +83,47 @@ pub fn status() -> Result<()> {
     }
 
     Ok(())
+}
+
+// Determine smartcard to which to connect based on optional target string
+fn open_card(target: Option<String>) -> Result<Card<Open>> {
+    let card = match target {
+        Some(ref serial) => {
+            // Find card by ident by briefly connecting to each
+            let backends: Vec<PcscBackend> = PcscBackend::cards(None)?
+                .filter_map(Result::ok)
+                .collect();
+            let mut found = None;
+            for backend in backends {
+                let mut c = Card::new(backend)?;
+                let ident = {
+                    let tx = c.transaction()?;
+                    tx.application_identifier()?.ident()
+                };
+                if ident.eq_ignore_ascii_case(serial) {
+                    found = Some(c);
+                    break;
+                }
+            }
+            found.ok_or_else(|| CardError::NotFound(format!("Card '{}' not found", serial)))?
+        }
+        None => {
+            let backends: Vec<PcscBackend> = PcscBackend::cards(None)?
+                .filter_map(Result::ok)
+                .collect();
+
+            match backends.len() {
+                0 => bail!("No card detected, please insert card"),
+                1 => Card::new(backends.into_iter().next().unwrap())?,
+                n => bail!(
+                    "Multiple cards ({}) detected, please specify card by serial",
+                    n
+                ),
+            }
+        }
+    };
+
+    Ok(card)
 }
 
 /// Config to create an ed25519/cv25519 user cert
@@ -159,9 +208,18 @@ impl SeededSmartcard {
 
     // PUBLIC OUTPUT API
 
-    /// Check smartcard access and export
-    pub fn check(&self, _target: Option<String>) -> Result<()> {
-        todo!()
+    /// Check smartcard access and subkeys
+    pub fn check(&self, target: Option<String>) -> Result<()> {
+
+        // Check if card is managed by derived key 
+        self.check_admin_pin(target.clone())?;
+
+        // Check if subkeys fingerprints match
+        let mut cert = self.generate_primcert()?;
+        cert = self.append_subcerts(cert)?;
+        self.check_subkeys(&cert, target)?;
+
+        Ok(())
     }
 
     /// Certify subkeys or external keys
@@ -391,45 +449,95 @@ impl SeededSmartcard {
         Ok(cert)
     }
 
+    /// Check that smartcard can be accessed with derived admin pin
+    pub fn check_admin_pin(&self, target: Option<String>) -> Result<()> {
+        // Determine smartcard to which to connect
+        let mut card = open_card(target)?;
+
+        // Establish connection and receive metadata
+        let mut transaction = card.transaction()?;
+        log::info!(
+            "Connected to smartcard '{}'",
+            transaction.application_identifier()?.ident()
+        );
+
+        // Verify admin pin derived from subseed
+        let admin_pin = self.subseed.base64(Some(b"admin"));
+        let admin_pin_str: String = AsRef::<str>::as_ref(&*admin_pin).to_owned();
+
+        transaction.verify_admin_pin(SecretString::new(admin_pin_str))?;
+
+        Ok(())
+    }
+
+    /// Check that subkey fingerprints of certificate matches those on smartcard
+    pub fn check_subkeys(&self, cert: &Cert, target: Option<String>) -> Result<()> {
+        // Determine smartcard to which to connect
+        let mut card = open_card(target)?;
+
+        // Establish connection and receive metadata
+        let mut transaction = card.transaction()?;
+        log::info!(
+            "Connected to smartcard '{}'",
+            transaction.application_identifier()?.ident()
+        );
+
+        // Get the certificate subkeys
+        let policy = &StandardPolicy::new();
+        let valid_cert = cert.with_policy(policy, None)?;
+
+        // For each of the expected subkeys...
+        for (kt, is_enc, code) in &DEFAULT_KEY_MAP {
+            // ... get fingerprint of matching subkey in cert ...
+            let subkey = valid_cert
+                .keys()
+                .subkeys()
+                .find(|k| {
+                    k.key_flags().map_or(false, |flags| {
+                        if *is_enc {
+                            flags.for_storage_encryption() || flags.for_transport_encryption()
+                        } else if *code == 0x02 {
+                            flags.for_signing()
+                        } else {
+                            flags.for_authentication()
+                        }
+                    })
+                })
+                .ok_or_else(|| anyhow::anyhow!("{:?} key not found in cert", kt))?;
+
+            let cert_fp_bytes: [u8; 20] = subkey
+                .key()
+                .fingerprint()
+                .as_bytes()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Unexpected fingerprint length"))?;
+
+            // ... and try to compare it to the fingerprint on the smartcard
+            if let Ok(Some(card_fp)) = transaction.fingerprint(*kt) {
+
+                if card_fp.as_bytes() == cert_fp_bytes {
+                    log::info!("Fingerprint match for {:?} key: {}", kt, card_fp.to_spaced_hex());
+                } else {
+                    bail!(
+                        "Fingerprint mismatch for {:?} key: certificate={}, card={}",
+                        kt,
+                        hex::encode_pretty(cert_fp_bytes),
+                        card_fp.to_spaced_hex()
+                    );
+                }
+            } else {
+                bail!("No {:?} key found on card", kt);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Upload subkeys to a smartcard and reset and lock smartcard in the process
     fn upload_subkeys(&self, cert: &Cert, target: Option<String>) -> PGPResult<()> {
         // Determine smartcard to which to connect
-        let mut card: Card<Open> = match target {
-            Some(ref serial) => {
-                // Find card by ident by briefly connecting to each
-                let backends: Vec<PcscBackend> = PcscBackend::cards(None)?
-                    .filter_map(Result::ok)
-                    .collect();
-                let mut found = None;
-                for backend in backends {
-                    let mut c = Card::new(backend)?;
-                    let ident = {
-                        let tx = c.transaction()?;
-                        tx.application_identifier()?.ident()
-                    };
-                    if ident.eq_ignore_ascii_case(serial) {
-                        found = Some(c);
-                        break;
-                    }
-                }
-                found.ok_or_else(|| CardError::NotFound(format!("Card '{}' not found", serial)))?
-            }
-            None => {
-                let backends: Vec<PcscBackend> = PcscBackend::cards(None)?
-                    .filter_map(Result::ok)
-                    .collect();
-
-                match backends.len() {
-                    0 => bail!("No card detected, please insert card"),
-                    1 => Card::new(backends.into_iter().next().unwrap())?,
-                    n => bail!(
-                        "Multiple cards ({}) detected, please specify card by serial",
-                        n
-                    ),
-                }
-            }
-        };
-
+        let mut card = open_card(target)?;
+          
         // Establish connection and receive metadata
         let mut transaction = card.transaction()?;
         log::info!(
@@ -465,17 +573,10 @@ impl SeededSmartcard {
         admin.set_cardholder_name(&self.name)?;
         admin.set_lang(&[['e', 'n'].into()])?;
 
-        // Map of (KeyType, is_encryption, seed_code)
-        let key_map: [(KeyType, bool, u8); 3] = [
-            (KeyType::Signing, false, 0x02),
-            (KeyType::Decryption, true, 0x0C),
-            (KeyType::Authentication, false, 0x20),
-        ];
-
         let p = &StandardPolicy::new();
         let vc = cert.with_policy(p, None)?;
 
-        for (kt, is_enc, code) in &key_map {
+        for (kt, is_enc, code) in &DEFAULT_KEY_MAP {
             // Find the matching subkey in the cert to get fingerprint, timestamp, and public bytes
             let subkey = vc
                 .keys()
