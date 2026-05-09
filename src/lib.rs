@@ -6,5 +6,5 @@ pub mod common;
 pub mod cli;
 pub mod qr;
 // Import backends
-pub mod openpgp;
+pub mod pgp;
 mod piv;

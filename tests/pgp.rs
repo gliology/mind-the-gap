@@ -1,4 +1,4 @@
-use mind_the_gap::openpgp::SeededSmartcard;
+use mind_the_gap::pgp::SeededSmartcard;
 use mind_the_gap::seed::Seed256;
 
 use sequoia_openpgp::policy::StandardPolicy;

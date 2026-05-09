@@ -1,7 +1,7 @@
 // Import helper to add shared commands
 use crate::mnemonic::{MnemonicSeed, MnemonicSource};
 use crate::common;
-use crate::openpgp;
+use crate::pgp;
 use crate::piv;
 use crate::qr;
 
@@ -53,8 +53,8 @@ pub struct CLI {
 
 #[derive(Subcommand, Clone, Debug)]
 enum Backend {
-    /// Generate and export OpenPGP keys and certs
-    OpenPGP {
+    /// Generate and export PGP keys and certs
+    PGP {
         /// Creation date of the primary key
         #[arg(short, long, value_name = "YYYY-MM-DD", global = true, env = "MIND_THE_DATE", value_parser = common::parse_date)]
         date: Option<DateTime<Utc>>,
@@ -68,7 +68,7 @@ enum Backend {
         validity: Option<Duration>,
 
         #[command(subcommand)]
-        command: OpenPGPCommand,
+        command: PGPCommand,
     },
     /// Generate and export PIV keys and certs
     PIV {
@@ -89,7 +89,7 @@ impl Backend {
     /// Determine if selected backend and command needs secret seed data
     fn needs_seed(self) -> bool {
         match self {
-            Backend::OpenPGP { command: OpenPGPCommand::Status, ..} => false,
+            Backend::PGP { command: PGPCommand::Status, ..} => false,
             Backend::PIV { command: PIVCommand::Status, ..} => false,
             _ => true,
         }
@@ -97,7 +97,7 @@ impl Backend {
 }
 
 #[derive(Subcommand, Clone, PartialEq, Debug)]
-enum OpenPGPCommand {
+enum PGPCommand {
     /// Display current status
     Status,
 
@@ -272,8 +272,8 @@ pub fn run() -> Result<()> {
     // Match backend ...
     match backend {
         // ... then command
-        Some(Backend::OpenPGP { date, subdate, validity, command }) => {
-            let builder = if command != OpenPGPCommand::Status {
+        Some(Backend::PGP { date, subdate, validity, command }) => {
+            let builder = if command != PGPCommand::Status {
 
                 let name = name.ok_or(anyhow!("Requires name to be specified"))?;
 
@@ -281,10 +281,10 @@ pub fn run() -> Result<()> {
                     bail!("Requires at least one email to be specified");
                 }
 
-                // Prepare openpgp cert
-                log::info!("Initializing OpenPGP certificate for '{}'", name);
+                // Prepare pgp cert
+                log::info!("Initializing PGP certificate for '{}'", name);
 
-                let mut builder = openpgp::SeededSmartcard::new(seed.seed(), subkey, name);
+                let mut builder = pgp::SeededSmartcard::new(seed.seed(), subkey, name);
 
                 // Add user identities
                 for address in emails.into_iter() {
@@ -324,8 +324,8 @@ pub fn run() -> Result<()> {
             };
 
             match command {
-                OpenPGPCommand::Status => openpgp::status(),
-                OpenPGPCommand::Check { pin, card } => {
+                PGPCommand::Status => pgp::status(),
+                PGPCommand::Check { pin, card } => {
                     // Retrieve initialized builder
                     let mut builder = builder.unwrap();
 
@@ -342,7 +342,7 @@ pub fn run() -> Result<()> {
 
                     builder.check(card)
                 }
-                OpenPGPCommand::Upload { pin, card, yes, output, qr: show_qr } => {
+                PGPCommand::Upload { pin, card, yes, output, qr: show_qr } => {
                     // Retrieve initialized builder
                     let mut builder = builder.unwrap();
 
@@ -364,12 +364,12 @@ pub fn run() -> Result<()> {
 
                     // Check user confirmation
                     if !yes {
-                        confirm("OpenPGP")?;
+                        confirm("PGP")?;
                     }
 
                     // Generate and save result
                     let cert = builder.upload(card)?;
-                    log::info!("Uploaded OpenPGP certificate '{}'", cert);
+                    log::info!("Uploaded PGP certificate '{}'", cert);
 
                     let armored = cert.armored().to_vec()?;
                     if let Some(path) = output {
@@ -382,7 +382,7 @@ pub fn run() -> Result<()> {
 
                     Ok(())
                 }
-                OpenPGPCommand::Certify { input, output } => {
+                PGPCommand::Certify { input, output } => {
                     // Retrieve initialized builder
                     let builder = builder.unwrap();
 
@@ -397,7 +397,7 @@ pub fn run() -> Result<()> {
                     };
 
                     // Generate public certificate and save result
-                    log::info!("Generated OpenPGP certificate '{}'", cert);
+                    log::info!("Generated PGP certificate '{}'", cert);
                     let armored = cert.armored().to_vec()?;
                     if let Some(path) = output {
                         log::info!("Saving certificate to file: {}", path.display());
@@ -408,7 +408,7 @@ pub fn run() -> Result<()> {
 
                     Ok(())
                 }
-                OpenPGPCommand::Export { pin, output, qr: show_qr } => {
+                PGPCommand::Export { pin, output, qr: show_qr } => {
                     // Retrieve initialized builder
                     let mut builder = builder.unwrap();
 
@@ -420,7 +420,7 @@ pub fn run() -> Result<()> {
 
                     // Generate secret keys and save result
                     let cert = builder.export()?;
-                    log::info!("Generated OpenPGP secret keys for {}", cert);
+                    log::info!("Generated PGP secret keys for {}", cert);
 
                     let tsk_bytes = cert.as_tsk().armored().to_vec()?;
                     if let Some(path) = output {
@@ -433,13 +433,13 @@ pub fn run() -> Result<()> {
 
                     Ok(())
                 }
-                OpenPGPCommand::Revoke { output, code, text } => {
+                PGPCommand::Revoke { output, code, text } => {
                     // Retrieve initialized builder
                     let builder = builder.unwrap();
 
                     // Generate rev cert and save result
                     let cert = builder.revoke(code, &text)?;
-                    log::info!("Generated OpenPGP revocation certificate");
+                    log::info!("Generated PGP revocation certificate");
 
                     // Armor the revocation packet (gnupg convention: Kind::PublicKey)
                     let raw = cert.to_vec()?;
