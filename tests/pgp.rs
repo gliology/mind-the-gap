@@ -1,4 +1,4 @@
-use mind_the_gap::pgp::SeededSmartcard;
+use mind_the_gap::pgp::{CertKind, SeededSmartcard};
 use mind_the_gap::seed::Seed256;
 
 use sequoia_openpgp::policy::StandardPolicy;
@@ -24,7 +24,7 @@ fn builder(seed: Seed256, name: &str, email: &str) -> SeededSmartcard {
 #[test]
 fn certify_has_three_subkeys() {
     let cert = builder(SEED_A, "Alice", "alice@example.com")
-        .certify(None)
+        .certify(CertKind::Full)
         .unwrap();
     assert_eq!(cert.keys().subkeys().count(), 3);
 }
@@ -32,7 +32,7 @@ fn certify_has_three_subkeys() {
 #[test]
 fn certify_subkeys_have_correct_flags_and_algorithms() {
     let cert = builder(SEED_A, "Alice", "alice@example.com")
-        .certify(None)
+        .certify(CertKind::Full)
         .unwrap();
     let policy = StandardPolicy::new();
     let vc = cert.with_policy(&policy, None).unwrap();
@@ -66,7 +66,7 @@ fn certify_subkeys_have_correct_flags_and_algorithms() {
 #[test]
 fn certify_has_user_id() {
     let cert = builder(SEED_A, "Alice", "alice@example.com")
-        .certify(None)
+        .certify(CertKind::Full)
         .unwrap();
     let uids: Vec<_> = cert.userids().collect();
     assert_eq!(uids.len(), 1);
@@ -78,10 +78,10 @@ fn certify_has_user_id() {
 #[test]
 fn certify_is_deterministic() {
     let cert1 = builder(SEED_A, "Alice", "alice@example.com")
-        .certify(None)
+        .certify(CertKind::Full)
         .unwrap();
     let cert2 = builder(SEED_A, "Alice", "alice@example.com")
-        .certify(None)
+        .certify(CertKind::Full)
         .unwrap();
     assert_eq!(cert1.fingerprint(), cert2.fingerprint());
 }
@@ -89,10 +89,10 @@ fn certify_is_deterministic() {
 #[test]
 fn certify_differs_by_seed() {
     let cert_a = builder(SEED_A, "Alice", "alice@example.com")
-        .certify(None)
+        .certify(CertKind::Full)
         .unwrap();
     let cert_b = builder(SEED_B, "Bob", "bob@example.com")
-        .certify(None)
+        .certify(CertKind::Full)
         .unwrap();
     assert_ne!(cert_a.fingerprint(), cert_b.fingerprint());
 }
@@ -100,7 +100,7 @@ fn certify_differs_by_seed() {
 #[test]
 fn certify_valid_under_policy() {
     let cert = builder(SEED_A, "Alice", "alice@example.com")
-        .certify(None)
+        .certify(CertKind::Full)
         .unwrap();
     let policy = StandardPolicy::new();
     cert.with_policy(&policy, None).unwrap();
@@ -122,7 +122,7 @@ fn export_primary_matches_certify() {
         .export()
         .unwrap();
     let certified = builder(SEED_A, "Alice", "alice@example.com")
-        .certify(None)
+        .certify(CertKind::Full)
         .unwrap();
     assert_eq!(exported.fingerprint(), certified.fingerprint());
 }
@@ -132,12 +132,12 @@ fn export_primary_matches_certify() {
 #[test]
 fn wot_preserves_target_fingerprint() {
     let bob_cert = builder(SEED_B, "Bob", "bob@example.com")
-        .certify(None)
+        .certify(CertKind::Full)
         .unwrap();
     let bob_fp = bob_cert.fingerprint();
 
     let certified = builder(SEED_A, "Alice", "alice@example.com")
-        .certify(Some(bob_cert))
+        .certify_other(bob_cert)
         .unwrap();
 
     assert_eq!(certified.fingerprint(), bob_fp);
@@ -147,16 +147,16 @@ fn wot_preserves_target_fingerprint() {
 fn wot_adds_certification_to_each_uid() {
     // Alice's fingerprint for issuer matching
     let alice_fp = builder(SEED_A, "Alice", "alice@example.com")
-        .certify(None)
+        .certify(CertKind::Full)
         .unwrap()
         .fingerprint();
 
     let bob_cert = builder(SEED_B, "Bob", "bob@example.com")
-        .certify(None)
+        .certify(CertKind::Full)
         .unwrap();
 
     let certified = builder(SEED_A, "Alice", "alice@example.com")
-        .certify(Some(bob_cert))
+        .certify_other(bob_cert)
         .unwrap();
 
     for uid in certified.userids() {
@@ -172,12 +172,12 @@ fn wot_adds_certification_to_each_uid() {
 #[test]
 fn wot_certification_not_self_sig() {
     let bob_cert = builder(SEED_B, "Bob", "bob@example.com")
-        .certify(None)
+        .certify(CertKind::Full)
         .unwrap();
     let bob_fp = bob_cert.fingerprint();
 
     let certified = builder(SEED_A, "Alice", "alice@example.com")
-        .certify(Some(bob_cert))
+        .certify_other(bob_cert)
         .unwrap();
 
     // certifications() returns only third-party certs; none should carry Bob's fingerprint
@@ -197,7 +197,7 @@ fn wot_certification_not_self_sig() {
 #[test]
 fn certify_primary_uses_ed25519() {
     let cert = builder(SEED_A, "Alice", "alice@example.com")
-        .certify(None)
+        .certify(CertKind::Full)
         .unwrap();
     assert_eq!(cert.primary_key().key().pk_algo(), PublicKeyAlgorithm::EdDSA);
 }
@@ -220,7 +220,7 @@ fn revoke_packet_is_key_revocation() {
 #[test]
 fn certify_armor_round_trips() {
     let cert = builder(SEED_A, "Alice", "alice@example.com")
-        .certify(None)
+        .certify(CertKind::Full)
         .unwrap();
     // Use the same serialisation path as the CLI (cert.armored().to_vec())
     let armored = cert.armored().to_vec().unwrap();
@@ -270,7 +270,7 @@ fn fp_hex(cert: &Cert) -> String {
 #[test]
 fn sq_inspect_accepts_exported_cert() {
     let cert = builder(SEED_A, "Alice", "alice@example.com")
-        .certify(None)
+        .certify(CertKind::Full)
         .unwrap();
     let armored = cert.armored().to_vec().unwrap();
 
@@ -302,7 +302,7 @@ fn sq_inspect_accepts_exported_cert() {
 #[test]
 fn gpg_accepts_exported_cert() {
     let cert = builder(SEED_A, "Alice", "alice@example.com")
-        .certify(None)
+        .certify(CertKind::Full)
         .unwrap();
     let armored = cert.armored().to_vec().unwrap();
 

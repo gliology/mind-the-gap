@@ -1,14 +1,14 @@
 // Import helper to add shared commands
-use crate::mnemonic::{MnemonicSeed, MnemonicSource};
 use crate::common;
-use crate::pgp;
+use crate::mnemonic::{MnemonicSeed, MnemonicSource};
+use crate::pgp::{self, CertKind};
 use crate::piv;
 use crate::qr;
 
 use std::{path::PathBuf, time::Duration};
 
-use std::{fs, io};
 use std::io::Write;
+use std::{fs, io};
 
 use anyhow::{anyhow, bail, Result};
 
@@ -144,6 +144,10 @@ enum PGPCommand {
         /// Public certificate output path (QR code shown when omitted)
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Type of certificate to generate (full, uid, subkeys)
+        #[arg(short = 't', long, default_value = "full")]
+        kind: CertKind,
     },
 
     /// Export secret keys to file
@@ -167,11 +171,11 @@ enum PGPCommand {
         /// Revocation certificate output path (QR code shown when omitted)
         #[arg(short, long)]
         output: Option<PathBuf>,
-        
-        /// Reason code of revocation 
+
+        /// Reason code of revocation
         #[arg(short, long, default_value = "0")]
         code: u8,
-        
+
         /// Reason string of revocation
         #[arg(short, long, default_value = "Unspecified")]
         text: String,
@@ -382,18 +386,21 @@ pub fn run() -> Result<()> {
 
                     Ok(())
                 }
-                PGPCommand::Certify { input, output } => {
+                PGPCommand::Certify { input, output, kind } => {
                     // Retrieve initialized builder
                     let builder = builder.unwrap();
 
                     let cert = if let Some(path) = input {
+                        if kind != CertKind::Full {
+                            log::warn!("Certify 'kind' parameter was ignored: {:?}", kind);
+                        }
                         log::info!("Certifying public key file: {}", path.display());
                         let cert = Cert::from_file(path)?;
                         log::info!("Certifying certificate: {}", cert);
-                        builder.certify(Some(cert))?
+                        builder.certify_other(cert)?
                     } else {
-                        log::info!("Certifying seeded primary and subkeys");
-                        builder.certify(None)?
+                        log::info!("Certifying uids and seeded keys: {:?}", kind);
+                        builder.certify(kind)?
                     };
 
                     // Generate public certificate and save result
@@ -526,7 +533,7 @@ pub fn run() -> Result<()> {
                             "Setting certificate validity duration: {}",
                             humantime::format_duration(validity)
                         );
-                       builder = builder.with_validity_duration(validity);
+                        builder = builder.with_validity_duration(validity);
                     }
 
                     // Show info about target card
