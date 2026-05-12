@@ -3,7 +3,7 @@
 
   inputs = {
     # Pinned, as current unstable iso with grub does not boot
-    nixpkgs.url = "github:NixOS/nixpkgs/release-25.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
 
     # Pinned nixpkgs rust is to currently to old
     fenix.url = "github:nix-community/fenix";
