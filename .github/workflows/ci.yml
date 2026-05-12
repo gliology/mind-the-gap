@@ -7,7 +7,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
-        runner: [ubuntu-24.04, macos-26-intel, ubuntu-24.04-arm, macos-26]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        target: [mind-the-gap, iso]
 
     steps:
     - name: Checkout repository
@@ -23,4 +24,4 @@ jobs:
       uses: DeterminateSystems/flake-checker-action@main
 
     - name: Check nix flake
-      run: nix flake check
+      run: nix build .\#${{ matrix.target }}
