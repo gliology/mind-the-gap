@@ -18,7 +18,7 @@
   outputs = { self, nixpkgs, fenix, naersk }:
     let
       # List of all supported system architectures
-      allSystems = [ "x86_64-linux" "aarch64-linux" ];
+      allSystems = [ "x86_64-linux" "x86_64-darwin" "aarch64-linux" "aarch64-darwin" ];
 
       # Helper to generate attrset entry for each system
       forEachSystem = nixpkgs.lib.genAttrs allSystems;
