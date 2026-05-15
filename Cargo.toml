@@ -4,6 +4,7 @@ description = "Derive smart card keys and certs from mnemonic seeds"
 version = "0.2.2"
 authors = ["Florian Franzen <florian@gli.al"]
 edition = "2021"
+default-run = "mind-the-gap"
 #build = "build.rs"
 
 [dependencies]
