@@ -29,22 +29,42 @@ use openpgp_card::ocard::crypto::{CardUploadableKey, EccKey, EccType, PrivateKey
 use openpgp_card::ocard::KeyType;
 use openpgp_card::{Card, Error as CardError};
 
-/// Type of certificate to generate
-#[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
-pub enum CertKind {
-    /// Generate full certificate
-    Full,
-    /// Generate certificate for user IDs only
-    Uids,
-    /// Generate certificate for subkeys only
-    Subkeys,
-}
 use openpgp_card::ocard::data::{Fingerprint as CardFingerprint, KeyGenerationTime, TouchPolicy};
 use openpgp_card::state::Open;
 
 // Some use type shorthands
 type SecretPrimaryKey = Key<key::SecretParts, key::PrimaryRole>;
 type SecretSubKey = Key<key::SecretParts, key::SubordinateRole>;
+
+/// Type of certificate to generate
+#[derive(clap::ValueEnum, Clone, Debug, Default, PartialEq)]
+pub enum CertificateKind {
+    /// Generate certificate for user IDs and subkeys
+    #[default]
+    Generic,
+    /// Generate certficate for primary key only
+    Primary,
+    /// Generate certificate for user IDs only
+    Uids,
+    /// Generate certificate for subkeys only
+    Subkeys,
+    /// Generate full cerficate, incl. self-signed primary
+    Full,
+}
+
+/// Level of verification to specify in certification
+#[derive(clap::ValueEnum, Clone, Debug, Default, PartialEq)]
+pub enum VerificationKind {
+    /// Unspecified amount of verfication of identity claim
+    #[default]
+    Generic,
+    /// No verification of identity claim
+    Persona,
+    /// Casual verification of identity claim
+    Casual,
+    /// Substantial verification of identity claim
+    Positive,
+}
 
 /// Subkeys to export
 pub const DEFAULT_KEY_TYPES: [KeyType; 3] = [
@@ -226,39 +246,58 @@ impl SeededSmartcard {
         self.check_admin_pin(target.clone())?;
 
         // Check if subkeys fingerprints match
-        let mut cert = self.generate_primcert()?;
-        cert = self.append_subcerts(cert)?;
+        let mut cert = self.generate_primary()?;
+        cert = self.append_subkeys(cert)?;
         self.check_subkeys(&cert, target)?;
 
         Ok(())
     }
 
     /// Certify primary key, uids and/or subkeys
-    pub fn certify(&self, kind: CertKind) -> Result<Cert> {
-        let mut cert = self.generate_primcert()?;
+    pub fn certify(&self, kind: CertificateKind) -> Result<Cert> {
+        use CertificateKind::*;
 
-        if kind == CertKind::Full || kind == CertKind::Uids {
+        let mut cert = if kind == Primary || kind == Full {
+            self.generate_signed_primary()?
+        } else {
+            self.generate_primary()?
+        };
+
+        if kind == Generic || kind == Uids || kind == Full {
             cert = self.append_uids(cert)?;
         }
 
-        if kind == CertKind::Full || kind == CertKind::Subkeys {
-            cert = self.append_subcerts(cert)?
+        if kind == Generic || kind == Subkeys || kind == Full {
+            cert = self.append_subkeys(cert)?
         }
 
         Ok(cert.strip_secret_key_material())
     }
 
     /// Certify external keys
-    pub fn certify_other(&self, other: Cert) -> Result<Cert> {
-        self.primsign_cert(other)
+    pub fn trust(&self, other: Cert, kind: VerificationKind) -> Result<Cert> {
+        use VerificationKind::*;
+
+        // Match signature type to user input
+        let kind = match kind {
+            Generic => SignatureType::GenericCertification,
+            Persona => SignatureType::PersonaCertification,
+            Casual => SignatureType::CasualCertification,
+            Positive => SignatureType::PositiveCertification,
+        };
+
+        // Remove subkeys from supplied cert, as we do not sign those
+        let cert = other.clone().retain_subkeys(|_| false);
+
+        self.sign_uids(cert, other, kind)
     }
 
     /// Upload secret subkeys
     pub fn upload(&self, target: Option<String>) -> Result<Cert> {
-        let mut cert = self.generate_primcert()?;
+        let mut cert = self.generate_primary()?;
 
         cert = self.append_uids(cert)?;
-        cert = self.append_subcerts(cert)?;
+        cert = self.append_subkeys(cert)?;
 
         self.upload_subkeys(&cert, target)?;
 
@@ -267,15 +306,15 @@ impl SeededSmartcard {
 
     /// Export all secret keys
     pub fn export(&self) -> Result<Cert> {
-        let mut cert = self.generate_primcert()?;
+        let mut cert = self.generate_primary()?;
 
         cert = self.append_uids(cert)?;
-        self.append_subcerts(cert)
+        self.append_subkeys(cert)
     }
 
     /// Generate and sign revoaction certificate
     pub fn revoke(&self, code: u8, text: &str) -> Result<Packet> {
-        let mut cert = self.generate_primcert()?;
+        let mut cert = self.generate_primary()?;
 
         self.generate_revcert(&mut cert, code, text)
     }
@@ -317,36 +356,27 @@ impl SeededSmartcard {
         Ok(signer)
     }
 
-    /// Sign a certificate with our primary key
-    fn primsign_cert(&self, mut cert: Cert) -> PGPResult<Cert> {
+    /// Generate a primary certificate
+    fn generate_primary(&self) -> PGPResult<Cert> {
         // Generate and self-sign primary key.
-        let mut signer = self.new_primary_signer()?;
+        let primary: SecretPrimaryKey =
+            Key4::import_secret_ed25519(&self.seed, self.creation_time())?.into();
 
-        let policy = &StandardPolicy::new();
-        let cc = cert.clone();
-        let vc = cc.with_policy(policy, None)?;
-
-        for uid in vc.userids() {
-            log::info!("Signing userid '{}'", uid.userid());
-
-            // Use a minimal builder without subpackets
-            let sig = SignatureBuilder::new(SignatureType::GenericCertification)
-                .set_hash_algo(HashAlgorithm::SHA512)
-                .set_signature_creation_time(self.creation_time())?;
-
-            let signature = uid.userid().bind(&mut signer, &cert, sig)?;
-
-            // Insert each signed UserID with its signature to associate them
-            cert = cert
-                .insert_packets(vec![Packet::from(uid.userid().clone()), signature.into()])
-                .map(|(c, _)| c)?;
+        // Optionally encrypt the primary key copy for the certificate
+        let mut primary_enc = primary.clone();
+        if let Some(ref pin) = self.pin.as_ref() {
+            primary_enc
+                .secret_mut()
+                .encrypt_in_place(primary.parts_as_public(), pin)?;
         }
+
+        let cert = Cert::try_from(vec![Packet::SecretKey(primary_enc)])?;
 
         Ok(cert)
     }
 
-    /// Generate primary certificate
-    fn generate_primcert(&self) -> PGPResult<Cert> {
+    /// Generate a self-signed primary certificate
+    fn generate_signed_primary(&self) -> PGPResult<Cert> {
         // Generate and self-sign primary key.
         let primary: SecretPrimaryKey =
             Key4::import_secret_ed25519(&self.seed, self.creation_time())?.into();
@@ -372,7 +402,7 @@ impl SeededSmartcard {
         Ok(cert)
     }
 
-    /// Append signed user ids to a primary certificate
+    /// Append self-signed user ids to a primary certificate
     fn append_uids(&self, mut cert: Cert) -> PGPResult<Cert> {
         // Generate, self-sign and append all subkeys.
         let mut signer = self.new_primary_signer()?;
@@ -393,8 +423,8 @@ impl SeededSmartcard {
         Ok(cert)
     }
 
-    /// Append subkeys to a primary certificate
-    fn append_subcerts(&self, mut cert: Cert) -> PGPResult<Cert> {
+    /// Append self-signed subkeys to a primary certificate
+    fn append_subkeys(&self, mut cert: Cert) -> PGPResult<Cert> {
         // Generate primary key and signer
         let primary: SecretPrimaryKey =
             Key4::import_secret_ed25519(&self.seed, self.creation_time())?.into();
@@ -469,6 +499,33 @@ impl SeededSmartcard {
             // Add everything to certificate
             cert = cert
                 .insert_packets(vec![Packet::SecretSubkey(subkey), signature.into()])
+                .map(|(c, _)| c)?;
+        }
+
+        Ok(cert)
+    }
+
+    /// Sign uids in external certificate with our primary key
+    fn sign_uids(&self, mut cert: Cert, other: Cert, kind: SignatureType) -> PGPResult<Cert> {
+        // Generate and self-sign primary key.
+        let mut signer = self.new_primary_signer()?;
+
+        let policy = &StandardPolicy::new();
+        let valid_other = other.with_policy(policy, None)?;
+
+        for uid in valid_other.userids() {
+            log::info!("Signing userid '{}'", uid.userid());
+
+            // Use a minimal builder without subpackets
+            let sig = SignatureBuilder::new(kind)
+                .set_hash_algo(HashAlgorithm::SHA512)
+                .set_signature_creation_time(self.creation_time())?;
+
+            let signature = uid.userid().bind(&mut signer, &cert, sig)?;
+
+            // Insert each signed UserID with its signature to associate them
+            cert = cert
+                .insert_packets(vec![Packet::from(uid.userid().clone()), signature.into()])
                 .map(|(c, _)| c)?;
         }
 

@@ -1,7 +1,7 @@
 // Import helper to add shared commands
 use crate::common;
 use crate::mnemonic::{MnemonicSeed, MnemonicSource};
-use crate::pgp::{self, CertKind};
+use crate::pgp::{self, CertificateKind, VerificationKind};
 use crate::piv;
 use crate::qr;
 
@@ -135,19 +135,15 @@ enum PGPCommand {
         qr: bool,
     },
 
-    /// Export primary-signed certificates for subkeys or external keys
+    /// Export primary-signed certificates for uids and subkeys
     Certify {
-        /// Optional public key to sign (instead of certifying subkeys)
-        #[arg(short, long)]
-        input: Option<PathBuf>,
+        /// Type of certificate to generate
+        #[arg(short = 't', long, default_value = "generic")]
+        kind: CertificateKind,
 
         /// Public certificate output path (QR code shown when omitted)
         #[arg(short, long)]
         output: Option<PathBuf>,
-
-        /// Type of certificate to generate (full, uid, subkeys)
-        #[arg(short = 't', long, default_value = "full")]
-        kind: CertKind,
     },
 
     /// Export secret keys to file
@@ -179,6 +175,21 @@ enum PGPCommand {
         /// Reason string of revocation
         #[arg(short, long, default_value = "Unspecified")]
         text: String,
+    },
+
+    /// Export primary-signed certificates of external keys
+    Trust {
+        /// External certificate to sign
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Level of verification to certify
+        #[arg(short = 't', long, default_value = "generic")]
+        kind: VerificationKind,
+
+        /// Public certificate output path (QR code shown when omitted)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -386,26 +397,17 @@ pub fn run() -> Result<()> {
 
                     Ok(())
                 }
-                PGPCommand::Certify { input, output, kind } => {
+                PGPCommand::Certify { kind, output } => {
                     // Retrieve initialized builder
                     let builder = builder.unwrap();
 
-                    let cert = if let Some(path) = input {
-                        if kind != CertKind::Full {
-                            log::warn!("Certify 'kind' parameter was ignored: {:?}", kind);
-                        }
-                        log::info!("Certifying public key file: {}", path.display());
-                        let cert = Cert::from_file(path)?;
-                        log::info!("Certifying certificate: {}", cert);
-                        builder.certify_other(cert)?
-                    } else {
-                        log::info!("Certifying uids and seeded keys: {:?}", kind);
-                        builder.certify(kind)?
-                    };
-
                     // Generate public certificate and save result
+                    log::info!("Certifying uids and seeded keys: {:?}", kind);
+                    let cert = builder.certify(kind)?;
+
                     log::info!("Generated PGP certificate '{}'", cert);
                     let armored = cert.armored().to_vec()?;
+
                     if let Some(path) = output {
                         log::info!("Saving certificate to file: {}", path.display());
                         fs::write(path, &armored)?;
@@ -465,7 +467,30 @@ pub fn run() -> Result<()> {
 
                     Ok(())
                 }
-            }
+                PGPCommand::Trust { input, kind, output } => {
+                    // Retrieve initialized builder
+                    let builder = builder.unwrap();
+
+                    // Generate public certificate and save result
+                    log::info!("Certifying certificate in file: {}", input.display());
+                    let other = Cert::from_file(input)?;
+
+                    log::info!("Certifying certificate with id: {}", other);
+                    let cert = builder.trust(other, kind)?;
+
+                    log::info!("Generated PGP certificate '{}'", cert);
+                    let armored = cert.armored().to_vec()?;
+
+                    if let Some(path) = output {
+                        log::info!("Saving certificate to file: {}", path.display());
+                        fs::write(path, &armored)?;
+                    } else {
+                        qr::print_qr(&armored)?;
+                    }
+
+                    Ok(())
+                }
+           }
         }
         // ... then command
         Some(Backend::PIV { date, validity, command }) => {
