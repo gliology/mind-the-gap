@@ -5,7 +5,7 @@ use crate::seed::{Seed256, Seed256Derive};
 
 use anyhow::{anyhow, Result};
 
-use yubikey::{Certificate, Error as CardError, MgmKey, PinPolicy, Serial, TouchPolicy, YubiKey};
+use yubikey::{Certificate, Error as CardError, MgmAlgorithmId, MgmKey, PinPolicy, Serial, TouchPolicy, YubiKey};
 use yubikey::piv::{self, AlgorithmId, ManagementSlotId, SlotId};
 use yubikey::reader::Context;
 
@@ -184,19 +184,18 @@ impl SeededSmartcard {
         token.reset_device()?;
 
         // Authenticate with default key
-        token.authenticate(MgmKey::default())?;
+        token.authenticate(&MgmKey::get_default(&token)?)?;
 
         // Determine management key
-        // TODO: Switch to AES256 once supported iqlusioninc/yubikey.rs#330
         let mgmt_id = u8::from(ManagementSlotId::Management);
         let mgmt_seed = self.seed.derive(Some(&mgmt_id.to_le_bytes()));
-        let mgmt_key = MgmKey::from_bytes(&mgmt_seed[..24])?;
+        let mgmt_key = MgmKey::from_bytes(&mgmt_seed, Some(MgmAlgorithmId::Aes256))?;
 
         // Update management key
         mgmt_key.set_manual(&mut token, true)?;
 
         println!("[Please touch device to authenticate management access!]");
-        token.authenticate(mgmt_key)?;
+        token.authenticate(&mgmt_key)?;
         println!();
 
         // Update pin
@@ -288,28 +287,22 @@ impl SeededSmartcard {
 
     /// Determine validity period from creation time and duration
     fn validity(&self) -> Result<Validity> {
-        let validity = if let Some(time) = self.creation_time {
+        let validity = if let Some(not_before) = self.creation_time {
             // With start time, check if we have a valid duration too
-            let then = if let Some(duration) = self.validity_duration {
-                Time::try_from(time + duration)?
+            let not_after = if let Some(duration) = self.validity_duration {
+                Time::try_from(not_before + duration)?
             } else {
                 Time::INFINITY
             };
 
             // ... and put it all together
-            Validity {
-                not_before: Time::try_from(time)?,
-                not_after: Time::try_from(then)?,
-            }
+            Validity::new(Time::try_from(not_before)?, not_after)
         } else if let Some(duration) = self.validity_duration {
             // With only duration, use now for start
             Validity::from_now(duration)?
         } else {
             // Without anything, default is from now till infinity
-            Validity {
-                not_before: Time::try_from(SystemTime::now())?,
-                not_after: Time::INFINITY,
-            }
+            Validity::infinity()?
         };
 
         Ok(validity)
