@@ -9,6 +9,11 @@ use yubikey::{Certificate, Error as CardError, MgmAlgorithmId, MgmKey, PinPolicy
 use yubikey::piv::{self, AlgorithmId, ManagementSlotId, SlotId};
 use yubikey::reader::Context;
 
+use ed25519_dalek::SigningKey;
+
+use x509_cert::Certificate as X509Certificate;
+use x509_cert::builder::{CertificateBuilder, Builder};
+use x509_cert::builder::profile::BuilderProfile;
 use x509_cert::name::Name;
 use x509_cert::ext::pkix::SubjectAltName;
 use x509_cert::ext::pkix::name::GeneralName;
@@ -19,6 +24,8 @@ use der::Encode;
 use der::asn1::Ia5String;
 
 use sha2::{Digest, Sha256};
+use spki::SubjectPublicKeyInfoOwned;
+use spki::SubjectPublicKeyInfoRef;
 use zeroize::{Zeroize, Zeroizing};
 
 /// Configuration of key slots to be generated and uploaded
@@ -135,11 +142,19 @@ impl SeededSmartcard {
 
     // PUBLIC OUTPUT API
 
-    pub fn check(self, _target: Option<String>) -> Result<()> {
+    /// Generate primary certificate
+    pub fn certify(&self) -> Result<X509Certificate> {
+        let cert = self.generate_primary()?;
+
+        Ok(cert)
+    }
+
+    /// Check available PIV card setup
+    pub fn check(&self, _target: Option<String>) -> Result<()> {
         todo!()
     }
 
-    /// Generate certificate and revocation signature
+    /// Generate subkeys and subcertificates and upload them to card
     pub fn upload(&self, target: Option<String>) -> Result<()> {
         // Open connection to smart card
         let mut token = if let Some(serial) = target {
@@ -306,5 +321,67 @@ impl SeededSmartcard {
         };
 
         Ok(validity)
+    }
+
+    /// Generate the users primary certificate
+    fn generate_primary(&self) -> Result<X509Certificate> {
+        let profile = SelfSigned { subject: self.name() };
+
+        // Generate signer from subseed and derive pubkey
+        let signer = SigningKey::from_bytes(&self.seed);
+        let pubkey = SubjectPublicKeyInfoOwned::from_key(&signer.verifying_key())?;
+
+        // Generate serial number from last 20 bytes of public key fingerprint
+        let mut keyid = pubkey.fingerprint_bytes()?;
+        keyid[12] &= 0x7f; // MSB has to be zero
+        let serial = SerialNumber::new(&keyid[12..32])?;
+
+        // Put it all together ...
+        let mut builder = CertificateBuilder::new(
+            profile,
+            serial,
+            self.validity()?,
+            pubkey,
+        )?;
+
+        // ... with any alternative names
+        builder
+            .add_extension(&SubjectAltName(self.alternatives.clone()))
+            .expect("GeneralName always results in valid extension");
+
+        // ... and sign it
+        Ok(builder.build(&signer)?)
+    } 
+}
+
+/// A [`BuilderProfile`] for self-signed certificates.
+///
+/// Taken from yubikey.rs, as it does not have an accesible intializer.
+struct SelfSigned {
+    subject: Name,
+}
+
+impl BuilderProfile for SelfSigned {
+    fn get_issuer(&self, subject: &Name) -> Name {
+        // RFC 5280 Section 3.2:
+        //
+        // > Self-issued certificates are CA certificates in which the issuer and subject
+        // > are the same entity. [..] Self-signed certificates are self-issued
+        // > certificates where the digital signature may be verified by the public key
+        // > bound into the certificate.
+        subject.clone()
+    }
+
+    fn get_subject(&self) -> Name {
+        self.subject.clone()
+    }
+
+    fn build_extensions(
+        &self,
+        _spk: SubjectPublicKeyInfoRef<'_>,
+        _issuer_spk: SubjectPublicKeyInfoRef<'_>,
+        _tbs: &x509_cert::TbsCertificate,
+    ) -> x509_cert::builder::Result<Vec<x509_cert::ext::Extension>> {
+        Ok(vec![])
     }
 }

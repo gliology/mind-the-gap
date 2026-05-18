@@ -50,6 +50,8 @@ der = "0.8"
 spki = { version = "0.8", features = [ "fingerprint" ]}
 sha2 = "0.10"
 p256 = "0.14.0-rc.9"
+ed25519-dalek = { version = "3.0.0-pre.7", features = [ "alloc", "pkcs8" ]}
+pem-rfc7468 = "1.0"
 
 [lib]
 doctest = false

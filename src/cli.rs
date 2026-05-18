@@ -16,6 +16,10 @@ use chrono::{DateTime, Utc};
 
 use clap::{ArgGroup, Command, CommandFactory, Parser, Subcommand};
 
+use sha2::{Digest, Sha256};
+use der::Encode;
+use pem_rfc7468::{encode_string, LineEnding};
+
 use sequoia_openpgp::armor;
 use sequoia_openpgp::cert::Cert;
 use sequoia_openpgp::parse::Parse;
@@ -197,6 +201,13 @@ enum PGPCommand {
 enum PIVCommand {
     /// Display current status
     Status,
+
+    /// Export primary-signed certificates that signs all subcerts
+    Certify {
+        /// Public certificate output path (QR code shown when omitted)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 
     /// Check validity of smartcard
     Check {
@@ -513,6 +524,29 @@ pub fn run() -> Result<()> {
 
             match command {
                 PIVCommand::Status => piv::status(),
+                PIVCommand::Certify { output } => {
+                    // Retrieve initialized builder
+                    let builder = builder.unwrap();
+
+                    // Generate public certificate and save result
+                    log::info!("Generating primary PIV certificate");
+                    let cert = builder.certify()?;
+                    let encoded = cert.to_der()?;
+                    let certid = Sha256::digest(&encoded);
+
+                    let pem = encode_string("CERTIFICATE", LineEnding::default(), &encoded)?;
+
+                    log::info!("Generated primary PIV certificate: {:x}", certid);
+
+                    if let Some(path) = output {
+                        log::info!("Saving certificate to file: {}", path.display());
+                        fs::write(path, &pem.into_bytes())?;
+                    } else {
+                        qr::print_qr(&pem.into_bytes())?;
+                    }
+
+                    Ok(())
+                }
                 PIVCommand::Check { pin, card } => {
                     let mut builder = builder.unwrap();
 
