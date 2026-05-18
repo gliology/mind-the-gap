@@ -140,7 +140,7 @@ impl SeededSmartcard {
     }
 
     /// Generate certificate and revocation signature
-    pub fn upload(self, target: Option<String>) -> Result<()> {
+    pub fn upload(&self, target: Option<String>) -> Result<()> {
         // Open connection to smart card
         let mut token = if let Some(serial) = target {
             YubiKey::open_by_serial(Serial::from_str(&serial)?)
@@ -200,7 +200,7 @@ impl SeededSmartcard {
         println!();
 
         // Update pin
-        if let Some(pin) = self.pin {
+        if let Some(pin) = &self.pin {
             token.change_pin(b"123456", pin.as_bytes())?;
             token.verify_pin(pin.as_bytes())?;
         } else {
@@ -213,34 +213,8 @@ impl SeededSmartcard {
 
         // Generate subkeys
         let subseed = self.seed.derive(self.subkey.as_ref().map(|k| k.as_bytes()));
-         
-        // Determine validity period ...
-        let validity = if let Some(time) = self.creation_time {
-            // ... with start time, check if we have a valid duration too
-            let then = if let Some(duration) = self.validity_duration {
-                Time::try_from(time + duration)?
-            } else {
-                Time::INFINITY
-            };
-
-            // ... and put it all together
-            Validity {
-                not_before: Time::try_from(time)?,
-                not_after: Time::try_from(then)?,
-            }
-        } else if let Some(duration) = self.validity_duration {
-            // ... with only duration, use now for start
-            Validity::from_now(duration)?
-        } else {
-            // ... without anything, default is from now till infinity
-            Validity {
-                not_before: Time::try_from(SystemTime::now())?,
-                not_after: Time::INFINITY,
-            }
-        };
 
         // Generate common name
-        let name = Name::from_str(&format!("CN={}", self.name)).unwrap();
         for slot in DEFAULT_KEY_SLOTS.iter() {
             // Generate and upload key
             log::info!("Generating and uploading {:?} subkey", slot);
@@ -278,8 +252,8 @@ impl SeededSmartcard {
                 &mut token,
                 *slot,
                 serial.clone(),
-                validity,
-                name.clone(),
+                self.validity()?,
+                self.name(),
                 pubkey,
                 |builder| {
                     // Generate and add extensions
@@ -303,5 +277,41 @@ impl SeededSmartcard {
         token.deauthenticate()?;
 
         Ok(())
+    }
+
+    // HELPER FOR COMMEN PROPERTIES
+
+    /// Generate default certificate subject
+    fn name(&self) -> Name {
+        Name::from_str(&format!("CN={}", self.name)).unwrap()
+    }
+
+    /// Determine validity period from creation time and duration
+    fn validity(&self) -> Result<Validity> {
+        let validity = if let Some(time) = self.creation_time {
+            // With start time, check if we have a valid duration too
+            let then = if let Some(duration) = self.validity_duration {
+                Time::try_from(time + duration)?
+            } else {
+                Time::INFINITY
+            };
+
+            // ... and put it all together
+            Validity {
+                not_before: Time::try_from(time)?,
+                not_after: Time::try_from(then)?,
+            }
+        } else if let Some(duration) = self.validity_duration {
+            // With only duration, use now for start
+            Validity::from_now(duration)?
+        } else {
+            // Without anything, default is from now till infinity
+            Validity {
+                not_before: Time::try_from(SystemTime::now())?,
+                not_after: Time::INFINITY,
+            }
+        };
+
+        Ok(validity)
     }
 }
