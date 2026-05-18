@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::seed::{Seed256, Seed256Derive};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 use yubikey::{Certificate, Error as CardError, MgmKey, PinPolicy, Serial, TouchPolicy, YubiKey};
 use yubikey::piv::{self, AlgorithmId, ManagementSlotId, SlotId};
@@ -19,7 +19,6 @@ use der::Encode;
 use der::asn1::Ia5String;
 
 use sha2::{Digest, Sha256};
-use rand_core::{OsRng, TryRngCore};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Configuration of key slots to be generated and uploaded
@@ -116,7 +115,9 @@ impl SeededSmartcard {
 
     /// Add email to list of alternative names
     pub fn add_email(mut self, address: String) -> Self {
-        self.alternatives.push(GeneralName::Rfc822Name(Ia5String::new(address.as_str()).unwrap()));
+        self.alternatives.push(GeneralName::Rfc822Name(
+            Ia5String::new(address.as_str()).unwrap(),
+        ));
         self
     }
 
@@ -240,13 +241,6 @@ impl SeededSmartcard {
 
         // Generate common name
         let name = Name::from_str(&format!("CN={}", self.name)).unwrap();
-
-        // Generate random serial number
-        let mut serial = [0u8; 20];
-        OsRng.try_fill_bytes(&mut serial).expect("OS RNG failed");
-        serial[0] &= 0x7f; // MSB has to be zero
-        let serial = SerialNumber::new(&serial).unwrap();
-
         for slot in DEFAULT_KEY_SLOTS.iter() {
             // Generate and upload key
             log::info!("Generating and uploading {:?} subkey", slot);
@@ -265,8 +259,16 @@ impl SeededSmartcard {
 
             slotseed.zeroize();
 
-            // Retrieve metadata
+            // Retrieve metadata and public key
             let metadata = piv::metadata(&mut token, *slot)?;
+            let pubkey = metadata
+                .public
+                .ok_or(anyhow!("Failed to retrieve public key"))?;
+
+            // Generate serial number from last 20 bytes of public key fingerprint
+            let mut keyid = pubkey.fingerprint_bytes()?;
+            keyid[12] &= 0x7f; // MSB has to be zero
+            let serial = SerialNumber::new(&keyid[12..32])?;
 
             // Generate a self-signed certificate for the new key.
             log::info!("Generating and uploading {:?} certificate", slot);
@@ -278,18 +280,24 @@ impl SeededSmartcard {
                 serial.clone(),
                 validity,
                 name.clone(),
-                metadata.public.unwrap(),
+                pubkey,
                 |builder| {
                     // Generate and add extensions
-                    builder.add_extension(&SubjectAltName(self.alternatives.clone())).unwrap();
+                    builder
+                        .add_extension(&SubjectAltName(self.alternatives.clone()))
+                        .expect("GeneralName always results in valid extension");
                     Ok(())
-                }
+                },
             )?;
             println!();
 
             // Determine cert fingerprint
-            let fingerprint = Sha256::digest((&cert.cert).to_der().unwrap());
-            log::info!("Uploaded certificate with fingerprint '{:x}'", fingerprint);
+            let certid = Sha256::digest(
+                (&cert.cert)
+                    .to_der()
+                    .expect("generated certificate can always be encoded"),
+            );
+            log::info!("Uploaded certificate with fingerprint '{:x}'", certid);
         }
 
         token.deauthenticate()?;
