@@ -528,21 +528,18 @@ pub fn run() -> Result<()> {
                     // Retrieve initialized builder
                     let builder = builder.unwrap();
 
-                    // Generate public certificate and save result
+                    // Generate public certificate and determine fingerprint
                     log::info!("Generating primary PIV certificate");
-                    let cert = builder.certify()?;
-                    let encoded = cert.to_der()?;
-                    let certid = Sha256::digest(&encoded);
+                    let cert = builder.certify()?.to_der()?;
+                    log::info!("Generated primary PIV certificate: {:x}", Sha256::digest(&cert));
 
-                    let pem = encode_string("CERTIFICATE", LineEnding::default(), &encoded)?;
-
-                    log::info!("Generated primary PIV certificate: {:x}", certid);
-
+                    // Export certificate in PEM format
+                    let encoded = encode_string("CERTIFICATE", LineEnding::default(), &cert)?;
                     if let Some(path) = output {
                         log::info!("Saving certificate to file: {}", path.display());
-                        fs::write(path, &pem.into_bytes())?;
+                        fs::write(path, &encoded.into_bytes())?;
                     } else {
-                        qr::print_qr(&pem.into_bytes())?;
+                        qr::print_qr(&encoded.into_bytes())?;
                     }
 
                     Ok(())
