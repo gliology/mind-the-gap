@@ -62,7 +62,7 @@
         {
           default = pkgs.mkShell {
             nativeBuildInputs =
-              (with pkgs; [ pkg-config rustPlatform.bindgenHook sequoia-sq gnupg ])
+              (with pkgs; [ cargo-deny pkg-config rustPlatform.bindgenHook sequoia-sq gnupg ])
                 ++ (with toolchain; [ cargo rustc rust-analyzer rustfmt ]);
 
             buildInputs = with pkgs; [ gmp nettle pcsclite ];
