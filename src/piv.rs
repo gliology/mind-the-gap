@@ -777,10 +777,7 @@ impl SeededSmartcard {
         let _ = token;
         let mgmt_id = u8::from(ManagementSlotId::Management);
         let mgmt_seed = self.subseed.derive(Some(&mgmt_id.to_le_bytes()));
-        Ok(MgmKey::from_bytes(
-            &mgmt_seed,
-            Some(MgmAlgorithmId::Aes256),
-        )?)
+        Ok(MgmKey::from_bytes(mgmt_seed, Some(MgmAlgorithmId::Aes256))?)
     }
 
     /// Card identifier used in the slot 9E subject.
@@ -1017,6 +1014,10 @@ impl BuilderProfile for PivRootCa {
         self.subject.clone()
     }
 
+    // `to_extension` takes the extensions accumulated so far, because `Criticality` may
+    // depend on them, so these pushes are sequentially dependent and cannot become a
+    // `vec![]` literal.
+    #[allow(clippy::vec_init_then_push)]
     fn build_extensions(
         &self,
         spk: SubjectPublicKeyInfoRef<'_>,
@@ -1072,6 +1073,10 @@ impl BuilderProfile for PivIssuingCa {
         self.subject.clone()
     }
 
+    // `to_extension` takes the extensions accumulated so far, because `Criticality` may
+    // depend on them, so these pushes are sequentially dependent and cannot become a
+    // `vec![]` literal.
+    #[allow(clippy::vec_init_then_push)]
     fn build_extensions(
         &self,
         spk: SubjectPublicKeyInfoRef<'_>,
@@ -1122,6 +1127,10 @@ impl BuilderProfile for PivLeaf {
         self.subject.clone()
     }
 
+    // `to_extension` takes the extensions accumulated so far, because `Criticality` may
+    // depend on them, so these pushes are sequentially dependent and cannot become a
+    // `vec![]` literal.
+    #[allow(clippy::vec_init_then_push)]
     fn build_extensions(
         &self,
         spk: SubjectPublicKeyInfoRef<'_>,

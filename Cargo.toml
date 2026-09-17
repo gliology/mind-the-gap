@@ -5,7 +5,7 @@ version = "0.2.2"
 authors = ["Florian Franzen <florian@gli.al"]
 edition = "2021"
 default-run = "mind-the-gap"
-#build = "build.rs"
+build = "build.rs"
 
 [dependencies]
 # Command line interface

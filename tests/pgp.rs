@@ -268,6 +268,7 @@ fn fp_hex(cert: &Cert) -> String {
 }
 
 #[test]
+#[cfg_attr(not(has_sq), ignore = "sq not found in PATH")]
 fn sq_inspect_accepts_exported_cert() {
     let cert = builder(SEED_A, "Alice", "alice@example.com")
         .certify(CertificateKind::default())
@@ -299,6 +300,7 @@ fn sq_inspect_accepts_exported_cert() {
 }
 
 #[test]
+#[cfg_attr(not(has_gpg), ignore = "gpg not found in PATH")]
 fn gpg_accepts_exported_cert() {
     let cert = builder(SEED_A, "Alice", "alice@example.com")
         .certify(CertificateKind::default())

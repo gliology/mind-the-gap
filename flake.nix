@@ -62,8 +62,13 @@
         {
           default = pkgs.mkShell {
             nativeBuildInputs =
-              (with pkgs; [ pkg-config rustPlatform.bindgenHook sequoia-sq gnupg ])
-                ++ (with toolchain; [ cargo rustc rust-analyzer rustfmt ]);
+              # Tools the integration tests shell out to. Without them the affected tests
+              # report as ignored rather than silently passing, see build.rs.
+              (with pkgs; [ sequoia-sq gnupg openssl ])
+                # Tools for the manual PIV hardware checklist, see docs/piv-hardware-testing.md
+                ++ (with pkgs; [ opensc yubikey-manager nss.tools ])
+                ++ (with pkgs; [ pkg-config rustPlatform.bindgenHook ])
+                ++ (with toolchain; [ cargo rustc rust-analyzer rustfmt clippy ]);
 
             buildInputs = with pkgs; [ gmp nettle pcsclite ];
 

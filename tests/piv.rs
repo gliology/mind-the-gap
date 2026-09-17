@@ -501,6 +501,7 @@ fn serials_are_distinct_and_positive() {
 // --- External validation -----------------------------------------------------
 
 #[test]
+#[cfg_attr(not(has_openssl), ignore = "openssl not found in PATH")]
 fn openssl_verifies_chain() {
     for intermediate in [false, true] {
         let chain = alice()
@@ -585,6 +586,7 @@ fn openssl_verifies_chain() {
 }
 
 #[test]
+#[cfg_attr(not(has_openssl), ignore = "openssl not found in PATH")]
 fn openssl_encrypts_to_key_management_cert() {
     // The real end use for slot 9D: CMS enveloping has to pick ECDH key agreement. This is
     // what `-purpose smimeencrypt` cannot tell us, since it only understands RSA transport.

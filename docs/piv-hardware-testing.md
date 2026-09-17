@@ -17,21 +17,30 @@ unit-tested as far as is possible without hardware, but has never been run again
 A YubiKey 5 series (or any PIV token supporting AES-256 management keys and P-256 import), a
 CCID reader, and a running `pcscd`.
 
-The tooling is not in the project's dev shell, so pull it in separately:
+All of the tooling is in the project's dev shell, so just:
 
 ```
-nix shell nixpkgs#openssl nixpkgs#opensc nixpkgs#yubikey-manager nixpkgs#nss
+nix develop
 ```
 
-Note that `cargo test --test piv` **silently skips** its two OpenSSL-dependent tests when
-`openssl` is not on `PATH`. Run the suite inside the shell above to actually exercise them:
+That provides `openssl`, `opensc` (`pkcs11-tool`, `pkcs15-tool`), `yubikey-manager` (`ykman`)
+and `nss.tools` (`certutil`, `modutil`), alongside the `sq` and `gpg` the OpenPGP tests use.
+
+Tests that shell out to an external tool are marked `#[ignore]` when that tool is absent, via
+the probe in `build.rs`, so they are reported as ignored rather than quietly passing. Inside
+the dev shell nothing should be ignored:
 
 ```
-nix shell nixpkgs#openssl --command cargo test --test piv
+cargo test        # expect 0 ignored
 ```
 
-Throughout, `$PKCS11` is `${pkgs.opensc}/lib/opensc-pkcs11.so` (`nix eval` it, or use the path
-`pkcs11-tool --module` reports).
+If you see `N ignored`, a tool is missing and those checks did **not** run.
+
+Throughout, `$PKCS11` is the `opensc-pkcs11.so` from the dev shell:
+
+```
+export PKCS11=$(dirname $(dirname $(command -v pkcs11-tool)))/lib/opensc-pkcs11.so
+```
 
 ## 1. Provision the card
 
@@ -174,7 +183,7 @@ fix rather than dropping the touch requirement.
 ## If something fails
 
 Everything up to step 1 is reproducible offline without a card, so start by confirming
-`cargo test --test piv` is green *with OpenSSL present*. A mismatch reported by `piv check`
+`cargo test --test piv` is green with **0 ignored**. A mismatch reported by `piv check`
 between the derived and on-card public key points at the derivation or the import path; a
 mismatch in the certificate digest alone points at encoding or at the `--date` / `--card-id` /
 DN flags differing between the `upload` and `check` invocations -- all of them must be passed
