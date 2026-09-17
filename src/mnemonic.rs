@@ -25,6 +25,9 @@ pub enum MnemonicSource {
 
 impl MnemonicSeed {
     /// Create new random seed
+    // No `Default` impl on purpose: this mints fresh key material, whereas `Default::default()`
+    // reads as cheap and inert. Generating a new 24 word mnemonic has to stay an explicit call.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         MnemonicSeed {
             mnemonic: Mnemonic::new(MnemonicType::Words24, Language::English),

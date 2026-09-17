@@ -55,6 +55,9 @@ pub struct CLI {
 }
 
 #[derive(Subcommand, Clone, Debug)]
+// PGP and PIV are the established names of these backends and of the subcommands they map to;
+// spelling them `Pgp`/`Piv` would read worse in a domain where both are always capitalised.
+#[allow(clippy::upper_case_acronyms)]
 enum Backend {
     /// Generate and export PGP keys and certs
     PGP {
@@ -122,6 +125,9 @@ enum Backend {
 
 impl Backend {
     /// Determine if selected backend and command needs secret seed data
+    // Kept as a match so both backends line up symmetrically; the `!matches!(..)` form clippy
+    // suggests hides the shared shape behind a negation.
+    #[allow(clippy::match_like_matches_macro)]
     fn needs_seed(self) -> bool {
         match self {
             Backend::PGP { command: PGPCommand::Status, ..} => false,
@@ -399,9 +405,9 @@ pub fn run() -> Result<()> {
                     let mut builder = builder.unwrap();
 
                     // Apply pin to smartcard
-                    if let Some(ref pin) = pin.as_ref() {
+                    if let Some(pin) = pin.as_ref() {
                         log::info!("Checking protection pin: {}", pin.as_str());
-                        builder = builder.with_pin((*pin).clone());
+                        builder = builder.with_pin(pin.clone());
                     }
 
                     // Show info about target card
@@ -421,9 +427,9 @@ pub fn run() -> Result<()> {
                     }
 
                     // Apply pin to smartcard and cert
-                    if let Some(ref pin) = pin.as_ref() {
+                    if let Some(pin) = pin.as_ref() {
                         log::info!("Setting protection pin: {}", pin.as_str());
-                        builder = builder.with_pin((*pin).clone());
+                        builder = builder.with_pin(pin.clone());
                     }
 
                     // Show info about target card
@@ -476,9 +482,9 @@ pub fn run() -> Result<()> {
                     let mut builder = builder.unwrap();
 
                     // Apply pin to private keys
-                    if let Some(ref pin) = pin.as_ref() {
+                    if let Some(pin) = pin.as_ref() {
                         log::info!("Setting protection pin of export: {}", pin.as_str());
-                        builder = builder.with_pin((*pin).clone());
+                        builder = builder.with_pin(pin.clone());
                     }
 
                     // Generate secret keys and save result
@@ -670,9 +676,9 @@ pub fn run() -> Result<()> {
                 PIVCommand::Check { pin, card } => {
                     let mut builder = builder.unwrap();
 
-                    if let Some(ref pin) = pin.as_ref() {
+                    if let Some(pin) = pin.as_ref() {
                         log::info!("Checking protection pin: {}", pin.as_str());
-                        builder = builder.with_pin((*pin).clone());
+                        builder = builder.with_pin(pin.clone());
                     }
 
                     // Show info about target card
@@ -684,7 +690,7 @@ pub fn run() -> Result<()> {
                 },
                 PIVCommand::Upload { pin, card, yes, output, show_qr } => {
                     // Verify user inputs further
-                    if let Some(ref pin) = pin.as_ref() {
+                    if let Some(pin) = pin.as_ref() {
                         if pin.len() < 6 || pin.len() > 8 {
                             bail!("PIV pin needs to be between 6 and 8 characters")
                         }
@@ -692,9 +698,9 @@ pub fn run() -> Result<()> {
 
                     let mut builder = builder.unwrap();
 
-                    if let Some(ref pin) = pin.as_ref() {
+                    if let Some(pin) = pin.as_ref() {
                         log::info!("Setting smartcard user pin: {}", pin.as_str());
-                        builder = builder.with_pin((*pin).clone());
+                        builder = builder.with_pin(pin.clone());
                     }
 
                     // Show info about target card

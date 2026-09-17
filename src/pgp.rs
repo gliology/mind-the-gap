@@ -364,7 +364,7 @@ impl SeededSmartcard {
 
         // Optionally encrypt the primary key copy for the certificate
         let mut primary_enc = primary.clone();
-        if let Some(ref pin) = self.pin.as_ref() {
+        if let Some(pin) = self.pin.as_ref() {
             primary_enc
                 .secret_mut()
                 .encrypt_in_place(primary.parts_as_public(), pin)?;
@@ -391,7 +391,7 @@ impl SeededSmartcard {
 
         // Optionally encrypt the primary key copy for the certificate
         let mut primary_enc = primary.clone();
-        if let Some(ref pin) = self.pin.as_ref() {
+        if let Some(pin) = self.pin.as_ref() {
             primary_enc
                 .secret_mut()
                 .encrypt_in_place(primary.parts_as_public(), pin)?;
@@ -489,7 +489,7 @@ impl SeededSmartcard {
             let signature = subkey.bind(&mut signer, &cert, builder)?;
 
             // Apply password protection (use a clone for the key reference to avoid borrow conflict)
-            if let Some(ref pin) = self.pin.as_ref() {
+            if let Some(pin) = self.pin.as_ref() {
                 let subkey_pub = subkey.clone();
                 subkey
                     .secret_mut()
@@ -576,7 +576,7 @@ impl SeededSmartcard {
                 .keys()
                 .subkeys()
                 .find(|k| {
-                    k.key_flags().map_or(false, |flags| {
+                    k.key_flags().is_some_and(|flags| {
                         if *is_enc {
                             flags.for_storage_encryption() || flags.for_transport_encryption()
                         } else if *code == 0x02 {
@@ -632,7 +632,7 @@ impl SeededSmartcard {
         transaction.factory_reset()?;
 
         // Change user pin if it was specified
-        if let Some(ref pin) = self.pin.as_ref() {
+        if let Some(pin) = self.pin.as_ref() {
             let new_pin: Zeroizing<String> =
                 pin.map(|p| String::from_utf8_lossy(p).to_string()).into();
             transaction.change_user_pin(
@@ -665,7 +665,7 @@ impl SeededSmartcard {
                 .keys()
                 .subkeys()
                 .find(|k| {
-                    k.key_flags().map_or(false, |flags| {
+                    k.key_flags().is_some_and(|flags| {
                         if *is_enc {
                             flags.for_storage_encryption() || flags.for_transport_encryption()
                         } else if *code == 0x02 {
@@ -768,7 +768,7 @@ impl SeededSmartcard {
         let revocation: Packet = CertRevocationBuilder::new()
             .set_signature_creation_time(creation_time)?
             .set_reason_for_revocation(reason, text.as_bytes())?
-            .build(&mut signer, &cert, None)?
+            .build(&mut signer, cert, None)?
             .into();
 
         Ok(revocation)
@@ -798,7 +798,7 @@ impl CardUploadableKey for RawEccKey {
     }
 
     fn timestamp(&self) -> KeyGenerationTime {
-        self.timestamp.clone()
+        self.timestamp
     }
 
     fn fingerprint(&self) -> std::result::Result<CardFingerprint, openpgp_card::Error> {
