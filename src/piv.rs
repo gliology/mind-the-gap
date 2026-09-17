@@ -116,22 +116,36 @@ pub fn status() -> Result<()> {
     for reader in cards {
         println!(" - Reader '{}'", reader.name());
 
-        let mut token = reader.open()?;
+        // A reader that is busy or holds a non-PIV card must not abort the whole listing:
+        // status is a read-only overview and is expected to report what it can.
+        let mut token = match reader.open() {
+            Ok(token) => token,
+            Err(err) => {
+                println!("   Unavailable: {err}");
+                println!();
+                continue;
+            }
+        };
         println!("   Serial: {}", token.serial());
 
-        for key in token.piv_keys()? {
-            let cert = key.certificate();
-            let raw = &cert.cert;
+        match token.piv_keys() {
+            Ok(keys) => {
+                for key in keys {
+                    let cert = key.certificate();
 
-            // Fingerprint is SHA256 hash of certificate
-            let fingerprint = Sha256::digest(raw.to_der().unwrap());
-
-            println!(
-                "   {} key: {:x} ({})",
-                key.slot(),
-                fingerprint,
-                cert.subject()
-            );
+                    // Fingerprint is SHA256 hash of certificate
+                    match cert.cert.to_der() {
+                        Ok(der) => println!(
+                            "   {} key: {:x} ({})",
+                            key.slot(),
+                            Sha256::digest(der),
+                            cert.subject()
+                        ),
+                        Err(err) => println!("   {} key: unreadable certificate: {err}", key.slot()),
+                    }
+                }
+            }
+            Err(err) => println!("   No PIV keys: {err}"),
         }
 
         println!();
