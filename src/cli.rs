@@ -18,7 +18,6 @@ use clap::{ArgGroup, Command, CommandFactory, Parser, Subcommand};
 
 use sha2::{Digest, Sha256};
 use der::Encode;
-use pem_rfc7468::{encode_string, LineEnding};
 
 use sequoia_openpgp::armor;
 use sequoia_openpgp::cert::Cert;
@@ -76,13 +75,45 @@ enum Backend {
     },
     /// Generate and export PIV keys and certs
     PIV {
-        /// Creation date of certificates (current timestamp by default)
+        /// Creation date of certificates (unix epoch by default)
         #[arg(short, long, value_name = "YYYY-MM-DD", global = true, env = "MIND_THE_DATE", value_parser = common::parse_date)]
         date: Option<DateTime<Utc>>,
 
-        /// Validity duration of certificates (infinite by default)
+        /// Validity duration of the slot certificates (infinite by default)
         #[arg(short, long, value_name = "DURATION", global = true, env = "MIND_THE_VALIDITY", value_parser = common::parse_duration)]
         validity: Option<Duration>,
+
+        /// Insert an intermediate issuing CA between the root and the slot certificates
+        #[arg(long, global = true, env = "MIND_THE_INTERMEDIATE")]
+        intermediate: bool,
+
+        /// Organization (O) to include in all certificate subjects
+        #[arg(long, value_name = "ORG", global = true, env = "MIND_THE_ORG")]
+        org: Option<String>,
+
+        /// Organizational unit (OU) to include in all certificate subjects
+        #[arg(long, value_name = "UNIT", global = true, env = "MIND_THE_OU")]
+        ou: Option<String>,
+
+        /// Two-letter ISO country code (C) to include in all certificate subjects
+        #[arg(long, value_name = "CC", global = true, env = "MIND_THE_COUNTRY")]
+        country: Option<String>,
+
+        /// Card identifier used in the card authentication subject (derived by default)
+        #[arg(long, value_name = "ID", global = true, env = "MIND_THE_CARD_ID")]
+        card_id: Option<String>,
+
+        /// Override the per-slot pin policy (ignored for the card authentication slot)
+        #[arg(long, value_enum, global = true, env = "MIND_THE_PIN_POLICY")]
+        pin_policy: Option<piv::PinPolicyArg>,
+
+        /// Override the per-slot touch policy (ignored for the card authentication slot)
+        #[arg(long, value_enum, global = true, env = "MIND_THE_TOUCH_POLICY")]
+        touch_policy: Option<piv::TouchPolicyArg>,
+
+        /// Do not store the certificate authorities in the card's msroots object
+        #[arg(long, global = true)]
+        no_msroots: bool,
 
         #[command(subcommand)]
         command: PIVCommand,
@@ -202,8 +233,12 @@ enum PIVCommand {
     /// Display current status
     Status,
 
-    /// Export primary-signed certificates that signs all subcerts
+    /// Export the derived certificate chain
     Certify {
+        /// Which part of the chain to export
+        #[arg(short = 't', long, value_enum, default_value = "chain")]
+        kind: piv::CertificateKind,
+
         /// Public certificate output path (QR code shown when omitted)
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -233,6 +268,14 @@ enum PIVCommand {
         /// Accept potentially dangerous operations
         #[arg(short, long)]
         yes: bool,
+
+        /// Certificate chain output path
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Show the root certificate as a QR code
+        #[arg(short = 'q', long = "qr")]
+        show_qr: bool,
     },
 }
 
@@ -504,7 +547,19 @@ pub fn run() -> Result<()> {
            }
         }
         // ... then command
-        Some(Backend::PIV { date, validity, command }) => {
+        Some(Backend::PIV {
+            date,
+            validity,
+            intermediate,
+            org,
+            ou,
+            country,
+            card_id,
+            pin_policy,
+            touch_policy,
+            no_msroots,
+            command,
+        }) => {
             let builder = if command != PIVCommand::Status {
                 let name = name.ok_or(anyhow!("Requires name to be specified"))?;
 
@@ -512,9 +567,67 @@ pub fn run() -> Result<()> {
                 log::info!("Generating PIV certificates for '{}'", name);
                 let mut builder = piv::SeededSmartcard::new(seed.seed(), subkey, name);
 
-                for address in emails.into_iter() {
+                for address in emails.iter() {
                     log::info!("Adding SAN for email: {}", address);
                     builder = builder.add_email(address);
+                }
+
+                // Distinguished name attributes shared by every tier of the chain
+                if let Some(org) = org {
+                    log::info!("Setting certificate organization: {}", org);
+                    builder = builder.with_org(org);
+                }
+                if let Some(unit) = ou {
+                    log::info!("Setting certificate organizational unit: {}", unit);
+                    builder = builder.with_org_unit(unit);
+                }
+                if let Some(country) = country {
+                    log::info!("Setting certificate country: {}", country);
+                    builder = builder.with_country(country);
+                }
+                if let Some(id) = card_id {
+                    log::info!("Setting card identifier: {}", id);
+                    builder = builder.with_card_id(id);
+                }
+
+                if intermediate {
+                    log::info!("Inserting an intermediate issuing certificate authority");
+                    builder = builder.with_intermediate(true);
+                }
+
+                // Policy overrides only affect the user slots, never card authentication
+                if let Some(policy) = pin_policy {
+                    log::info!("Setting slot pin policy: {:?}", policy);
+                    builder = builder.with_pin_policy(policy.into());
+                }
+                if let Some(policy) = touch_policy {
+                    log::info!("Setting slot touch policy: {:?}", policy);
+                    builder = builder.with_touch_policy(policy.into());
+                }
+
+                if no_msroots {
+                    log::info!("Not storing certificate authorities in msroots");
+                    builder = builder.with_msroots(false);
+                }
+
+                // Applied here rather than per command so that certify, check and upload all
+                // derive the very same chain
+                if let Some(date) = date {
+                    log::info!(
+                        "Setting certificate creation time: {}",
+                        date.format("%Y-%m-%d %T")
+                    );
+                    builder = builder.with_creation_time(date.into());
+                } else {
+                    log::warn!("No creation date given, using the unix epoch");
+                }
+
+                if let Some(validity) = validity {
+                    log::info!(
+                        "Setting certificate validity duration: {}",
+                        humantime::format_duration(validity)
+                    );
+                    builder = builder.with_validity_duration(validity);
                 }
 
                 Some(builder)
@@ -524,22 +637,32 @@ pub fn run() -> Result<()> {
 
             match command {
                 PIVCommand::Status => piv::status(),
-                PIVCommand::Certify { output } => {
+                PIVCommand::Certify { kind, output } => {
                     // Retrieve initialized builder
                     let builder = builder.unwrap();
 
-                    // Generate public certificate and determine fingerprint
-                    log::info!("Generating primary PIV certificate");
-                    let cert = builder.certify()?.to_der()?;
-                    log::info!("Generated primary PIV certificate: {:x}", Sha256::digest(&cert));
+                    // Generate the chain and report what it contains
+                    log::info!("Generating PIV certificate chain: {:?}", kind);
+                    let chain = builder.certify(kind.clone())?;
+                    let selected = chain.select(kind.clone())?;
 
-                    // Export certificate in PEM format
-                    let encoded = encode_string("CERTIFICATE", LineEnding::default(), &cert)?;
+                    for cert in selected.iter() {
+                        log::info!(
+                            "{}: {:x}",
+                            cert.tbs_certificate().subject(),
+                            Sha256::digest(cert.to_der()?)
+                        );
+                    }
+
+                    // Export certificates in PEM format
+                    let encoded = chain.to_pem(kind)?;
                     if let Some(path) = output {
-                        log::info!("Saving certificate to file: {}", path.display());
-                        fs::write(path, &encoded.into_bytes())?;
+                        log::info!("Saving certificates to file: {}", path.display());
+                        fs::write(path, encoded.as_bytes())?;
+                    } else if selected.len() == 1 {
+                        qr::print_qr(encoded.as_bytes())?;
                     } else {
-                        qr::print_qr(&encoded.into_bytes())?;
+                        bail!("Refusing to render {} certificates as a QR code, use --output or --kind root", selected.len())
                     }
 
                     Ok(())
@@ -559,7 +682,7 @@ pub fn run() -> Result<()> {
 
                     builder.check(card)
                 },
-                PIVCommand::Upload { pin, card, yes } => {
+                PIVCommand::Upload { pin, card, yes, output, show_qr } => {
                     // Verify user inputs further
                     if let Some(ref pin) = pin.as_ref() {
                         if pin.len() < 6 || pin.len() > 8 {
@@ -574,24 +697,6 @@ pub fn run() -> Result<()> {
                         builder = builder.with_pin((*pin).clone());
                     }
 
-                    // Set validity period
-                    if let Some(date) = date {
-                        log::info!(
-                            "Setting certificate creation time: {}",
-                            date.format("%Y-%m-%d %T")
-                        );
-                        builder = builder.with_creation_time(date.into());
-                    }
-
-                    // Set validity period
-                    if let Some(validity) = validity {
-                        log::info!(
-                            "Setting certificate validity duration: {}",
-                            humantime::format_duration(validity)
-                        );
-                        builder = builder.with_validity_duration(validity);
-                    }
-
                     // Show info about target card
                     if let Some(serial) = card.as_ref() {
                         log::info!("Upload keys to smartcard: {}", serial);
@@ -602,7 +707,22 @@ pub fn run() -> Result<()> {
                         confirm("PIV")?;
                     }
 
-                    builder.upload(card)
+                    // Generate, upload and save result
+                    let chain = builder.upload(card)?;
+                    log::info!(
+                        "Uploaded PIV certificate chain under '{}'",
+                        chain.root.tbs_certificate().subject()
+                    );
+
+                    if let Some(path) = output {
+                        log::info!("Saving certificates to file: {}", path.display());
+                        fs::write(path, chain.to_pem(piv::CertificateKind::Chain)?.as_bytes())?;
+                    }
+                    if show_qr {
+                        qr::print_qr(chain.to_pem(piv::CertificateKind::Root)?.as_bytes())?;
+                    }
+
+                    Ok(())
                 }
             }
         }

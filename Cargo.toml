@@ -45,13 +45,22 @@ secrecy = "0.8"
 
 # Yubikey PIV module
 yubikey = { version = "0.9.0-pre.0",  features = [ "untested" ]}
-x509-cert = "0.3.0-rc.4"
-der = "0.8"
-spki = { version = "0.8", features = [ "fingerprint" ]}
+# Features declared explicitly: `builder` gates CertificateBuilder/BuilderProfile *and* the
+# TryFrom<SubjectPublicKeyInfoRef> impls for Subject/AuthorityKeyIdentifier, `hazmat` gates
+# Time::INFINITY. They currently also arrive via yubikey's own dependency, but relying on
+# feature unification would break on a yubikey patch release.
+x509-cert = { version = "0.3.0-rc.4", features = [ "builder", "hazmat", "pem" ]}
+der = { version = "0.8", features = [ "oid", "alloc", "flagset" ]}
+spki = { version = "0.8", features = [ "fingerprint", "alloc" ]}
+# Degenerate PKCS#7 (certs-only SignedData) for the YubiKey msroots object.
+# Pins x509-cert 0.3.0-rc.4 and der/spki 0.8.0-rc.*, which unify with the releases above.
+cms = { version = "0.3.0-pre.2", features = [ "std" ]}
+# NOTE: this is sha2 0.10 while yubikey/ecdsa pull sha2 0.11. Two majors coexist fine here
+# because no sha2 type crosses the boundary -- do not "fix" this by bumping it.
 sha2 = "0.10"
+# Default features already give arithmetic + ecdsa + pem(-> pkcs8) + std(-> alloc), which is
+# exactly the set x509-cert's Builder::build bounds require.
 p256 = "0.14.0-rc.9"
-ed25519-dalek = { version = "3.0.0-pre.7", features = [ "alloc", "pkcs8" ]}
-pem-rfc7468 = "1.0"
 
 [lib]
 doctest = false

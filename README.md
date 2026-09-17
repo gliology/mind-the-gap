@@ -42,31 +42,69 @@ The salt is always set to at least `MINDTHEGAP256HDKD` and optionally followed b
 ```
 256-bit mnemonic seed/
 └── (optional password)/
-    ├── app identifier/
+    ├── "openpgp"/
     │   ├── primary key
     │   ├── (optional subkey id)/
-    │   │   ├── mgmnt key
+    │   │   ├── admin pin
     │   │   ├── signing subkey
     │   │   ├── decryption subkey
     │   │   └── authentication subkey
     │   └── (additinal subkey id)/
     │       └── any other subkey type
-    └── app identifier/
-        ├── primary key
+    └── "piv"/
+        ├── root CA key
         ├── (optional subkey id)/
+        │   ├── issuing CA key
         │   ├── mgmnt key
-        │   ├── signing subkey
-        │   ├── decryption subkey
-        │   └── authentication subkey
+        │   ├── card identifier
+        │   ├── authentication key    (slot 9A)
+        │   ├── signature key         (slot 9C)
+        │   ├── key management key    (slot 9D)
+        │   └── card authentication   (slot 9E)
         └── (additinal subkey id)/
-             └── any other subkey type
+             └── any other subkey generation
 ```
+
+Note that the certificate authority key is a *sibling* of the subkey id, not its parent.
+Were it the parent, anyone holding the authority key could re-derive every slot key.
+
+### PIV certificate chain
+
+The PIV backend issues a full X.509 chain rather than a set of self-signed certificates,
+so that the card works with S/MIME, TLS client authentication, SSH and smartcard logon:
+
+```
+Root CA (self-signed, CA:TRUE)
+└── (optional issuing CA, enabled with --intermediate)
+    ├── 9A authentication   digitalSignature            clientAuth, msSmartcardLogon
+    ├── 9C signature        digitalSignature, nonRepudiation   emailProtection
+    ├── 9D key management   keyAgreement                emailProtection, clientAuth
+    └── 9E card auth        digitalSignature            id-PIV-cardAuth
+```
+
+All keys are NIST P-256 and every certificate is signed with `ecdsa-with-SHA256`. Slot 9D
+uses `keyAgreement` rather than `keyEncipherment` because these are ECDH keys and RFC 8813
+forbids the latter on EC keys.
+
+Slots 9A, 9C and 9D are bound to the cardholder; slot 9E is bound to the card and carries no
+email address, as required by FIPS 201-3 section 4.2.3. Its subject uses a card identifier
+derived from the seed rather than the card's serial number, so that `piv certify` (which runs
+without any hardware) and `piv upload` produce identical certificates.
+
+Export the root certificate with `mind-the-gap piv certify --kind root` and install it as a
+trust anchor. The authorities are additionally written to the card's `msroots` object, where
+the Windows minidriver picks them up.
+
+Certificate generation is fully deterministic: signing uses RFC 6979 deterministic ECDSA
+nonces, and the creation time defaults to the unix epoch, so re-running `piv certify` with
+the same inputs reproduces the same bytes.
 
 ## Open issues:
 
-- Implement check command to verify inputs and uploads
+- Run the PIV hardware test checklist in [docs/piv-hardware-testing.md](docs/piv-hardware-testing.md);
+  the card layer (`piv upload`, `piv check`, `msroots`) has not yet been exercised against a real card
 - Zerorize secrets properly and consistently
-- Add PIV primary certificate
+- Archive previous PIV subkey generations in the retired slots (82-95)
 - Test and support other keys (i.e. Solo 2, Nitrokey 3)
 - Investigate use of sequoia piv wrapper `openpgp-piv-sequoia`
 - Investigate u2f integration

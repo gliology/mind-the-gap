@@ -7,4 +7,4 @@ pub mod cli;
 pub mod qr;
 // Import backends
 pub mod pgp;
-mod piv;
+pub mod piv;

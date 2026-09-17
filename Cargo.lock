@@ -393,6 +393,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f88a43d011fc4a6876cb7344703e297c71dda42494fee094d5f7c76bf13f746"
 
 [[package]]
+name = "cms"
+version = "0.3.0-pre.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "986e7713348fbe5322df18082d73a0ad53a2946dbb7a02452cf3622b83b91e7c"
+dependencies = [
+ "const-oid",
+ "der",
+ "spki",
+ "x509-cert",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1269,14 +1281,13 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
+ "cms",
  "der",
- "ed25519-dalek",
  "env_logger",
  "humantime",
  "log",
  "openpgp-card",
  "p256",
- "pem-rfc7468",
  "qrcode",
  "rand_core 0.9.5",
  "secrecy",
