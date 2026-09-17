@@ -25,10 +25,7 @@ fn derive_none_path_differs_from_some() {
 #[test]
 fn derive_chains() {
     // derive(a).derive(b) is distinct from derive(b) alone
-    assert_ne!(
-        SEED.derive(Some(b"a")).derive(Some(b"b")),
-        SEED.derive(Some(b"b"))
-    );
+    assert_ne!(SEED.derive(Some(b"a")).derive(Some(b"b")), SEED.derive(Some(b"b")));
 }
 
 #[test]

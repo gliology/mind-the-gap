@@ -46,25 +46,10 @@ use zeroize::Zeroizing;
 /// (9E) or recommended (the rest) by the same document -- see [`SeededSmartcard::policies_for`].
 const DEFAULT_KEY_SLOTS: [(SlotId, SlotRole, PinPolicy, TouchPolicy); 4] = [
     // One PIN verification unlocks a series of authentication operations (SSH, TLS, logon).
-    (
-        SlotId::Authentication,
-        SlotRole::Authentication,
-        PinPolicy::Once,
-        TouchPolicy::Cached,
-    ),
+    (SlotId::Authentication, SlotRole::Authentication, PinPolicy::Once, TouchPolicy::Cached),
     // Non-repudiable signing: PIN and touch immediately before every single signature.
-    (
-        SlotId::Signature,
-        SlotRole::Signature,
-        PinPolicy::Always,
-        TouchPolicy::Always,
-    ),
-    (
-        SlotId::KeyManagement,
-        SlotRole::KeyManagement,
-        PinPolicy::Once,
-        TouchPolicy::Cached,
-    ),
+    (SlotId::Signature, SlotRole::Signature, PinPolicy::Always, TouchPolicy::Always),
+    (SlotId::KeyManagement, SlotRole::KeyManagement, PinPolicy::Once, TouchPolicy::Cached),
     // The card authentication key MUST be usable without cardholder verification.
     (
         SlotId::CardAuthentication,
@@ -141,7 +126,9 @@ pub fn status() -> Result<()> {
                             Sha256::digest(der),
                             cert.subject()
                         ),
-                        Err(err) => println!("   {} key: unreadable certificate: {err}", key.slot()),
+                        Err(err) => {
+                            println!("   {} key: unreadable certificate: {err}", key.slot())
+                        }
                     }
                 }
             }
@@ -536,10 +523,7 @@ impl SeededSmartcard {
             primary,
             subseed,
             subkey,
-            identity: Identity {
-                name,
-                ..Default::default()
-            },
+            identity: Identity { name, ..Default::default() },
             alternatives: vec![],
             creation_time: None,
             validity_duration: None,
@@ -758,10 +742,7 @@ impl SeededSmartcard {
     /// Authorities never expire: they are re-derivable from the mnemonic, and an infinite
     /// notAfter guarantees a leaf can never outlive its issuer.
     fn ca_validity(&self) -> Result<Validity> {
-        Ok(Validity::new(
-            Time::try_from(self.creation_time())?,
-            Time::INFINITY,
-        ))
+        Ok(Validity::new(Time::try_from(self.creation_time())?, Time::INFINITY))
     }
 
     /// Effective pin and touch policy for a slot
@@ -780,10 +761,7 @@ impl SeededSmartcard {
             return (*pin, *touch);
         }
 
-        (
-            self.pin_policy.unwrap_or(*pin),
-            self.touch_policy.unwrap_or(*touch),
-        )
+        (self.pin_policy.unwrap_or(*pin), self.touch_policy.unwrap_or(*touch))
     }
 
     /// Management key derived from the subkey generation seed
@@ -832,10 +810,7 @@ impl SeededSmartcard {
                 .identity
                 .issuing_dn(self.subkey.as_ref().map(|id| id.as_str()))?;
             let cert = issue(
-                PivIssuingCa {
-                    subject,
-                    issuer: root_dn.clone(),
-                },
+                PivIssuingCa { subject, issuer: root_dn.clone() },
                 self.ca_validity()?,
                 SubjectPublicKeyInfoOwned::from_key(key.verifying_key())?,
                 &root_key,
@@ -884,11 +859,7 @@ impl SeededSmartcard {
             leaves.push((*slot, cert));
         }
 
-        Ok(CertChain {
-            root,
-            intermediate: issuing.map(|(_, cert)| cert),
-            leaves,
-        })
+        Ok(CertChain { root, intermediate: issuing.map(|(_, cert)| cert), leaves })
     }
 
     /// Wipe the card and install the derived management key and user pin
@@ -977,10 +948,7 @@ impl SeededSmartcard {
                 .public
                 .ok_or(anyhow!("Failed to retrieve public key"))?;
             if on_card.to_der()? != cert.tbs_certificate().subject_public_key_info().to_der()? {
-                bail!(
-                    "Imported key for {:?} does not match the certified key",
-                    slot
-                );
+                bail!("Imported key for {:?} does not match the certified key", slot);
             }
 
             log::info!("Uploading {:?} certificate", slot);
@@ -1042,11 +1010,8 @@ impl BuilderProfile for PivRootCa {
         let ski = SubjectKeyIdentifier::try_from(spk)?;
 
         extensions.push(
-            BasicConstraints {
-                ca: true,
-                path_len_constraint: Some(self.path_len),
-            }
-            .to_extension(tbs.subject(), &extensions)?,
+            BasicConstraints { ca: true, path_len_constraint: Some(self.path_len) }
+                .to_extension(tbs.subject(), &extensions)?,
         );
 
         extensions.push(
@@ -1059,11 +1024,8 @@ impl BuilderProfile for PivRootCa {
         // RFC 5280 Section 4.2.1.1: for a self-signed certificate the authority key
         // identifier points back at the subject key identifier.
         extensions.push(
-            AuthorityKeyIdentifier {
-                key_identifier: Some(ski.0.clone()),
-                ..Default::default()
-            }
-            .to_extension(tbs.subject(), &extensions)?,
+            AuthorityKeyIdentifier { key_identifier: Some(ski.0.clone()), ..Default::default() }
+                .to_extension(tbs.subject(), &extensions)?,
         );
 
         // Deliberately no extended key usage: an absent EKU is unconstrained, which is what
@@ -1100,11 +1062,8 @@ impl BuilderProfile for PivIssuingCa {
         let mut extensions: Vec<Extension> = Vec::new();
 
         extensions.push(
-            BasicConstraints {
-                ca: true,
-                path_len_constraint: Some(0),
-            }
-            .to_extension(tbs.subject(), &extensions)?,
+            BasicConstraints { ca: true, path_len_constraint: Some(0) }
+                .to_extension(tbs.subject(), &extensions)?,
         );
 
         extensions.push(

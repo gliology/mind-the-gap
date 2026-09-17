@@ -121,9 +121,8 @@ fn open_card(target: Option<String>) -> Result<Card<Open>> {
     let card = match target {
         Some(ref serial) => {
             // Find card by ident by briefly connecting to each
-            let backends: Vec<PcscBackend> = PcscBackend::cards(None)?
-                .filter_map(Result::ok)
-                .collect();
+            let backends: Vec<PcscBackend> =
+                PcscBackend::cards(None)?.filter_map(Result::ok).collect();
             let mut found = None;
             for backend in backends {
                 let mut c = Card::new(backend)?;
@@ -139,17 +138,13 @@ fn open_card(target: Option<String>) -> Result<Card<Open>> {
             found.ok_or_else(|| CardError::NotFound(format!("Card '{}' not found", serial)))?
         }
         None => {
-            let backends: Vec<PcscBackend> = PcscBackend::cards(None)?
-                .filter_map(Result::ok)
-                .collect();
+            let backends: Vec<PcscBackend> =
+                PcscBackend::cards(None)?.filter_map(Result::ok).collect();
 
             match backends.len() {
                 0 => bail!("No card detected, please insert card"),
                 1 => Card::new(backends.into_iter().next().unwrap())?,
-                n => bail!(
-                    "Multiple cards ({}) detected, please specify card by serial",
-                    n
-                ),
+                n => bail!("Multiple cards ({}) detected, please specify card by serial", n),
             }
         }
     };
@@ -241,8 +236,7 @@ impl SeededSmartcard {
 
     /// Check smartcard access and subkeys
     pub fn check(&self, target: Option<String>) -> Result<()> {
-
-        // Check if card is managed by derived key 
+        // Check if card is managed by derived key
         self.check_admin_pin(target.clone())?;
 
         // Check if subkeys fingerprints match
@@ -539,10 +533,7 @@ impl SeededSmartcard {
 
         // Establish connection and receive metadata
         let mut transaction = card.transaction()?;
-        log::info!(
-            "Connected to smartcard '{}'",
-            transaction.application_identifier()?.ident()
-        );
+        log::info!("Connected to smartcard '{}'", transaction.application_identifier()?.ident());
 
         // Verify admin pin derived from subseed
         let admin_pin = self.subseed.base64(Some(b"admin"));
@@ -560,10 +551,7 @@ impl SeededSmartcard {
 
         // Establish connection and receive metadata
         let mut transaction = card.transaction()?;
-        log::info!(
-            "Connected to smartcard '{}'",
-            transaction.application_identifier()?.ident()
-        );
+        log::info!("Connected to smartcard '{}'", transaction.application_identifier()?.ident());
 
         // Get the certificate subkeys
         let policy = &StandardPolicy::new();
@@ -597,7 +585,6 @@ impl SeededSmartcard {
 
             // ... and try to compare it to the fingerprint on the smartcard
             if let Ok(Some(card_fp)) = transaction.fingerprint(*kt) {
-
                 if card_fp.as_bytes() == cert_fp_bytes {
                     log::info!("Fingerprint match for {:?} key: {}", kt, card_fp.to_spaced_hex());
                 } else {
@@ -623,10 +610,7 @@ impl SeededSmartcard {
 
         // Establish connection and receive metadata
         let mut transaction = card.transaction()?;
-        log::info!(
-            "Connected to smartcard '{}'",
-            transaction.application_identifier()?.ident()
-        );
+        log::info!("Connected to smartcard '{}'", transaction.application_identifier()?.ident());
 
         // Factory reset smartcard
         transaction.factory_reset()?;

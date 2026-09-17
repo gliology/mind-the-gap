@@ -16,8 +16,8 @@ use chrono::{DateTime, Utc};
 
 use clap::{ArgGroup, Command, CommandFactory, Parser, Subcommand};
 
-use sha2::{Digest, Sha256};
 use der::Encode;
+use sha2::{Digest, Sha256};
 
 use sequoia_openpgp::armor;
 use sequoia_openpgp::cert::Cert;
@@ -130,8 +130,8 @@ impl Backend {
     #[allow(clippy::match_like_matches_macro)]
     fn needs_seed(self) -> bool {
         match self {
-            Backend::PGP { command: PGPCommand::Status, ..} => false,
-            Backend::PIV { command: PIVCommand::Status, ..} => false,
+            Backend::PGP { command: PGPCommand::Status, .. } => false,
+            Backend::PIV { command: PIVCommand::Status, .. } => false,
             _ => true,
         }
     }
@@ -310,14 +310,7 @@ pub fn command() -> Command {
 
 /// Parse and run clap command line ui
 pub fn run() -> Result<()> {
-    let CLI {
-        seed,
-        password,
-        subkey,
-        name,
-        emails,
-        backend,
-    } = CLI::parse();
+    let CLI { seed, password, subkey, name, emails, backend } = CLI::parse();
 
     // Prepare root seed phrase and password
     let mut seed = seed.unwrap_or(MnemonicSeed::new());
@@ -349,7 +342,6 @@ pub fn run() -> Result<()> {
         // ... then command
         Some(Backend::PGP { date, subdate, validity, command }) => {
             let builder = if command != PGPCommand::Status {
-
                 let name = name.ok_or(anyhow!("Requires name to be specified"))?;
 
                 if emails.is_empty() {
@@ -369,18 +361,12 @@ pub fn run() -> Result<()> {
 
                 // Set creation date
                 if let Some(date) = date {
-                    log::info!(
-                        "Setting certificate creation time: {}",
-                        date.format("%Y-%m-%d %T")
-                    );
+                    log::info!("Setting certificate creation time: {}", date.format("%Y-%m-%d %T"));
                     builder = builder.with_creation_time(date.into());
                 }
 
                 if let Some(date) = subdate {
-                    log::info!(
-                        "Setting subkey creation time: {}",
-                        date.format("%Y-%m-%d %T")
-                    );
+                    log::info!("Setting subkey creation time: {}", date.format("%Y-%m-%d %T"));
                     builder = builder.with_subkey_creation_time(date.into());
                 }
 
@@ -550,7 +536,7 @@ pub fn run() -> Result<()> {
 
                     Ok(())
                 }
-           }
+            }
         }
         // ... then command
         Some(Backend::PIV {
@@ -619,10 +605,7 @@ pub fn run() -> Result<()> {
                 // Applied here rather than per command so that certify, check and upload all
                 // derive the very same chain
                 if let Some(date) = date {
-                    log::info!(
-                        "Setting certificate creation time: {}",
-                        date.format("%Y-%m-%d %T")
-                    );
+                    log::info!("Setting certificate creation time: {}", date.format("%Y-%m-%d %T"));
                     builder = builder.with_creation_time(date.into());
                 } else {
                     log::warn!("No creation date given, using the unix epoch");
@@ -687,7 +670,7 @@ pub fn run() -> Result<()> {
                     }
 
                     builder.check(card)
-                },
+                }
                 PIVCommand::Upload { pin, card, yes, output, show_qr } => {
                     // Verify user inputs further
                     if let Some(pin) = pin.as_ref() {

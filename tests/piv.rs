@@ -92,11 +92,7 @@ fn certify_is_deterministic() {
 
     assert_eq!(digest(&a.root), digest(&b.root));
     for ((slot, left), (_, right)) in a.leaves.iter().zip(b.leaves.iter()) {
-        assert_eq!(
-            digest(left),
-            digest(right),
-            "{slot:?} slot is not reproducible"
-        );
+        assert_eq!(digest(left), digest(right), "{slot:?} slot is not reproducible");
     }
 }
 
@@ -221,10 +217,7 @@ fn root_is_self_signed() {
     let chain = alice().certify(CertificateKind::Chain).unwrap();
     let root = &chain.root;
 
-    assert_eq!(
-        root.tbs_certificate().issuer(),
-        root.tbs_certificate().subject()
-    );
+    assert_eq!(root.tbs_certificate().issuer(), root.tbs_certificate().subject());
     assert!(verifies_under(root, root));
 
     // RFC 5280 4.2.1.1: on a self-signed certificate the AKI mirrors the SKI
@@ -333,11 +326,7 @@ fn slot_key_usages_are_exact() {
             SlotRole::Authentication => {
                 assert!(usage.digital_signature(), "{slot:?}");
                 assert!(!usage.key_agreement(), "{slot:?}");
-                assert_eq!(
-                    eku,
-                    vec!["1.3.6.1.5.5.7.3.2", "1.3.6.1.4.1.311.20.2.2"],
-                    "{slot:?}"
-                );
+                assert_eq!(eku, vec!["1.3.6.1.5.5.7.3.2", "1.3.6.1.4.1.311.20.2.2"], "{slot:?}");
             }
             SlotRole::Signature => {
                 assert!(usage.digital_signature(), "{slot:?}");
@@ -350,11 +339,7 @@ fn slot_key_usages_are_exact() {
                 assert!(usage.key_agreement(), "{slot:?}");
                 assert!(!usage.key_encipherment(), "{slot:?}");
                 assert!(!usage.encipher_only() && !usage.decipher_only(), "{slot:?}");
-                assert_eq!(
-                    eku,
-                    vec!["1.3.6.1.5.5.7.3.4", "1.3.6.1.5.5.7.3.2"],
-                    "{slot:?}"
-                );
+                assert_eq!(eku, vec!["1.3.6.1.5.5.7.3.4", "1.3.6.1.5.5.7.3.2"], "{slot:?}");
             }
             SlotRole::CardAuthentication => {
                 assert!(usage.digital_signature(), "{slot:?}");
@@ -418,10 +403,7 @@ fn emails_land_in_subject_alt_name() {
             assert!(san.is_none(), "the card slot must not be person bound");
         } else {
             let san = san.expect("user slots carry the email addresses").1;
-            assert!(
-                format!("{:?}", san.0).contains("alice@example.com"),
-                "{slot:?}"
-            );
+            assert!(format!("{:?}", san.0).contains("alice@example.com"), "{slot:?}");
         }
     }
 }
@@ -518,11 +500,8 @@ fn openssl_verifies_chain() {
 
         let write = |name: &str, cert: &Certificate| {
             let path = dir.join(name);
-            std::fs::write(
-                &path,
-                cert.to_pem(x509_cert::der::pem::LineEnding::LF).unwrap(),
-            )
-            .unwrap();
+            std::fs::write(&path, cert.to_pem(x509_cert::der::pem::LineEnding::LF).unwrap())
+                .unwrap();
             path
         };
 
@@ -600,11 +579,7 @@ fn openssl_encrypts_to_key_management_cert() {
     let recipient = dir.join("9d.pem");
     let message = dir.join("msg.txt");
     let enveloped = dir.join("msg.p7m");
-    std::fs::write(
-        &recipient,
-        cert.to_pem(x509_cert::der::pem::LineEnding::LF).unwrap(),
-    )
-    .unwrap();
+    std::fs::write(&recipient, cert.to_pem(x509_cert::der::pem::LineEnding::LF).unwrap()).unwrap();
     std::fs::write(&message, b"hello").unwrap();
 
     let result = std::process::Command::new("openssl")

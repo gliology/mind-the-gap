@@ -161,9 +161,8 @@ fn wot_adds_certification_to_each_uid() {
 
     for uid in certified.userids() {
         assert!(
-            uid.certifications().any(|sig| {
-                sig.issuer_fingerprints().any(|fp| fp == &alice_fp)
-            }),
+            uid.certifications()
+                .any(|sig| { sig.issuer_fingerprints().any(|fp| fp == &alice_fp) }),
             "each UID should carry a certification from Alice"
         );
     }
@@ -184,10 +183,7 @@ fn wot_certification_not_self_sig() {
     for uid in certified.userids() {
         for sig in uid.certifications() {
             let from_bob = sig.issuer_fingerprints().any(|fp| fp == &bob_fp);
-            assert!(
-                !from_bob,
-                "WoT certification should not be issued by Bob's own key"
-            );
+            assert!(!from_bob, "WoT certification should not be issued by Bob's own key");
         }
     }
 }
@@ -240,7 +236,11 @@ fn export_signing_key_can_sign_and_verify() {
     let policy = StandardPolicy::new();
     let vc = cert.with_policy(&policy, None).unwrap();
 
-    let ka = vc.keys().secret().for_signing().next()
+    let ka = vc
+        .keys()
+        .secret()
+        .for_signing()
+        .next()
         .expect("should have a signing subkey");
     let mut keypair = ka.key().clone().into_keypair().unwrap();
 
@@ -284,19 +284,27 @@ fn sq_inspect_accepts_exported_cert() {
     std::fs::remove_file(&tmp).ok();
 
     let output = match result {
-        Err(_) => { eprintln!("sq not found, skipping"); return; }
+        Err(_) => {
+            eprintln!("sq not found, skipping");
+            return;
+        }
         Ok(o) => o,
     };
-    assert!(output.status.success(),
-        "sq inspect failed:\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sq inspect failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Strip whitespace so we match regardless of the spaced-hex display format
     let stdout_nows: String = stdout.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(stdout_nows.to_uppercase().contains(&fp_hex(&cert)),
-        "fingerprint not found in sq output:\n{}", stdout);
-    assert!(stdout.contains("alice@example.com"),
-        "UID not found in sq output:\n{}", stdout);
+    assert!(
+        stdout_nows.to_uppercase().contains(&fp_hex(&cert)),
+        "fingerprint not found in sq output:\n{}",
+        stdout
+    );
+    assert!(stdout.contains("alice@example.com"), "UID not found in sq output:\n{}", stdout);
 }
 
 #[test]
@@ -317,17 +325,25 @@ fn gpg_accepts_exported_cert() {
     std::fs::remove_file(&tmp).ok();
 
     let output = match result {
-        Err(_) => { eprintln!("gpg not found, skipping"); return; }
+        Err(_) => {
+            eprintln!("gpg not found, skipping");
+            return;
+        }
         Ok(o) => o,
     };
-    assert!(output.status.success(),
-        "gpg --show-keys failed:\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "gpg --show-keys failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     // In colon format fingerprints appear as "fpr::::::<40-char-hex>:" — uppercase, no spaces
-    assert!(stdout.to_uppercase().contains(&fp_hex(&cert)),
-        "fingerprint not found in gpg output:\n{}", stdout);
+    assert!(
+        stdout.to_uppercase().contains(&fp_hex(&cert)),
+        "fingerprint not found in gpg output:\n{}",
+        stdout
+    );
     // At least one uid record should contain the email
-    assert!(stdout.contains("alice@example.com"),
-        "UID not found in gpg output:\n{}", stdout);
+    assert!(stdout.contains("alice@example.com"), "UID not found in gpg output:\n{}", stdout);
 }
