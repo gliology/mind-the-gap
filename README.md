@@ -103,6 +103,7 @@ the same inputs reproduces the same bytes.
 
 - Run the PIV hardware test checklist in [docs/piv-hardware-testing.md](docs/piv-hardware-testing.md);
   the card layer (`piv upload`, `piv check`, `msroots`) has not yet been exercised against a real card
+- Apply the deferred repo-wide `cargo fmt` pass (~290 lines, config already in `rustfmt.toml`)
 - Zerorize secrets properly and consistently
 - Archive previous PIV subkey generations in the retired slots (82-95)
 - Test and support other keys (i.e. Solo 2, Nitrokey 3)

@@ -1,0 +1,22 @@
+# Width overrides, chosen by measuring the reflow each setting causes against the existing
+# hand-formatted code. Stock defaults explode constructs this codebase deliberately keeps on
+# one line; these four values leave them alone without loosening anything else.
+#
+#   struct_variant_width  Backend::PGP { command: PGPCommand::Status, .. } => false,
+#   struct_lit_width      PIVCommand::Upload { pin, card, yes, output, show_qr } => { .. }
+#   attr_fn_like_width    #[arg(short = 'm', long, value_delimiter = ',', global = true, ..)]
+#   fn_call_width         log::info!("Setting creation time: {}", date.format("%Y-%m-%d %T"));
+#
+# Deliberately NOT set:
+#
+#   use_small_heuristics = "Max"   collapses far too much (measured 622 changed lines), including
+#                                  chains that are broken up on purpose
+#   chain_width                    already optimal at its default of 60: lowering it to 50/40 or
+#                                  raising it to 80/90 both cost more than they save
+#   reorder_imports = false        unnecessary, rustfmt only sorts within blank-line-separated
+#                                  groups, so the existing import grouping survives either way
+
+fn_call_width = 90
+attr_fn_like_width = 100
+struct_lit_width = 60
+struct_variant_width = 90
