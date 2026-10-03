@@ -4,7 +4,7 @@ description = "Derive smart card keys and certs from mnemonic seeds"
 # The major version tracks the derivation scheme: 0.x derived under the legacy scheme
 # (`mtg0`, OpenPGP only), 1.x derives under the current labelled scheme (`mtg1`). A future
 # scheme change is a breaking change by definition and bumps the major.
-version = "0.2.2"
+version = "1.0.0"
 authors = ["Florian Franzen <florian@gli.al>"]
 license = "LGPL-3.0-or-later"
 repository = "https://github.com/gliology/mind-the-gap"
