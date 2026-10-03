@@ -42,31 +42,103 @@ The salt is always set to at least `MINDTHEGAP256HDKD` and optionally followed b
 ```
 256-bit mnemonic seed/
 └── (optional password)/
-    ├── app identifier/
+    ├── "openpgp"/
     │   ├── primary key
     │   ├── (optional subkey id)/
-    │   │   ├── mgmnt key
+    │   │   ├── admin pin
     │   │   ├── signing subkey
     │   │   ├── decryption subkey
     │   │   └── authentication subkey
     │   └── (additinal subkey id)/
     │       └── any other subkey type
-    └── app identifier/
-        ├── primary key
+    └── "piv"/
+        ├── root CA key
         ├── (optional subkey id)/
+        │   ├── issuing CA key
         │   ├── mgmnt key
-        │   ├── signing subkey
-        │   ├── decryption subkey
-        │   └── authentication subkey
+        │   ├── card identifier
+        │   ├── authentication key    (slot 9A)
+        │   ├── signature key         (slot 9C)
+        │   ├── key management key    (slot 9D)
+        │   └── card authentication   (slot 9E)
         └── (additinal subkey id)/
-             └── any other subkey type
+             └── any other subkey generation
 ```
+
+Note that the certificate authority key is a *sibling* of the subkey id, not its parent.
+Were it the parent, anyone holding the authority key could re-derive every slot key.
+
+### PIV certificate chain
+
+The PIV backend issues a full X.509 chain rather than a set of self-signed certificates,
+so that the card works with S/MIME, TLS client authentication, SSH and smartcard logon:
+
+```
+Root CA (self-signed, CA:TRUE)
+└── (optional issuing CA, enabled with --intermediate)
+    ├── 9A authentication   digitalSignature            clientAuth, msSmartcardLogon
+    ├── 9C signature        digitalSignature, nonRepudiation   emailProtection
+    ├── 9D key management   keyAgreement                emailProtection, clientAuth
+    └── 9E card auth        digitalSignature            id-PIV-cardAuth
+```
+
+All keys are NIST P-256 and every certificate is signed with `ecdsa-with-SHA256`. Slot 9D
+uses `keyAgreement` rather than `keyEncipherment` because these are ECDH keys and RFC 8813
+forbids the latter on EC keys.
+
+Slots 9A, 9C and 9D are bound to the cardholder; slot 9E is bound to the card and carries no
+email address, as required by FIPS 201-3 section 4.2.3. Its subject uses a card identifier
+derived from the seed rather than the card's serial number, so that `piv certify` (which runs
+without any hardware) and `piv upload` produce identical certificates.
+
+Export the root certificate with `mind-the-gap piv certify --kind root` and install it as a
+trust anchor. The authorities are additionally written to the card's `msroots` object, where
+the Windows minidriver picks them up.
+
+Certificate generation is fully deterministic: signing uses RFC 6979 deterministic ECDSA
+nonces, and the creation time defaults to the unix epoch, so re-running `piv certify` with
+the same inputs reproduces the same bytes.
+
+### Hardware tests
+
+Both backends have an on-card test suite. They are **destructive** -- the PIV one resets the
+PIV applet, the OpenPGP one factory-resets the OpenPGP applet -- so they are gated behind a
+feature *and* behind naming the card:
+
+```
+gpgconf --kill scdaemon        # scdaemon holds the card exclusively
+
+MTG_HARDWARE_TEST_SERIAL=$(ykman list --serials) \
+  cargo test --features destructive-hardware-tests --test hardware -- --nocapture
+
+MTG_HARDWARE_TEST_CARD=$(mind-the-gap pgp status | awk '/Card/{print $3}') \
+  cargo test --features destructive-hardware-tests --test hardware_pgp -- --nocapture
+```
+
+Each applet is reset independently, so one token can carry both suites -- just not at the same
+time, since they contend for the reader. The PIV suite needs three touches (`check`, the 9A
+signature, the 9D key agreement); the OpenPGP suite needs none.
+
+The second feature, `no-destructive-hardware-tests`, is a safety interlock that must never be
+enabled by hand. The tests compile only when `destructive-hardware-tests` is on and it is off,
+so `cargo test --all-features` -- which turns on both -- compiles them out rather than wiping
+whatever card is plugged in.
+
+See [docs/piv-hardware-testing.md](docs/piv-hardware-testing.md) for what they assert and for
+the manual checklist covering what cannot be automated.
 
 ## Open issues:
 
-- Implement check command to verify inputs and uploads
+- Automate the remaining manual checklist items where possible; sections 1-4 now run as
+  `cargo test --features destructive-hardware-tests --test hardware` (see
+  [docs/piv-hardware-testing.md](docs/piv-hardware-testing.md))
+- Finish the last two items of the PIV hardware test checklist in
+  [docs/piv-hardware-testing.md](docs/piv-hardware-testing.md): TLS client auth from a
+  browser, and Thunderbird S/MIME. Everything else -- `piv upload`, `piv check`, per-slot
+  policies, `msroots`, on-card signing and decryption, SSH and TLS client auth -- passed
+  against a YubiKey 5 on 2026-09-17
 - Zerorize secrets properly and consistently
-- Add PIV primary certificate
+- Archive previous PIV subkey generations in the retired slots (82-95)
 - Test and support other keys (i.e. Solo 2, Nitrokey 3)
 - Investigate use of sequoia piv wrapper `openpgp-piv-sequoia`
 - Investigate u2f integration

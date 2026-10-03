@@ -350,6 +350,194 @@ fn certify_intermediate_without_intermediate_fails() {
     );
 }
 
+/// The validity window follows the flags: infinite by default, bounded by --validity.
+#[test]
+fn validity_window_follows_the_flags() {
+    let creation = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+    let ten_years = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+
+    // Default: leaves never expire, matching the promise that a derived certificate can be
+    // reproduced years later
+    let infinite = alice().certify(CertificateKind::Chain).unwrap();
+    for (slot, cert) in &infinite.leaves {
+        let validity = cert.tbs_certificate().validity();
+        assert_eq!(validity.not_before.to_system_time(), creation, "{slot:?} notBefore moved");
+        assert_eq!(
+            validity.not_after.to_system_time(),
+            x509_cert::time::Time::INFINITY.to_system_time(),
+            "{slot:?} should not expire by default"
+        );
+    }
+
+    // Bounded: --validity sets notAfter relative to the creation time, on the leaves only --
+    // the authorities never expire, so a leaf can never outlive its issuer
+    let bounded = alice()
+        .with_validity_duration(ten_years)
+        .certify(CertificateKind::Chain)
+        .unwrap();
+    for (slot, cert) in &bounded.leaves {
+        assert_eq!(
+            cert.tbs_certificate().validity().not_after.to_system_time(),
+            creation + ten_years,
+            "{slot:?} notAfter does not honour --validity"
+        );
+    }
+    assert_eq!(
+        bounded
+            .root
+            .tbs_certificate()
+            .validity()
+            .not_after
+            .to_system_time(),
+        x509_cert::time::Time::INFINITY.to_system_time(),
+        "the root must never expire"
+    );
+}
+
+/// `cas()` feeds the msroots object: issuing authority first, trust anchor last.
+#[test]
+fn cas_orders_the_root_last() {
+    let plain = alice().certify(CertificateKind::Chain).unwrap();
+    let cas = plain.cas();
+    assert_eq!(cas.len(), 1);
+    assert_eq!(digest(&cas[0]), digest(&plain.root));
+
+    let tiered = alice()
+        .with_intermediate(true)
+        .certify(CertificateKind::Chain)
+        .unwrap();
+    let cas = tiered.cas();
+    assert_eq!(cas.len(), 2);
+    assert_eq!(digest(&cas[0]), digest(tiered.intermediate.as_ref().unwrap()));
+    assert_eq!(digest(&cas[1]), digest(&tiered.root));
+}
+
+/// The msroots encoding is a degenerate PKCS#7: SignedData carrying only certificates.
+///
+/// This is what the Windows minidriver expects to find in the object; until now it was
+/// asserted only on real hardware, i.e. never in CI.
+#[test]
+fn msroots_encodes_a_degenerate_pkcs7() {
+    use cms::content_info::ContentInfo;
+    use x509_cert::der::{Decode, Encode};
+
+    let chain = alice()
+        .with_intermediate(true)
+        .certify(CertificateKind::Chain)
+        .unwrap();
+
+    let encoded = ContentInfo::try_from(chain.cas())
+        .expect("authorities do not form a PKCS#7")
+        .to_der()
+        .expect("PKCS#7 does not encode");
+
+    // Round-trips as a ContentInfo declaring SignedData
+    let decoded = ContentInfo::from_der(&encoded).expect("emitted DER does not parse back");
+    assert_eq!(decoded.content_type.to_string(), "1.2.840.113549.1.7.2", "not SignedData");
+
+    // Degenerate: both authorities embedded verbatim, root included
+    let intermediate = chain.intermediate.as_ref().unwrap().to_der().unwrap();
+    let root = chain.root.to_der().unwrap();
+    let haystack = encoded.as_slice();
+    let contains = |needle: &[u8]| haystack.windows(needle.len()).any(|w| w == needle);
+    assert!(contains(&intermediate), "intermediate certificate missing from msroots");
+    assert!(contains(&root), "root certificate missing from msroots");
+}
+
+/// The validity window follows the flags: infinite by default, bounded by --validity.
+#[test]
+fn validity_window_follows_the_flags() {
+    let creation = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+    let ten_years = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+
+    // Default: leaves never expire, matching the promise that a derived certificate can be
+    // reproduced years later
+    let infinite = alice().certify(CertificateKind::Chain).unwrap();
+    for (slot, cert) in &infinite.leaves {
+        let validity = cert.tbs_certificate().validity();
+        assert_eq!(validity.not_before.to_system_time(), creation, "{slot:?} notBefore moved");
+        assert_eq!(
+            validity.not_after.to_system_time(),
+            x509_cert::time::Time::INFINITY.to_system_time(),
+            "{slot:?} should not expire by default"
+        );
+    }
+
+    // Bounded: --validity sets notAfter relative to the creation time, on the leaves only --
+    // the authorities never expire, so a leaf can never outlive its issuer
+    let bounded = alice()
+        .with_validity_duration(ten_years)
+        .certify(CertificateKind::Chain)
+        .unwrap();
+    for (slot, cert) in &bounded.leaves {
+        assert_eq!(
+            cert.tbs_certificate().validity().not_after.to_system_time(),
+            creation + ten_years,
+            "{slot:?} notAfter does not honour --validity"
+        );
+    }
+    assert_eq!(
+        bounded
+            .root
+            .tbs_certificate()
+            .validity()
+            .not_after
+            .to_system_time(),
+        x509_cert::time::Time::INFINITY.to_system_time(),
+        "the root must never expire"
+    );
+}
+
+/// `cas()` feeds the msroots object: issuing authority first, trust anchor last.
+#[test]
+fn cas_orders_the_root_last() {
+    let plain = alice().certify(CertificateKind::Chain).unwrap();
+    let cas = plain.cas();
+    assert_eq!(cas.len(), 1);
+    assert_eq!(digest(&cas[0]), digest(&plain.root));
+
+    let tiered = alice()
+        .with_intermediate(true)
+        .certify(CertificateKind::Chain)
+        .unwrap();
+    let cas = tiered.cas();
+    assert_eq!(cas.len(), 2);
+    assert_eq!(digest(&cas[0]), digest(tiered.intermediate.as_ref().unwrap()));
+    assert_eq!(digest(&cas[1]), digest(&tiered.root));
+}
+
+/// The msroots encoding is a degenerate PKCS#7: SignedData carrying only certificates.
+///
+/// This is what the Windows minidriver expects to find in the object; until now it was
+/// asserted only on real hardware, i.e. never in CI.
+#[test]
+fn msroots_encodes_a_degenerate_pkcs7() {
+    use cms::content_info::ContentInfo;
+    use x509_cert::der::{Decode, Encode};
+
+    let chain = alice()
+        .with_intermediate(true)
+        .certify(CertificateKind::Chain)
+        .unwrap();
+
+    let encoded = ContentInfo::try_from(chain.cas())
+        .expect("authorities do not form a PKCS#7")
+        .to_der()
+        .expect("PKCS#7 does not encode");
+
+    // Round-trips as a ContentInfo declaring SignedData
+    let decoded = ContentInfo::from_der(&encoded).expect("emitted DER does not parse back");
+    assert_eq!(decoded.content_type.to_string(), "1.2.840.113549.1.7.2", "not SignedData");
+
+    // Degenerate: both authorities embedded verbatim, root included
+    let intermediate = chain.intermediate.as_ref().unwrap().to_der().unwrap();
+    let root = chain.root.to_der().unwrap();
+    let haystack = encoded.as_slice();
+    let contains = |needle: &[u8]| haystack.windows(needle.len()).any(|w| w == needle);
+    assert!(contains(&intermediate), "intermediate certificate missing from msroots");
+    assert!(contains(&root), "root certificate missing from msroots");
+}
+
 // --- Chain integrity ---------------------------------------------------------
 
 #[test]
@@ -680,14 +868,9 @@ fn openssl_verifies_chain() {
             args.push(leaf_path.to_str().unwrap().to_string());
 
             let result = std::process::Command::new("openssl").args(&args).output();
-            let output = match result {
-                Err(_) => {
-                    eprintln!("openssl not found, skipping");
-                    std::fs::remove_dir_all(&dir).ok();
-                    return;
-                }
-                Ok(output) => output,
-            };
+            // Gated by cfg(has_openssl): a spawn failure here means the build.rs probe went
+            // stale, which must fail loudly, not pass silently (see build.rs)
+            let output = result.expect("openssl vanished since the build.rs probe ran");
 
             assert!(
                 output.status.success(),
@@ -732,14 +915,9 @@ fn openssl_encrypts_to_key_management_cert() {
         ])
         .output();
 
-    let output = match result {
-        Err(_) => {
-            eprintln!("openssl not found, skipping");
-            std::fs::remove_dir_all(&dir).ok();
-            return;
-        }
-        Ok(output) => output,
-    };
+    // Gated by cfg(has_openssl): a spawn failure here means the build.rs probe went
+    // stale, which must fail loudly, not pass silently (see build.rs)
+    let output = result.expect("openssl vanished since the build.rs probe ran");
 
     assert!(
         output.status.success(),

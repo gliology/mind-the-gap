@@ -287,13 +287,9 @@ fn sq_inspect_accepts_exported_cert() {
         .args(["inspect", tmp.path().to_str().unwrap()])
         .output();
 
-    let output = match result {
-        Err(_) => {
-            eprintln!("sq not found, skipping");
-            return;
-        }
-        Ok(o) => o,
-    };
+    // Gated by cfg(has_sq): a spawn failure here means the build.rs probe went
+    // stale, which must fail loudly, not pass silently (see build.rs)
+    let output = result.expect("sq vanished since the build.rs probe ran");
     assert!(
         output.status.success(),
         "sq inspect failed:\n{}",
@@ -327,13 +323,9 @@ fn gpg_accepts_exported_cert() {
         .args(["--show-keys", "--with-colons", tmp.path().to_str().unwrap()])
         .output();
 
-    let output = match result {
-        Err(_) => {
-            eprintln!("gpg not found, skipping");
-            return;
-        }
-        Ok(o) => o,
-    };
+    // Gated by cfg(has_gpg): a spawn failure here means the build.rs probe went
+    // stale, which must fail loudly, not pass silently (see build.rs)
+    let output = result.expect("gpg vanished since the build.rs probe ran");
     assert!(
         output.status.success(),
         "gpg --show-keys failed:\n{}",

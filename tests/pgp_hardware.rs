@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! MTG_HARDWARE_TEST_CARD=0006:20381784 \
-//!   cargo test --features destructive-hardware-tests --test hardware_pgp -- --nocapture
+//!   cargo test --features destructive-hardware-tests --test pgp_hardware -- --nocapture
 //! ```
 //!
 //! Unlike the PIV suite this one needs **no touches**: the OpenPGP applet is provisioned
@@ -24,15 +24,15 @@
     not(feature = "no-destructive-hardware-tests")
 ))]
 
-use mind_the_gap::pgp::{CertificateKind, SeededSmartcard, SubkeyRole};
+use mind_the_gap::pgp::{CertificateKind, SeededSmartcard, DEFAULT_KEY_MAP};
 use mind_the_gap::seed::Seed256;
 
 use sequoia_openpgp::cert::Cert;
 use sequoia_openpgp::policy::StandardPolicy;
 
 use card_backend_pcsc::PcscBackend;
-use openpgp_card::Card;
 use openpgp_card::ocard::KeyType;
+use openpgp_card::Card;
 
 use zeroize::Zeroizing;
 
@@ -60,7 +60,7 @@ fn target() -> String {
              will not pick one for you. Print the identifier with `mind-the-gap pgp status`\n\
              and pass it explicitly:\n\
              \n\
-             \tMTG_HARDWARE_TEST_CARD=<ident> cargo test --features destructive-hardware-tests\n"
+             \tMTG_HARDWARE_TEST_CARD=<ident> cargo test --features destructive-hardware-tests --test pgp_hardware\n"
         ),
     }
 }
@@ -102,21 +102,30 @@ fn open() -> Card<openpgp_card::state::Open> {
     panic!("no OpenPGP card with identifier '{ident}'; `mind-the-gap pgp status` lists them")
 }
 
-/// Fingerprints of the three subkeys, in `SubkeyRole::ALL` order.
+/// Fingerprints of the three subkeys, in `DEFAULT_KEY_MAP` order.
 fn derived_fingerprints(cert: &Cert) -> Vec<(KeyType, [u8; 20])> {
     let policy = StandardPolicy::new();
     let valid = cert
         .with_policy(&policy, None)
         .expect("derived certificate is not valid under the standard policy");
 
-    SubkeyRole::ALL
+    DEFAULT_KEY_MAP
         .iter()
-        .map(|role| {
-            let kind = role.key_type();
+        .map(|(kind, is_encryption, code)| {
             let subkey = valid
                 .keys()
                 .subkeys()
-                .find(|key| key.key_flags().is_some_and(|flags| role.matches(&flags)))
+                .find(|key| {
+                    key.key_flags().is_some_and(|flags| {
+                        if *is_encryption {
+                            flags.for_storage_encryption() || flags.for_transport_encryption()
+                        } else if *code == 0x02 {
+                            flags.for_signing()
+                        } else {
+                            flags.for_authentication()
+                        }
+                    })
+                })
                 .unwrap_or_else(|| panic!("derived certificate has no {kind:?} subkey"));
 
             let fingerprint: [u8; 20] = subkey
@@ -126,7 +135,7 @@ fn derived_fingerprints(cert: &Cert) -> Vec<(KeyType, [u8; 20])> {
                 .try_into()
                 .expect("fingerprint is not 20 bytes");
 
-            (kind, fingerprint)
+            (*kind, fingerprint)
         })
         .collect()
 }
@@ -221,11 +230,8 @@ fn provision_and_verify_card() {
 /// fails with "No such device" whenever pcscd already holds the reader.
 #[cfg(has_gpg)]
 fn gpg_sees_the_keys(expected: &[(KeyType, [u8; 20])]) {
-    // tempfile gives an unpredictable path, so nothing can pre-place a directory or
-    // symlink there; into_path hands ownership to the ScdaemonGuard below
-    let home = tempfile::tempdir()
-        .expect("cannot create throwaway GNUPGHOME")
-        .keep();
+    let home = std::env::temp_dir().join(format!("mtg-test-gpg-card-{}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("cannot create throwaway GNUPGHOME");
 
     #[cfg(unix)]
     {
@@ -273,5 +279,11 @@ fn gpg_sees_the_keys(expected: &[(KeyType, [u8; 20])]) {
 
 #[cfg(not(has_gpg))]
 fn gpg_sees_the_keys(_expected: &[(KeyType, [u8; 20])]) {
-    eprintln!("      skipped: gpg not found in PATH");
+    // A destructive run that cannot finish its last assertion must say so in the result,
+    // not in a line of buffered output: a pass with a skipped step is not a pass. The card
+    // itself is fine -- provisioning succeeded before this step.
+    panic!(
+        "gpg is not in PATH, so the final cross-check cannot run; the card is provisioned \
+         fine -- install gpg (or enter the dev shell) and rerun to complete the suite"
+    );
 }

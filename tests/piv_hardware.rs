@@ -1,6 +1,6 @@
 //! On-card tests for the PIV backend.
 //!
-//! These are the automatable half of `docs/piv-hardware-testing.md`. Everything here talks to
+//! These are the automatable half of `docs/piv-hardware-tests.md`. Everything here talks to
 //! a real card, so the whole file is compiled out unless the `destructive-hardware-tests`
 //! feature is on *and* the `no-destructive-hardware-tests` interlock is off -- see the feature
 //! comments in `Cargo.toml` for why the second flag exists.
@@ -9,7 +9,7 @@
 //! device. Point it at a spare:
 //!
 //! ```text
-//! MTG_HARDWARE_TEST_SERIAL=12345678 cargo test --features destructive-hardware-tests
+//! MTG_HARDWARE_TEST_SERIAL=12345678 cargo test --features destructive-hardware-tests --test piv_hardware
 //! ```
 //!
 //! Expect to touch the token three times: once for `check`, which authenticates against the
@@ -36,8 +36,8 @@ use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{DerSignature, VerifyingKey};
 use p256::{PublicKey, SecretKey};
 
-use x509_cert::Certificate;
 use x509_cert::der::Encode;
+use x509_cert::Certificate;
 
 use yubikey::piv::{self, AlgorithmId, SlotId};
 use yubikey::{CccId, ChuId, MsRoots, PinPolicy, Serial, TouchPolicy, YubiKey};
@@ -53,7 +53,7 @@ const TEST_SEED: Seed256 = [0x5au8; 32];
 
 const TEST_PIN: &str = "471120";
 
-/// The per-slot policy table from `docs/piv-hardware-testing.md` section 2.
+/// The per-slot policy table from `docs/piv-hardware-tests.md` section 2.
 ///
 /// Spelled out here on purpose rather than read back from `SeededSmartcard::policies_for`: the
 /// point is to pin the *specification*, so that changing the implementation's table fails this
@@ -79,7 +79,7 @@ fn target() -> String {
              These tests reset the card they run against, so they will not pick one for you.\n\
              Find the serial with `ykman list` and pass it explicitly:\n\
              \n\
-             \tMTG_HARDWARE_TEST_SERIAL=<serial> cargo test --features destructive-hardware-tests\n"
+             \tMTG_HARDWARE_TEST_SERIAL=<serial> cargo test --features destructive-hardware-tests --test piv_hardware\n"
         ),
     }
 }
@@ -138,7 +138,7 @@ fn on_card<T>(what: &str, result: anyhow::Result<T>) -> T {
              \n\
              It is usually left over from ordinary gpg use. Sharing the card between gpg\n\
              and PIV at the same time is possible but unreliable -- see the scdaemon section\n\
-             of docs/piv-hardware-testing.md.\n"
+             of docs/piv-hardware-tests.md.\n"
         ),
         Err(error) => panic!("{what} failed: {error}"),
     }

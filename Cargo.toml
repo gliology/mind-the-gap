@@ -74,7 +74,7 @@ qrcode = { version = "0.14", default-features = false }
 # Pinned by revision rather than by tag: a tag can be force-moved and `cargo update` would
 # follow it, and this fork's two-commit patch set is load-bearing for reproducibility (see
 # the security model in the README). The revision is tag openpgp/v2.2.0-mtg0.
-sequoia-openpgp = { git = "https://gitlab.com/gli.al/sequoia.git", rev = "8ea683342764b6dedbf86e8d106d026266412e4d" }
+sequoia-openpgp = { version = "2", git = "https://gitlab.com/gli.al/sequoia.git", rev = "8ea683342764b6dedbf86e8d106d026266412e4d" }
 openpgp-card = "0.5"
 card-backend-pcsc = "0.5"
 secrecy = "0.8"
@@ -104,6 +104,8 @@ doctest = false
 [dev-dependencies]
 # Unpredictable, self-cleaning temp paths for the tests that shell out to external tools
 tempfile = "3"
+# setsid for the cli test that must run without a controlling terminal
+libc = "0.2"
 # The on-card key agreement test (tests/piv_hardware.rs) needs `ecdh`, which is not in p256's
 # default feature set. Kept here rather than on the main dependency so that a production
 # build does not carry it -- Cargo unifies features per build, so test targets get it and
