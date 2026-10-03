@@ -19,9 +19,17 @@
       url = "github:Nitrokey/opcard-rs";
       flake = false;
     };
+
+    # The trussed PIV implementation (Nitrokey 3), run as the virtual card in the
+    # virtual-piv check. Pinned to our fork until the ECC import, GET METADATA and
+    # Yubico client compatibility work is upstreamed to trussed-dev
+    piv-authenticator = {
+      url = "github:FlorianFranzen/piv-authenticator/ecc-import";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, fenix, crane, opcard }:
+  outputs = { self, nixpkgs, fenix, crane, opcard, piv-authenticator }:
     let
       # List of all supported system architectures
       allSystems = [ "x86_64-linux" "aarch64-linux" ];
@@ -116,7 +124,7 @@
               cargoClippyExtraArgs = "--all-targets -- --deny warnings";
 
               nativeBuildInputs = commonArgs.nativeBuildInputs
-                ++ (with pkgs; [ sequoia-sq gnupg openssl ]);
+                ++ (with pkgs; [ sequoia-sq gnupg openssl nss.tools ]);
             });
 
             # The tools live in nativeBuildInputs, not checkInputs: build.rs probes PATH
@@ -127,7 +135,7 @@
               inherit cargoArtifacts;
 
               nativeBuildInputs = commonArgs.nativeBuildInputs
-                ++ (with pkgs; [ sequoia-sq gnupg openssl ]);
+                ++ (with pkgs; [ sequoia-sq gnupg openssl nss.tools ]);
 
               # Expose shared libraries so the test binaries can load them at runtime
               LD_LIBRARY_PATH = libPath;
@@ -190,6 +198,38 @@
           '';
         };
 
+      # The trussed PIV app as a host binary, same construction as opcard: its vpicc
+      # example connects to vpcd and presents the card as a PC/SC reader
+      mkPivVpicc = system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          craneLib = (crane.mkLib pkgs).overrideToolchain (mkToolchain system);
+        in
+        craneLib.buildPackage {
+          pname = "piv-vpicc";
+          version = "0";
+          src = piv-authenticator;
+
+          # Upstream does not track a Cargo.lock, so the dependency tree is pinned here:
+          # piv-authenticator.lock was generated from the locked input revision.
+          # Regenerate with `cargo generate-lockfile` in the input source when bumping.
+          cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = ./piv-authenticator.lock; };
+          postPatch = ''
+            cp ${./piv-authenticator.lock} Cargo.lock
+          '';
+
+          # littlefs2-sys generates its bindings at build time
+          nativeBuildInputs = [ pkgs.rustPlatform.bindgenHook ];
+
+          # The crate's own tests want a card to talk to -- this build *is* the card
+          doCheck = false;
+          cargoBuildCommand = "cargo build --release --example vpicc";
+          installPhaseCommand = ''
+            mkdir -p $out/bin
+            cp target/release/examples/vpicc $out/bin/piv-vpicc
+          '';
+        };
+
       # The live iso with the nixos test backdoor baked in, used by the boot checks only;
       # packages.iso remains the clean image
       mkInstrumentedIso = system:
@@ -213,6 +253,24 @@
           nixos-lib = import (pkgs.path + "/nixos/lib") { };
         in
         rust.${system}.checks // {
+          # Spell-check the source and prose. `fpr` (a GnuPG record type) is allowlisted in
+          # .typos.toml; everything else that trips this is a real typo.
+          typos = pkgs.runCommand "check-typos" { nativeBuildInputs = [ pkgs.typos ]; } ''
+            cd ${./.}
+            typos
+            touch $out
+          '';
+
+          # Unused-dependency check. Textual, so no build and no network -- the one rename
+          # false positive (tiny-bip39 imported as `bip39`) is ignored in Cargo.toml.
+          machete = pkgs.runCommand "check-machete" {
+            nativeBuildInputs = [ pkgs.cargo-machete ];
+          } ''
+            cd ${./.}
+            cargo-machete
+            touch $out
+          '';
+
           # Rendering the book is its own check: mdbook fails on a malformed SUMMARY.md
           # or a broken template, and the rendered site lands in the cache for the pages
           # workflow to pull
@@ -303,7 +361,7 @@
           }).config.result;
 
           # Provision a virtual OpenPGP card (Nitrokey's opcard behind vpcd) end to end:
-          # upload, check and configure through the real binary, with no hardware involved
+          # upload, check and config through the real binary, with no hardware involved
           virtual-card = (nixos-lib.runTest {
             hostPkgs = pkgs;
             node.specialArgs = { inherit self; };
@@ -311,6 +369,20 @@
               (import ./virtual-card-test.nix {
                 inherit pkgs;
                 opcard-vpicc = mkOpcardVpicc system;
+              })
+            ];
+          }).config.result;
+
+          # The same for PIV: provision the trussed piv-authenticator behind vpcd end to
+          # end -- reset, pin and management key handling, ECC key import with metadata
+          # read-back, and the certificate chain
+          virtual-piv = (nixos-lib.runTest {
+            hostPkgs = pkgs;
+            node.specialArgs = { inherit self; };
+            imports = [
+              (import ./virtual-piv-test.nix {
+                inherit pkgs;
+                piv-vpicc = mkPivVpicc system;
               })
             ];
           }).config.result;
@@ -341,16 +413,23 @@
               # Tools the integration tests shell out to. Without them the affected tests
               # report as ignored rather than silently passing, see build.rs.
               (with pkgs; [ sequoia-sq gnupg openssl ])
-                # Tools for the manual PIV hardware checklist, see docs/piv-hardware-tests.md
-                ++ (with pkgs; [ opensc yubikey-manager nss.tools ])
+                # Tools for the PIV hardware checklist and its automated end-use steps,
+                # see docs/piv-hardware-tests.md
+                ++ (with pkgs; [ opensc yubikey-manager nss.tools openssh pkcs11-provider ])
                 # Documentation site, `mdbook serve --open` from the repository root
                 ++ (with pkgs; [ mdbook ])
-                ++ (with pkgs; [ cargo-deny pkg-config rustPlatform.bindgenHook ])
+                ++ (with pkgs; [ cargo-deny cargo-machete typos pkg-config rustPlatform.bindgenHook ])
                 # The rust-toolchain.toml toolchain; rust-analyzer locates rust-src
                 # through its own sysroot, so no RUST_SRC_PATH is needed
                 ++ [ (mkToolchain system) ];
 
             buildInputs = with pkgs; [ gmp nettle pcsclite ];
+
+            # Module paths for the PKCS#11 steps of the hardware suite and the manual
+            # checklist: the OpenSC module that talks to the card, and OpenSSL's pkcs11
+            # provider that lets `openssl s_client`/`cms` use keys living on it
+            PKCS11_MODULE = "${pkgs.opensc}/lib/opensc-pkcs11.so";
+            OPENSSL_PKCS11_PROVIDER = "${pkgs.pkcs11-provider}/lib/ossl-modules/pkcs11.so";
 
             # Expose shared libraries so `cargo test` can load them at runtime
             shellHook = with pkgs; ''

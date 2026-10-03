@@ -1,0 +1,9 @@
+# Keeps the commit-pinned actions current: dependabot preserves SHA pinning and
+# updates the version comment alongside it, so "bump the pins deliberately"
+# becomes reviewing one PR a week instead of remembering to look.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

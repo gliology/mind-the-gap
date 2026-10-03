@@ -1,7 +1,22 @@
+# Only the platforms this tool ships on, so a dependency pulled in only for some other OS
+# cannot flag an advisory or license the image never actually contains. all-features so the
+# gated hardware-test code and the dev-dependencies are scanned too, not just the defaults.
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+all-features = true
+
 [advisories]
 yanked = "deny"
 ignore = [
-    { id = "RUSTSEC-2023-0071", reason = "we do not use RSA in this code" }
+    # The Marvin RSA timing attack: `rsa` is a transitive dependency (through the yubikey
+    # stack alone; sequoia reaches RSA through nettle), but nothing here performs an RSA
+    # private-key operation whose timing an attacker could observe -- this tool derives
+    # and writes keys, it does not run an RSA decryption oracle. Revisit if PIV RSA slot
+    # support is ever added.
+    { id = "RUSTSEC-2023-0071", reason = "no RSA private-key operations are performed" },
 ]
 
 [licenses]

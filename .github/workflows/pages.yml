@@ -1,0 +1,67 @@
+name: Documentation
+
+on:
+  push:
+    branches: [main]
+  # Allow publishing the current main by hand, without waiting for a push
+  workflow_dispatch:
+
+# Pages deployment authenticates with a short-lived token rather than a secret
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never interrupt a deployment half way, but drop superseded queued ones
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+
+    steps:
+    # Third-party actions are pinned by commit -- a mutable `@main` reference hands whoever
+    # controls that repository a way into this one's CI. Bump the pins deliberately.
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Install nix
+      uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      with:
+        # No install diagnostics leave the runner
+        diagnostic-endpoint: ""
+
+    - name: Set up binary cache
+      uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+      with:
+        name: mind-the-gap
+        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        signingKey: ${{ secrets.CACHIX_SIGNING_KEY }}
+
+    # Usually a cache pull rather than a build: the derivation takes book.toml and docs/
+    # as its only inputs, so the store path is unchanged -- and already in the cache from
+    # an earlier push -- whenever a commit leaves the documentation alone.
+    - name: Build the book
+      run: nix build -L .#book
+
+    # `result` is a symlink into the read-only store, which the upload action cannot follow,
+    # so dereference it into a writable directory first
+    - name: Collect the rendered site
+      run: cp -rL result public
+
+    - name: Configure Pages
+      uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+    - name: Upload the site
+      uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+      with:
+        path: public
+
+    - name: Deploy to Pages
+      id: deploy
+      uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
