@@ -68,12 +68,30 @@
         "type": "github"
       }
     },
+    "piv-authenticator": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1790728706,
+        "narHash": "sha256-k4E308XEX5oM78kySupBp+wY2aRhM5zmHLbn8KYuGRM=",
+        "owner": "FlorianFranzen",
+        "repo": "piv-authenticator",
+        "rev": "0b1263634397d475017ba4cabaa2d48886944786",
+        "type": "github"
+      },
+      "original": {
+        "owner": "FlorianFranzen",
+        "ref": "ecc-import",
+        "repo": "piv-authenticator",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "crane": "crane",
         "fenix": "fenix",
         "nixpkgs": "nixpkgs",
-        "opcard": "opcard"
+        "opcard": "opcard",
+        "piv-authenticator": "piv-authenticator"
       }
     },
     "rust-analyzer-src": {
