@@ -53,7 +53,11 @@
     policies = machine.succeed("nft list table inet airgap | grep -c 'policy drop'")
     assert policies.strip() == "3", f"expected 3 drop policies, got {policies.strip()}"
 
-    # The module lock holds after boot; the tethering drivers are blacklisted besides
+    # The module lock holds after boot; the tethering drivers are blacklisted besides.
+    # The lock service orders itself after multi-user.target and runs `udevadm settle`
+    # first, so wait for it rather than race the settle -- kmscon's graphics bring-up
+    # gives udev more to settle.
+    machine.wait_for_unit("disable-kernel-module-loading.service")
     machine.fail("modprobe cdc_ether")
 
     # And prove it end to end: give the test VM's NIC an address by hand, the way anyone

@@ -61,7 +61,7 @@ rpassword = "7.5"
 # Line editing for the interactive session. Default features off so the file-backed
 # history (and its fd-lock dependency) cannot even be compiled in: history lives in
 # memory only and dies with the session.
-rustyline = { version = "17", default-features = false }
+rustyline = { version = "18", default-features = false }
 
 # Shell-style splitting of interactive lines, so `-n 'Jane Doe'` works at the prompt
 shlex = "1"
@@ -76,14 +76,23 @@ crossterm = { version = "0.29", default-features = false }
 # already in crossterm's tree, used directly for its safe poll wrapper
 rustix = { version = "1", features = ["event"] }
 
-# OS entropy for minting seeds and sampling the transcription quiz
-rand_core = { version = "0.9", features = ["os_rng"] }
+# OS entropy for minting seeds and sampling the transcription quiz; the lowest-level
+# interface to the kernel CSPRNG, and a version already shared with the card stacks
+getrandom = "0.4"
 
-# Mnemonic handling
-tiny-bip39 = "2.0"
+# Mnemonic handling. Default features off: the `rand` feature would pull a second,
+# older rand stack for an API this crate never calls (seeds come from `getrandom`
+# above), and the optional wordlists are unused -- English is always built in.
+tiny-bip39 = { version = "2.0", default-features = false }
 
 # Key Derivation
-argon2 = "0.5"
+#
+# NOTE: argon2 0.5 is shared with the sequoia fork, and its output is a frozen constant
+# of the mtg1 scheme -- do not bump it alone: a new major here is a new derivation
+# scheme by definition, like sha2 below. Default features off: the PHC-string API and
+# its password-hash/rand tree are unused, key material flows through
+# `hash_password_into` alone.
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 base64 = "0.22"
 
 # QR code output
@@ -95,9 +104,9 @@ qrcode = { version = "0.14", default-features = false }
 # follow it, and this fork's two-commit patch set is load-bearing for reproducibility (see
 # the security model in the README). The revision is tag openpgp/v2.2.0-mtg0.
 sequoia-openpgp = { version = "2", git = "https://gitlab.com/gli.al/sequoia.git", rev = "8ea683342764b6dedbf86e8d106d026266412e4d" }
-openpgp-card = "0.5"
+openpgp-card = "0.7"
 card-backend-pcsc = "0.5"
-secrecy = "0.8"
+secrecy = "0.10"
 
 # Yubikey PIV module
 yubikey = { version = "0.9.0-pre.0",  features = [ "untested" ]}
@@ -105,18 +114,18 @@ yubikey = { version = "0.9.0-pre.0",  features = [ "untested" ]}
 # TryFrom<SubjectPublicKeyInfoRef> impls for Subject/AuthorityKeyIdentifier, `hazmat` gates
 # Time::INFINITY. They currently also arrive via yubikey's own dependency, but relying on
 # feature unification would break on a yubikey patch release.
-x509-cert = { version = "0.3.0-rc.4", features = [ "builder", "hazmat", "pem" ]}
+x509-cert = { version = "0.3", features = [ "builder", "hazmat", "pem" ]}
 der = { version = "0.8", features = [ "oid", "alloc", "flagset" ]}
 spki = { version = "0.8", features = [ "fingerprint", "alloc" ]}
-# Degenerate PKCS#7 (certs-only SignedData) for the YubiKey msroots object.
-# Pins x509-cert 0.3.0-rc.4 and der/spki 0.8.0-rc.*, which unify with the releases above.
+# Degenerate PKCS#7 (certs-only SignedData) for the YubiKey msroots object; still a
+# prerelease, but it unifies with the final x509-cert 0.3 and der/spki 0.8 above.
 cms = { version = "0.3.0-pre.2", features = [ "std" ]}
 # NOTE: this is sha2 0.10 while yubikey/ecdsa pull sha2 0.11. Two majors coexist fine here
 # because no sha2 type crosses the boundary -- do not "fix" this by bumping it.
 sha2 = "0.10"
 # Default features already give arithmetic + ecdsa + pem(-> pkcs8) + std(-> alloc), which is
 # exactly the set x509-cert's Builder::build bounds require.
-p256 = "0.14.0-rc.9"
+p256 = "0.14"
 
 [lib]
 doctest = false
@@ -134,4 +143,4 @@ tempfile = "3"
 # default feature set. Kept here rather than on the main dependency so that a production
 # build does not carry it -- Cargo unifies features per build, so test targets get it and
 # `cargo build` does not.
-p256 = { version = "0.14.0-rc.9", features = [ "ecdh" ] }
+p256 = { version = "0.14", features = [ "ecdh" ] }
