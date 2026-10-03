@@ -15,3 +15,6 @@
 /*.pub
 /*.gpg
 /test.sh
+
+# Python bytecode from running the asset exporter in place
+__pycache__/
