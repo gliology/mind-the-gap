@@ -1,33 +1,59 @@
 # Mind the Gap
 
-
-DISCLAIMER: THIS IS WIP! DERIVATION PATHS MIGHT CHANGE AND BREAK COMPATIBLITY WITH PREVIOUS VERSIONS.
-
 This repository contains the following:
 
 - command line utility to generate smart card keys from mnemonic phrases
 - live image based on NixOS to use this tool in an air-gapped environment
 
-## How to use
+The **major version tracks the derivation scheme**: any release within a major re-derives
+the very same keys from a seed, which is what makes a lost card replaceable years later, and
+a scheme change always ships as a new major -- see the
+[derivation chapter](https://gliology.github.io/mind-the-gap/derivation.html).
 
+One trust note worth stating plainly: the OpenPGP implementation is a two-commit fork of
+sequoia, pinned by revision, and that single source is a single point of trust; the
+[security model](https://gliology.github.io/mind-the-gap/introduction.html#security-model)
+spells out what the fork changes and why.
 
-Install a flake enabled nix (e.g. by following the beginning of [this guide](https://serokell.io/blog/practical-nix-flakes)) and the run the following:
+## Quick start
+
+Install a flake enabled nix and build the live image:
 
 ```
 nix build github:gliology/mind-the-gap#iso
 ```
 
-The resulting live image can then be found in `result/iso` and copied to an install media of your choosing.
-
-Once booted you can now uses the `mind-the-gap` command line tool to generate and export any keys you might need. The command line client comes with built-in help and man pages, as well as shell completion to guide you through the process. We recommend the use of the `MIND_THE_...` environment variables to pass parameters to the utility.
-
-To just build and run the `mind-the-gap` tool in your current online environment you can also just run:
+Copy the image from `result/iso` to an install medium and boot it. To try the tool in your
+current online environment instead -- fine for testing, not for production keys:
 
 ```
 nix run github:gliology/mind-the-gap
 ```
 
-While this is a great way to test functionality, it is strongly recommended to use an air-gapped environment for any production level keys.
+Start by minting a seed with `mind-the-gap generate`; the built-in help, man pages and shell
+completion guide you from there.
+
+Running `mind-the-gap` without a subcommand opens an interactive session, the recommended
+interface for most users: it asks for the seed and optional password once, holds them in process memory only, and
+refuses any line that would put a secret into the session history. The `--seed` and
+`--password` flags and the `MIND_THE_...` environment variables form a second, fully
+scriptable interface for experts and integrations. Arguments and environments are visible
+to other processes, so that interface is for scenarios where the caller takes extra care to
+protect the secrets; the
+[user guide](https://gliology.github.io/mind-the-gap/introduction.html) spells out the
+risks.
+
+## Documentation
+
+- [User guide](https://gliology.github.io/mind-the-gap/) --- how to use the tool, the key
+  derivation scheme and its security model, several cards from one seed, the PIV certificate
+  chain, and the hardware test suites
+- [Developer reference](https://gliology.github.io/mind-the-gap/rustdoc/mind_the_gap/) ---
+  rustdoc for every module, private items included
+- [TODO.md](TODO.md) --- every open item
+
+Build the user guide locally with `nix build .#book`, or serve it with live reload from the
+dev shell via `mdbook serve --open`.
 
 ## Development
 
@@ -40,49 +66,14 @@ command:
 cachix use mind-the-gap
 ```
 
-`nix flake check` runs everything CI runs: format, clippy and the test suite, the live
-system test, and boots the actual iso in qemu over both BIOS and UEFI.
+`nix flake check` runs everything CI runs: format, clippy and the test suite, rustdoc, the
+rendered book and its consistency checks, the live system test, and boots the actual iso in
+qemu over both BIOS and UEFI.
 
-## Documentation
+Where things live: user documentation is the mdBook under [`docs/`](docs/), developer
+documentation is rustdoc on the modules and items themselves, open items are in
+[TODO.md](TODO.md), and this README stays a landing page that duplicates none of them.
 
-The full documentation is built from [`docs/`](docs/) with mdBook and published as a site:
-
-- [Key derivation](docs/derivation.md) --- the tree, the label grammar, and why every card
-  should have its own subkey id
-- [Several cards from one seed](docs/multiple-cards.md) --- what changes once one seed
-  provisions more than one card, and what revocation would require
-- [PIV certificate chain](docs/piv-certificates.md) --- the X.509 chain the PIV backend issues
-- [Hardware tests](docs/hardware-tests.md) --- the destructive on-card suites
-- [PIV hardware checklist](docs/piv-hardware-testing.md) --- the manual steps that cannot be
-  automated
-
-Build it locally with `nix build .#book`, or serve it with live reload from the dev shell:
-
-```
-mdbook serve --open
-```
-
-## Open issues:
-
-- Automate the remaining manual checklist items where possible; sections 1-4 now run as
-  `cargo test --features destructive-hardware-tests --test hardware` (see
-  [docs/piv-hardware-testing.md](docs/piv-hardware-testing.md))
-- Finish the last two items of the PIV hardware test checklist in
-  [docs/piv-hardware-testing.md](docs/piv-hardware-testing.md): TLS client auth from a
-  browser, and Thunderbird S/MIME. Everything else -- `piv upload`, `piv check`, per-slot
-  policies, `msroots`, on-card signing and decryption, SSH and TLS client auth -- passed
-  against a YubiKey 5 on 2026-09-17
-- Zeroize the secret copies that remain out of reach without upstream support: transient
-  stack copies made when the 32-byte arrays are moved, and copies held inside foreign
-  crates (`yubikey::MgmKey`'s cipher key, `p256` and `chacha20poly1305` key buffers).
-  Everything under this crate's control is wiped by type now -- every derivation returns
-  `Zeroizing<Seed256>`, the long-lived seeds are stored wrapped, and the mnemonic phrase
-  copies, derived pins and the exported secret-key armor are all zeroizing
-- Archive previous PIV subkey generations in the retired slots (82-95)
-- Test and support other keys (i.e. Solo 2, Nitrokey 3)
-- Investigate use of sequoia piv wrapper `openpgp-piv-sequoia`
-- Investigate u2f integration
-
-## Alternatives:
+## Alternatives
 
 - [sshcerts](https://github.com/obelisk/sshcerts)

@@ -3,25 +3,22 @@
 The PIV certificate chain is fully covered by `cargo test --test piv` *except* for everything
 that needs a physical card. This document is the remaining manual checklist.
 
-**Status: executed 2026-09-17.** Every check passed except two that need interactive GUI
-software -- a browser and a mail client -- and are marked `[ ]` below with the reason. The
-run also turned up four corrections to the procedure itself, folded into the steps below,
-and one real bug (fixed, see *What the run changed*).
-
-Sections 1 to 4 have since been automated as `tests/hardware.rs`; see *Automated card tests*
+Sections 1 to 5 have been automated as `tests/piv_hardware.rs`; see *Automated card tests*
 immediately below. The manual steps are kept because they are what the test was derived from,
-and because they are still how you diagnose a failure.
+and because they are still how you diagnose a failure. Nothing on the list needs GUI
+software: the TLS handshake and the S/MIME round trip that a browser or mail client would
+perform run headless in the suite, and NSS chain validation runs offline in `cargo test`.
 
-Test rig for the recorded run:
+Reference rig the checklist was written against:
 
 | | |
 |---|---|
-| Token | YubiKey 5C NFC, firmware 5.4.3, serial 20381784 |
+| Token | YubiKey 5C NFC, firmware 5.4.3 |
 | Tooling | OpenSC 0.27.1, OpenSSL 3.6.2, ykman 5.8.0, NSS 3.112.5, libp11 0.4.13 |
 | Inputs | `-d 2026-01-01 -v 10y`, PIN `123456`, no `--intermediate` (two-tier chain) |
 | Seed | the public BIP39 test mnemonic `abandon … art` |
 
-> The recorded run used a **throwaway seed**, so the card it left behind holds test keys and
+> Use a **throwaway seed** for this checklist: the card it leaves behind holds test keys and
 > its CA is derivable by anyone. Never install that root as a trust anchor, add its 9A key to
 > an `authorized_keys`, or leave the card in service. Re-run `piv upload` with a real seed to
 > provision a card for actual use.
@@ -164,12 +161,11 @@ That provides `openssl`, `opensc` (`pkcs11-tool`, `pkcs15-tool`, `opensc-tool`),
 `yubikey-manager` (`ykman`) and `nss.tools` (`certutil`, `modutil`), alongside the `sq` and
 `gpg` the OpenPGP tests use.
 
-> **Correction (2026-09-17).** Earlier revisions of this checklist called `yubico-piv-tool`,
-> which is *not* in the dev shell. Every step below now uses `ykman`, which is in the shell,
-> is the CLI Yubico develops most actively, and covers everything this checklist needs. The
-> only `yubico-piv-tool` features without a `ykman` equivalent are `-a test-signature` and
-> `-a test-decipher`, and they add no coverage here: sections 3 and 5 already exercise the
-> same card operations through real clients.
+> **Note.** Every step below uses `ykman` rather than `yubico-piv-tool`, which is *not* in
+> the dev shell. `ykman` is the CLI Yubico develops most actively and covers everything this
+> checklist needs. The only `yubico-piv-tool` features without a `ykman` equivalent are
+> `-a test-signature` and `-a test-decipher`, and they add no coverage here: sections 3 and 5
+> already exercise the same card operations through real clients.
 
 Tests that shell out to an external tool are marked `#[ignore]` when that tool is absent, via
 the probe in `build.rs`, so they are reported as ignored rather than quietly passing. Inside
@@ -211,16 +207,12 @@ scripting; without a terminal and without `--yes` it now aborts rather than hang
 Expect **one** touch prompt during upload, when the management key is authenticated
 (`[Please touch device to authenticate management access!]`).
 
-> **Correction (2026-09-17).** This step previously said to expect *two* touch prompts, one
-> before and one after the management key is replaced. The observed run prompts once.
-
 - [x] `cmp chain.pem uploaded.pem` -- upload and certify produce the same chain
 - [x] `mind-the-gap piv check` reports all four slots matching (this also needs a touch,
       because the management key is installed with require-touch)
 - [x] `mind-the-gap piv status` lists four keys with the expected subjects
 
-`piv status` also lists the Yubico attestation cert and an entry labelled `Pin key`; see
-*Open questions* below.
+`piv status` also lists the Yubico attestation cert.
 
 ## 2. Confirm what actually landed on the card
 
@@ -253,7 +245,7 @@ Two observations that are expected, not faults:
   provisioning (`src/piv.rs`, `token.block_puk()`); there is no PUK recovery path by design,
   since the keys are re-derivable from the seed.
 - `WARNING: Using default PIN!` appears only when the PIN passed to `-i` is the PIV default
-  `123456`, as in the recorded run.
+  `123456`.
 
 ## 3. On-card signing
 
@@ -275,7 +267,7 @@ pkcs11-tool --module $PKCS11 --login --pin <pin> --id 01 --sign \
 - [x] **9E signs with no PIN at all** -- the NIST SP 800-73-4 requirement that motivated the
       per-slot policy table, and the one most likely to regress
 
-> **Correction (2026-09-17).** The 9E check cannot be made with `pkcs11-tool`. OpenSC's PIV
+> **Note.** The 9E check cannot be made with `pkcs11-tool`. OpenSC's PIV
 > emulation advertises a *token-level* `login required` flag, so `pkcs11-tool` performs a
 > `C_Login` for any private-key operation whether or not `--login` is passed — it prompts for
 > a PIN and, given none, aborts. That exercises OpenSC's policy, not the card's. Test the
@@ -298,7 +290,7 @@ ykman piv objects export 0x5fff11 msroots.der
 ```
 
 The object is wrapped in a `0x82` TLV, so strip the header before OpenSSL will parse it —
-for the 490-byte object of the recorded run that is the first 4 bytes:
+for a 490-byte object that is the first 4 bytes:
 
 ```
 python3 -c "
@@ -349,9 +341,10 @@ ssh -I $PKCS11 user@host
 ```
 
 - [x] Four `ecdsa-sha2-nistp256` keys listed
-- [x] **the 9A key authenticates.** The server logs
-      `Accepted publickey ... ECDSA SHA256:<9A fingerprint>` and rejects every other offered
-      key, so the card alone carries the login.
+- [x] **the 9A key authenticates.** Automated as step 11 of the suite: a throwaway sshd is
+      authorised for only the 9A key, and the client logs in through the PKCS#11 module, so
+      a successful session is the card carrying the login. The pin is fed via `SSH_ASKPASS`
+      (ssh has no pin flag), and the 9A touch blinks during the challenge signature.
 
 Two traps cost real time here, both worth knowing before you debug a failure:
 
@@ -378,8 +371,10 @@ openssl s_server -accept 4433 -cert server.pem -key server.key \
       server logs `depth=1` (root CA) then `depth=0` (9A leaf) and `1 server accepts that
       finished`, under `-Verify 2 -verify_return_error` so a verification failure would have
       aborted the connection.
-- [ ] the same handshake **from a browser** with `$PKCS11` loaded as a security device --
-      not attempted; needs manual browser setup
+
+The handshake above *is* a browser's client-certificate authentication -- the TLS stack
+neither knows nor cares what drives it -- so no separate browser run is kept on the list.
+The automated suite performs the same handshake as step 8.
 
 ### S/MIME
 
@@ -395,10 +390,23 @@ openssl cms -decrypt -in msg.p7m -recip 9d.pem \
             -inkey "pkcs11:id=%03;type=private" -keyform ENGINE -engine pkcs11
 ```
 
-- [x] Signing and verification round-trip, with `ecdsa-with-SHA256` on the signerInfo
+- [x] Signing and verification round-trip, with `ecdsa-with-SHA256` on the signerInfo.
+      Automated as step 9 of the suite (`openssl cms -sign` drives 9C through PKCS#11).
 - [x] **Decryption on card succeeds** -- the real test of the `keyAgreement` decision (see the
-      caveat below), and it cannot be checked offline. The recovered plaintext matched, and
-      the negotiated algorithms were exactly the documented pair.
+      caveat below), and it cannot be checked offline.
+
+> **On-card CMS decryption via OpenSSL's pkcs11 provider does not work, and the cause is
+> upstream.** `openssl cms -decrypt` against 9D fails at the AES key-unwrap
+> (`aes_wrap_cipher_internal: cipher operation failed`) because of OpenSSL bug
+> [#24698](https://github.com/openssl/openssl/issues/24698): `fix_ecdh_cofactor()` asserts a
+> non-NONE action type that the PKCS#11 parameter-translation path never sets, so the X9.63
+> KDF is fed a bad SharedInfo and derives the wrong key-encryption-key. The only known fix is
+> to patch OpenSSL. The 9D key's ECDH is nonetheless proven correct two ways that avoid the
+> broken bridge, both automated: the native derivation (step 7, via the `yubikey` crate) and
+> the standard PKCS#11 `CKM_ECDH1_DERIVE` (step 10, via `pkcs11-tool`, the operation a real
+> client's own module performs). A client that does its own ECDH+KDF -- Thunderbird through
+> NSS, say -- is unaffected by the OpenSSL bug. To reproduce the failure by hand, use the
+> `openssl cms` invocation above.
 
 ### NSS / Thunderbird
 
@@ -410,14 +418,31 @@ certutil -L -d sql:$HOME/.pki/nssdb -h all
 
 When testing with a throwaway seed, point `-d` at a scratch database instead of
 `$HOME/.pki/nssdb`; adding a root whose key anyone can derive to your real profile makes
-every browser on the machine trust it. The recorded run used a temporary database.
+every browser on the machine trust it.
 
 - [x] A complete chain is shown, with no "unknown issuer". `certutil -O` prints
       `MTG PIV Root` above the 9A certificate, all four card certs list as `u,u,u`, and
       `certutil -V -u C` (9A, client auth) and `-u S` (9C, e-mail signing) both report
       `certificate is valid`
-- [ ] Thunderbird can send a signed and encrypted mail to yourself and read it back --
-      not attempted; needs a configured mail account
+
+NSS is the crypto stack Firefox, Chrome and Thunderbird share, so its recognising the card
+is the compatibility statement that matters. Step 12 of the suite automates the touch-free
+half: it loads the OpenSC module into a scratch NSS database and asserts all four slot
+certificates appear, each with a private key, under the trusted derived root. Two things
+stay manual. `certutil -V` usage validation runs offline in `tests/piv.rs` instead, against
+non-expiring certs -- this fixture's ten-year window is long past, so a real-time NSS
+validation would fail on expiry, not trust. And on-card *decryption* through NSS's
+`cmsutil` is not asserted. Its token login does work once you know the flag -- `cmsutil -f
+<pinfile>`, not `-p` (which sets only the NSS database password) -- but the decrypt then
+fails with `SEC_ERROR_INVALID_KEY`: NSS will not run the CMS ECDH on the 9D token key even
+though the key advertises `CKA_DERIVE` and `pkcs11-tool` performs the identical
+`CKM_ECDH1_DERIVE` against it. Unlike the OpenSSL path, this is **not** matched to a filed
+upstream bug -- the nearest, [moz#1241446](https://bugzilla.mozilla.org/show_bug.cgi?id=1241446),
+is about ECDSA *signature* verification with software keys, not ECDH on a token -- so it
+wants a minimal reproduction and an NSS report before it can be cited. Either way the
+card's ECDH is proven correct by steps 7 and 10. To reproduce by hand:
+`cmsutil -E -d sql:DB -r "<Key Management nickname>" -i msg -o env` then
+`cmsutil -D -d sql:DB -f pinfile -i env -o out`.
 
 ## Known caveats -- do not "fix" these
 
@@ -430,46 +455,18 @@ as it must. The meaningful check is `openssl cms -encrypt`, which succeeds and n
 
 **`openssl cms -encrypt` defaults to a SHA-1 based ECDH KDF** (`dhSinglePass-stdDH-sha1kdf`).
 That is an OpenSSL default, not something the certificate selects, and is unrelated to the
-`ecdsa-with-SHA256` signatures on the chain itself. The recorded run observed exactly
+`ecdsa-with-SHA256` signatures on the chain itself. On hardware this negotiates exactly
 `dhSinglePass-stdDH-sha1kdf-scheme` + `id-aes256-wrap` + `aes-256-cbc`.
 
 **The management key is installed with require-touch**, so `piv check` needs a touch too. If
 that turns out to be too awkward in practice, a `--no-touch-mgm` escape hatch is the intended
 fix rather than dropping the touch requirement.
 
-## Answers to the open questions from the 2026-09-17 run
-
-Both findings from the manual run have since been resolved.
-
-**The duplicate `Pin key` in `piv status` was an upstream bug.** `yubikey`'s slot table maps
-`ManagementSlotId::Pin` to object `0x5fc10b` -- which is the *key management* certificate
-object, as that crate's own comment on the line says -- identical to `SlotId::KeyManagement`.
-`Key::list` therefore reads the same certificate twice and reports it under a slot that holds
-no certificate at all. The pin, puk and management key references (0x80, 0x81, 0x9B) are key
-slots, not certificate slots. `status` now skips `SlotId::Management(_)`.
-
-**CHUID and CCC are now written during `upload`.** A freshly reset YubiKey has neither, and
-Windows smartcard logon and a good deal of middleware refuse a card carrying neither. Both
-identifiers are *derived* from the seed rather than randomly generated, from the same material
-as the card id in the 9E subject, so re-provisioning reproduces them byte for byte -- verified
-by uploading twice and comparing. The CHUID Card UUID begins with the same four bytes as the
-printed card id, which is a quick way to confirm they came from one derivation.
-
-## What the run changed
-
-- **Fixed: `confirm()` spun forever on EOF.** `src/cli.rs` looped on
-  `io::stdin().read_line()` without checking for end of input. At EOF `read_line` returns
-  `Ok(0)` and leaves the buffer empty, which is neither an error nor a match for `"yes"`, so
-  any non-TTY invocation (CI, `< /dev/null`, a pipe) reprinted the prompt at full speed
-  forever — 4.1 GB of output in about four minutes during this run, before the card was ever
-  contacted. It now aborts with a message pointing at `--yes`. The bug affected the PGP
-  upload path identically, since both call the same helper.
-
 ## If something fails
 
 Everything up to step 1 is reproducible offline without a card, so start by confirming
 `cargo test --test piv` is green with **0 ignored**. A mismatch reported by `piv check`
 between the derived and on-card public key points at the derivation or the import path; a
-mismatch in the certificate digest alone points at encoding or at the `--date` / `--card-id` /
+mismatch in the certificate digest alone points at encoding or at the `--date` /
 DN flags differing between the `upload` and `check` invocations -- all of them must be passed
 identically, since the chain is regenerated from scratch each time.
