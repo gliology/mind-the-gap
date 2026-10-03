@@ -1,7 +1,7 @@
-use mind_the_gap::seed::{argon2id_256, Seed256, Seed256Derive};
+use mind_the_gap::seed::{Seed256, Seed256Derive, argon2id_256};
 
-use base64::prelude::BASE64_STANDARD_NO_PAD;
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD_NO_PAD;
 
 const SEED: Seed256 = [42u8; 32];
 const DEFAULT_INPUT: &[u8] = b"Mind the gap, bro!";
@@ -25,10 +25,7 @@ fn derive_none_path_differs_from_some() {
 #[test]
 fn derive_chains() {
     // derive(a).derive(b) is distinct from derive(b) alone
-    assert_ne!(
-        SEED.derive(Some(b"a")).derive(Some(b"b")),
-        SEED.derive(Some(b"b"))
-    );
+    assert_ne!(SEED.derive(Some(b"a")).derive(Some(b"b")), SEED.derive(Some(b"b")));
 }
 
 #[test]
