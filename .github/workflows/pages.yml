@@ -43,11 +43,12 @@ jobs:
         authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
         signingKey: ${{ secrets.CACHIX_SIGNING_KEY }}
 
-    # Usually a cache pull rather than a build: the derivation takes book.toml and docs/
-    # as its only inputs, so the store path is unchanged -- and already in the cache from
-    # an earlier push -- whenever a commit leaves the documentation alone.
-    - name: Build the book
-      run: nix build -L .#book
+    # Usually a cache pull rather than a build: the site bundles the book (inputs:
+    # book.toml and docs/) and the rustdoc (inputs: the cargo sources), so the store
+    # paths are unchanged -- and already in the cache from an earlier push -- whenever
+    # a commit leaves both alone.
+    - name: Build the site
+      run: nix build -L .#site
 
     # `result` is a symlink into the read-only store, which the upload action cannot follow,
     # so dereference it into a writable directory first

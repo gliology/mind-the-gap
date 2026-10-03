@@ -1,3 +1,5 @@
+//! Build-time generator for the man pages and shell completions, run by the nix package.
+
 use std::io::Write;
 use std::path::Path;
 

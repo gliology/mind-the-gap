@@ -1,0 +1,17 @@
+[book]
+title = "Mind the Gap"
+description = "Derive smart card keys and certs from mnemonic seeds"
+authors = ["Florian Franzen"]
+language = "en"
+# The docs directory *is* the book source, so a chapter has one copy and reads the same on
+# GitHub as it does on the site.
+src = "docs"
+
+[output.html]
+git-repository-url = "https://github.com/gliology/mind-the-gap"
+edit-url-template = "https://github.com/gliology/mind-the-gap/edit/main/{path}"
+default-theme = "rust"
+
+[output.html.fold]
+enable = true
+level = 1
