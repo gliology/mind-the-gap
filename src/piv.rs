@@ -10,6 +10,7 @@
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
+use crate::common;
 use crate::seed::{self, Seed256, Seed256Derive};
 
 use anyhow::{Result, anyhow, bail};
@@ -181,35 +182,47 @@ pub fn status() -> Result<()> {
         };
         println!("   Serial: {}", token.serial());
 
-        match token.piv_keys() {
-            Ok(keys) => {
-                for key in keys {
-                    // Skip the pin/puk/management key references. They hold no certificate of
-                    // their own, but `yubikey`'s slot table maps `ManagementSlotId::Pin` onto
-                    // object 0x5fc10b -- which *is* the key management certificate -- so every
-                    // card otherwise reports that same certificate a second time under a
-                    // nonexistent "Pin" slot.
-                    if matches!(key.slot(), SlotId::Management(_)) {
-                        continue;
-                    }
+        // Read each real certificate slot directly instead of `piv_keys()`: the crate's
+        // slot table behind that call maps pseudo-slots onto unrelated objects -- "Pin"
+        // onto the key management certificate and "Puk" onto the key history object,
+        // whose content is no certificate at all, so one written key history object (as
+        // any card with retired certificates has) makes the whole listing fail.
+        let slots = [
+            SlotId::Authentication,
+            SlotId::Signature,
+            SlotId::KeyManagement,
+            SlotId::CardAuthentication,
+            SlotId::Attestation,
+        ]
+        .into_iter()
+        .chain(
+            (0x82..=0x95)
+                .filter_map(|byte| RetiredSlotId::try_from(byte).ok().map(SlotId::Retired)),
+        );
 
-                    let cert = key.certificate();
+        for slot in slots {
+            let cert = match CardCertificate::read(&mut token, slot) {
+                Ok(cert) => cert,
+                // An empty slot is the normal case, not something to report
+                Err(_) => continue,
+            };
 
-                    // Fingerprint is SHA256 hash of certificate
-                    match cert.cert.to_der() {
-                        Ok(der) => println!(
-                            "   {} key: {:x} ({})",
-                            key.slot(),
-                            Sha256::digest(der),
-                            cert.subject()
-                        ),
-                        Err(err) => {
-                            println!("   {} key: unreadable certificate: {err}", key.slot())
-                        }
-                    }
+            // Fingerprint is SHA256 hash of certificate
+            match cert.cert.to_der() {
+                Ok(der) => {
+                    println!(
+                        "   {} key: {:x} ({})",
+                        slot,
+                        Sha256::digest(der),
+                        common::printable(&cert.subject().to_string())
+                    )
                 }
+                Err(err) => println!(
+                    "   {} key: unreadable certificate: {}",
+                    slot,
+                    common::printable(&err.to_string())
+                ),
             }
-            Err(err) => println!("   No PIV keys: {err}"),
         }
 
         println!();
@@ -521,9 +534,11 @@ impl CertChain {
         Ok(match kind {
             CertificateKind::Chain => self.iter().collect(),
             CertificateKind::Root => vec![&self.root],
-            CertificateKind::Intermediate => vec![self.intermediate.as_ref().ok_or(anyhow!(
-                "No intermediate certificate authority, pass --intermediate to generate one"
-            ))?],
+            CertificateKind::Intermediate => vec![self.intermediate.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "No intermediate certificate authority, pass --intermediate to generate one"
+                )
+            })?],
             CertificateKind::Leaves => self.leaves.iter().map(|(_, cert)| cert).collect(),
         })
     }
@@ -639,7 +654,6 @@ pub struct SeededSmartcard {
     intermediate: bool,
 
     /// Override for the derived card identifier used in the slot 9E subject
-    card_id: Option<String>,
 
     /// Override for the per-slot pin policy, ignored for slot 9E
     pin_policy: Option<PinPolicy>,
@@ -681,7 +695,6 @@ impl SeededSmartcard {
             validity_duration: None,
             pin: None,
             intermediate: false,
-            card_id: None,
             pin_policy: None,
             touch_policy: None,
             msroots: true,
@@ -690,7 +703,7 @@ impl SeededSmartcard {
 
     /// Set the pin to install on the card in place of the PIV default
     pub fn with_pin(mut self, pin: Zeroizing<String>) -> Self {
-        self.pin = Some(pin.clone());
+        self.pin = Some(pin);
         self
     }
 
@@ -807,12 +820,6 @@ impl SeededSmartcard {
         } else {
             &self.subseed
         }
-    }
-
-    /// Override the derived card id recorded in the card authentication subject
-    pub fn with_card_id(mut self, card_id: String) -> Self {
-        self.card_id = Some(card_id);
-        self
     }
 
     /// Override the per-slot pin policy
@@ -991,7 +998,12 @@ impl SeededSmartcard {
         log::info!("Requiring touch for future management access");
         self.management_key()?.set_manual(&mut token, true)?;
 
-        token.deauthenticate()?;
+        // Dropping the session works by selecting the Yubico management applet, which only
+        // exists on YubiKeys -- on other PIV implementations the authentication simply ends
+        // with the connection, so a failure here must not fail the finished provisioning
+        if let Err(err) = token.deauthenticate() {
+            log::warn!("Could not deauthenticate management key: {err}");
+        }
 
         Ok(chain)
     }
@@ -1089,10 +1101,6 @@ impl SeededSmartcard {
     /// Derived from the subkey generation seed rather than read off the card, so that
     /// `certify` (which runs without hardware) and `upload` agree and `check` can compare.
     fn card_id(&self) -> String {
-        if let Some(id) = &self.card_id {
-            return id.clone();
-        }
-
         let derived: String = self
             .subseed
             .id(NAME_CARD_ID, 4)
@@ -1266,8 +1274,8 @@ impl SeededSmartcard {
             token.change_pin(b"123456", pin.as_bytes())?;
             token.verify_pin(pin.as_bytes())?;
         } else {
+            // Warned about once at the command layer; here it only needs verifying
             token.verify_pin(b"123456")?;
-            log::warn!("Default pin is being used");
         }
 
         // Disable puk
@@ -1299,7 +1307,7 @@ impl SeededSmartcard {
             // Invariant: the card has to hold the key we certified
             let on_card = piv::metadata(token, *slot)?
                 .public
-                .ok_or(anyhow!("Failed to retrieve public key"))?;
+                .ok_or_else(|| anyhow!("Failed to retrieve public key"))?;
             if on_card.to_der()? != cert.tbs_certificate().subject_public_key_info().to_der()? {
                 bail!("Imported key for {:?} does not match the certified key", slot);
             }

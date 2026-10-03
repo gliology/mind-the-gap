@@ -7,6 +7,7 @@
 //! per-signature salt, so the same seed reproduces the same bytes -- see the derivation
 //! chapter, <https://gliology.github.io/mind-the-gap/derivation.html>.
 
+use crate::common;
 use crate::seed::{self, Seed256, Seed256Derive};
 
 use std::convert::TryFrom;
@@ -159,6 +160,75 @@ pub enum SubkeyRole {
 /// The role named by `--shared`, which is simply a subkey role
 pub type SharedKey = SubkeyRole;
 
+/// Command line mirror of `openpgp-card`'s [`TouchPolicy`], which is a foreign type.
+///
+/// The `fixed` variants brick the setting on purpose: a card configured `fixed` or
+/// `cached-fixed` refuses to change that key's policy again until its key is re-imported,
+/// which is what makes the requirement tamper-evident.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchPolicyArg {
+    /// Never require a touch
+    Off,
+    /// Require a touch for every operation
+    On,
+    /// Require a touch for every operation, and lock this setting until the key is replaced
+    Fixed,
+    /// Require a touch, valid for about 15 seconds of operations
+    Cached,
+    /// Like cached, and lock this setting until the key is replaced
+    CachedFixed,
+}
+
+impl From<TouchPolicyArg> for TouchPolicy {
+    fn from(arg: TouchPolicyArg) -> Self {
+        match arg {
+            TouchPolicyArg::Off => TouchPolicy::Off,
+            TouchPolicyArg::On => TouchPolicy::On,
+            TouchPolicyArg::Fixed => TouchPolicy::Fixed,
+            TouchPolicyArg::Cached => TouchPolicy::Cached,
+            TouchPolicyArg::CachedFixed => TouchPolicy::CachedFixed,
+        }
+    }
+}
+
+/// How long one user pin entry stays valid for signing
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignPinValidity {
+    /// Every signature asks for the pin again (the card default)
+    Once,
+    /// One pin entry signs until the card is disconnected
+    Session,
+}
+
+/// What [`SeededSmartcard::configure`] may change on a provisioned card.
+///
+/// Everything is optional and only applied when given, so the command can adjust one
+/// setting without touching the others.
+#[derive(Default)]
+pub struct CardSettings {
+    /// Per-key touch policies to set
+    pub touch: Vec<(SubkeyRole, TouchPolicyArg)>,
+    /// Cardholder language preferences, most preferred first
+    pub lang: Vec<[u8; 2]>,
+    /// URL where the public certificate can be fetched
+    pub url: Option<String>,
+    /// Login data (conventionally an account or user name)
+    pub login: Option<String>,
+    /// Whether one pin entry signs once or for the whole session
+    pub sign_pin: Option<SignPinValidity>,
+}
+
+impl CardSettings {
+    /// Whether anything at all was asked for
+    pub fn is_empty(&self) -> bool {
+        self.touch.is_empty()
+            && self.lang.is_empty()
+            && self.url.is_none()
+            && self.login.is_none()
+            && self.sign_pin.is_none()
+    }
+}
+
 impl SubkeyRole {
     /// Every role, in the order subkeys are generated and uploaded
     pub const ALL: [SubkeyRole; 3] = [
@@ -247,7 +317,7 @@ pub fn status() -> Result<()> {
 
         let name = transaction.cardholder_name()?;
         if !name.is_empty() {
-            println!("   Cardholder: {}", name);
+            println!("   Cardholder: {}", common::printable(&name));
         }
 
         for kt in DEFAULT_KEY_TYPES {
@@ -290,7 +360,7 @@ fn open_card(target: Option<String>) -> Result<Card<Open>> {
             match backends.len() {
                 0 => bail!("No card detected, please insert card"),
                 1 => Card::new(backends.into_iter().next().unwrap())?,
-                n => bail!("Multiple cards ({}) detected, please specify card by serial", n),
+                n => bail!("Multiple cards ({n}) detected, please specify card by serial"),
             }
         }
     };
@@ -476,7 +546,91 @@ impl SeededSmartcard {
 
         // And that the supplied user pin, if any, actually opens the card
         if self.pin.is_some() {
-            self.check_user_pin(target)?;
+            self.check_user_pin(target.clone())?;
+        }
+
+        // Advisory, like PIV's policy lines: say what the card's touch policies are,
+        // since upload and config both shape them and nothing else surfaces them
+        self.report_touch_policies(target);
+
+        Ok(())
+    }
+
+    /// Report the card's touch policies, informational only
+    fn report_touch_policies(&self, target: Option<String>) {
+        let Ok(mut card) = open_card(target) else {
+            return;
+        };
+        let Ok(mut transaction) = card.transaction() else {
+            return;
+        };
+        for (label, key_type) in [
+            ("signing", KeyType::Signing),
+            ("decryption", KeyType::Decryption),
+            ("authentication", KeyType::Authentication),
+        ] {
+            if let Ok(Some(uif)) = transaction.user_interaction_flag(key_type) {
+                log::info!("Touch policy for {label}: {:?}", uif.touch_policy());
+            }
+        }
+    }
+
+    /// Adjust a provisioned card's settings under the derived admin pin.
+    ///
+    /// The counterpart to `upload`'s defaults: provisioning writes the keys with sensible
+    /// policies, and this changes them to the user's liking afterwards without wiping
+    /// anything. Fingerprints are compared first -- that costs no pin retries, so a wrong
+    /// seed, subkey id or scheme fails here without spending one of the card's three admin
+    /// attempts.
+    pub fn configure(&self, target: Option<String>, settings: CardSettings) -> Result<()> {
+        let mut cert = self.generate_signed_primary()?;
+        cert = self.append_subkeys(cert)?;
+        self.check_subkeys(&cert, target.clone())?;
+
+        let mut card = open_card(target)?;
+        let mut transaction = card.transaction()?;
+        log::info!("Connected to smartcard '{}'", transaction.application_identifier()?.ident());
+
+        let admin_pin = self.admin_pin();
+        let mut admin =
+            transaction.as_admin_card(SecretString::from(admin_pin.as_str().to_owned()))?;
+
+        for (role, policy) in &settings.touch {
+            log::info!("Setting {:?} key touch policy: {:?}", role, policy);
+            admin.set_touch_policy(role.key_type(), (*policy).into())?;
+        }
+
+        if !settings.lang.is_empty() {
+            let langs: Vec<_> = settings
+                .lang
+                .iter()
+                .map(|pair| [pair[0] as char, pair[1] as char].into())
+                .collect();
+            log::info!(
+                "Setting cardholder language preferences: {}",
+                settings
+                    .lang
+                    .iter()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            admin.set_lang(&langs)?;
+        }
+
+        if let Some(url) = &settings.url {
+            log::info!("Setting public certificate url: {}", url);
+            admin.set_url(url)?;
+        }
+
+        if let Some(login) = &settings.login {
+            log::info!("Setting login data: {}", login);
+            admin.set_login_data(login.as_bytes())?;
+        }
+
+        if let Some(validity) = settings.sign_pin {
+            log::info!("Setting pin signing validity: {:?}", validity);
+            admin.set_user_pin_signing_validity(validity == SignPinValidity::Once)?;
         }
 
         Ok(())
@@ -541,24 +695,23 @@ impl SeededSmartcard {
         self.append_subkeys(cert)
     }
 
-    /// Generate and sign revoaction certificate
     /// Generate a revocation, ready to be armored
     ///
     /// A certificate revocation is a bare packet, which is the artifact gnupg expects and can
     /// be kept apart from the key it retires. A subkey revocation is delivered as the whole
     /// certificate instead: a lone subkey revocation signature has nothing to attach to, so
     /// what a recipient actually needs to import is the certificate carrying it.
-    pub fn revoke(&self, kind: RevocationKind, code: u8, text: &str) -> Result<Vec<u8>> {
+    pub fn revoke(&self, kind: RevocationKind, code: u8, reason: &str) -> Result<Vec<u8>> {
         match kind {
             RevocationKind::Certificate => {
                 let mut cert = self.generate_primary()?;
-                let revocation = self.generate_revcert(&mut cert, code, text)?;
+                let revocation = self.generate_revcert(&mut cert, code, reason)?;
 
                 Ok(revocation.to_vec()?)
             }
             RevocationKind::Subkeys => {
                 let cert = self.certify(CertificateKind::Full)?;
-                let revocations = self.generate_subkey_revcerts(&cert, code, text)?;
+                let revocations = self.generate_subkey_revcerts(&cert, code, reason)?;
 
                 if revocations.is_empty() {
                     bail!(
@@ -768,7 +921,7 @@ impl SeededSmartcard {
         let valid_other = other.with_policy(policy, None)?;
 
         for uid in valid_other.userids() {
-            log::info!("Signing userid '{}'", uid.userid());
+            log::info!("Signing userid '{}'", common::printable(&uid.userid().to_string()));
 
             // Use a minimal builder without subpackets
             let sig = SignatureBuilder::new(kind)
@@ -797,7 +950,7 @@ impl SeededSmartcard {
 
         // Verify admin pin derived from subseed
         let admin_pin = self.admin_pin();
-        transaction.verify_admin_pin(SecretString::new(admin_pin.as_str().to_owned()))?;
+        transaction.verify_admin_pin(SecretString::from(admin_pin.as_str().to_owned()))?;
 
         Ok(())
     }
@@ -816,7 +969,7 @@ impl SeededSmartcard {
         // A valid UTF-8 pin borrows through `from_utf8_lossy`, and the `String` moves into
         // `SecretString`, which zeroizes it -- no unwiped copy is left behind
         let pin_str = pin.map(|p| String::from_utf8_lossy(p).to_string());
-        transaction.verify_user_pin(SecretString::new(pin_str))?;
+        transaction.verify_user_pin(SecretString::from(pin_str))?;
 
         log::info!("User pin verified");
 
@@ -849,14 +1002,14 @@ impl SeededSmartcard {
                 .keys()
                 .subkeys()
                 .find(|k| k.key_flags().is_some_and(|flags| role.matches(&flags)))
-                .ok_or_else(|| anyhow::anyhow!("{:?} key not found in cert", kt))?;
+                .ok_or_else(|| anyhow!("{:?} key not found in cert", kt))?;
 
             let cert_fp_bytes: [u8; 20] = subkey
                 .key()
                 .fingerprint()
                 .as_bytes()
                 .try_into()
-                .map_err(|_| anyhow::anyhow!("Unexpected fingerprint length"))?;
+                .map_err(|_| anyhow!("Unexpected fingerprint length"))?;
 
             // ... and try to compare it to the fingerprint on the smartcard
             match transaction.fingerprint(kt) {
@@ -894,25 +1047,22 @@ impl SeededSmartcard {
             let new_pin: Zeroizing<String> =
                 pin.map(|p| String::from_utf8_lossy(p).to_string()).into();
             transaction.change_user_pin(
-                SecretString::new("123456".to_string()),
-                SecretString::new(AsRef::<str>::as_ref(&*new_pin).to_owned()),
+                SecretString::from("123456".to_string()),
+                SecretString::from(AsRef::<str>::as_ref(&*new_pin).to_owned()),
             )?;
-        } else {
-            // The factory reset above restored it, so say so out loud: a provisioned card
-            // that still answers to 123456 is not something to discover later
-            log::warn!("No user pin supplied, the card keeps the default pin 123456");
         }
+        // The missing-pin case was already warned about at the command layer, once
 
         // Set new admin pin derived from subseed
         let admin_pin = self.admin_pin();
         transaction.change_admin_pin(
-            SecretString::new("12345678".to_string()),
-            SecretString::new(admin_pin.as_str().to_owned()),
+            SecretString::from("12345678".to_string()),
+            SecretString::from(admin_pin.as_str().to_owned()),
         )?;
 
         // Authenticate as admin (combines verify + elevation in one step)
         let mut admin =
-            transaction.to_admin_card(SecretString::new(admin_pin.as_str().to_owned()))?;
+            transaction.as_admin_card(SecretString::from(admin_pin.as_str().to_owned()))?;
 
         admin.set_cardholder_name(&self.name)?;
         admin.set_lang(&[['e', 'n'].into()])?;
@@ -928,7 +1078,7 @@ impl SeededSmartcard {
                 .keys()
                 .subkeys()
                 .find(|k| k.key_flags().is_some_and(|flags| role.matches(&flags)))
-                .ok_or_else(|| anyhow::anyhow!("{:?} key not found in cert", kt))?;
+                .ok_or_else(|| anyhow!("{:?} key not found in cert", kt))?;
 
             // Extract fingerprint as 20-byte array
             let fp_bytes: [u8; 20] = subkey
@@ -936,14 +1086,14 @@ impl SeededSmartcard {
                 .fingerprint()
                 .as_bytes()
                 .try_into()
-                .map_err(|_| anyhow::anyhow!("Unexpected fingerprint length"))?;
+                .map_err(|_| anyhow!("Unexpected fingerprint length"))?;
 
             // Extract creation timestamp
             let ts = subkey
                 .key()
                 .creation_time()
                 .duration_since(SystemTime::UNIX_EPOCH)
-                .map_err(|e| anyhow::anyhow!("Key creation time error: {}", e))?
+                .map_err(|e| anyhow!("Key creation time error: {}", e))?
                 .as_secs() as u32;
 
             // Extract public key bytes from cert MPI (0x40-prefixed for 25519 keys)
@@ -979,17 +1129,26 @@ impl SeededSmartcard {
             };
 
             log::info!("Uploading {:?} key", kt);
-            admin.import_key(Box::new(key), kt)?;
+            admin.import_key(&key, kt)?;
 
-            // Set touch policy (Cached: one touch valid for ~15s)
-            admin.set_touch_policy(kt, TouchPolicy::Cached)?;
+            // Prefer Cached (one touch valid for ~15s), but only advisorily: Cached is a
+            // Yubico extension to the UIF data object, and a spec-conforming card -- the
+            // Nitrokey 3's opcard rejects it with "incorrect parameters" -- must not lose
+            // its freshly imported keys over a nicety. `pgp configure --touch` can set
+            // whatever the card actually supports afterwards.
+            if let Err(err) = admin.set_touch_policy(kt, TouchPolicy::Cached) {
+                log::warn!(
+                    "Card refused the cached touch policy for the {kt:?} key ({err}); \
+                     set a supported one with `pgp configure --touch`"
+                );
+            }
         }
 
         Ok(())
     }
 
     /// Generate revocation certificate
-    fn generate_revcert(&self, cert: &mut Cert, code: u8, text: &str) -> PGPResult<Packet> {
+    fn generate_revcert(&self, cert: &mut Cert, code: u8, reason_text: &str) -> PGPResult<Packet> {
         let creation_time = self.creation_time();
 
         // Derive signing key
@@ -1004,7 +1163,7 @@ impl SeededSmartcard {
         // Sign revocation certificate
         let revocation: Packet = CertRevocationBuilder::new()
             .set_signature_creation_time(creation_time)?
-            .set_reason_for_revocation(reason(code), text.as_bytes())?
+            .set_reason_for_revocation(reason(code), reason_text.as_bytes())?
             .build(&mut signer, cert, None)?
             .into();
 
@@ -1016,7 +1175,7 @@ impl SeededSmartcard {
         &self,
         cert: &Cert,
         code: u8,
-        text: &str,
+        reason_text: &str,
     ) -> PGPResult<Vec<Packet>> {
         let creation_time = self.creation_time();
 
@@ -1054,7 +1213,7 @@ impl SeededSmartcard {
             .map(|subkey| {
                 Ok(SubkeyRevocationBuilder::new()
                     .set_signature_creation_time(creation_time)?
-                    .set_reason_for_revocation(reason(code), text.as_bytes())?
+                    .set_reason_for_revocation(reason(code), reason_text.as_bytes())?
                     .build(&mut signer, cert, subkey.key(), None)?
                     .into())
             })
@@ -1106,12 +1265,14 @@ impl EccKey for RawEccKeyRef {
         self.oid
     }
 
-    fn private(&self) -> Vec<u8> {
-        self.private_bytes.to_vec()
+    // openpgp-card 0.7 borrows the key material instead of taking owned copies, so the
+    // private scalar never leaves its Zeroizing allocation on this side of the trait
+    fn private(&self) -> &[u8] {
+        &self.private_bytes
     }
 
-    fn public(&self) -> Vec<u8> {
-        self.public_bytes.clone()
+    fn public(&self) -> &[u8] {
+        &self.public_bytes
     }
 
     fn ecc_type(&self) -> EccType {

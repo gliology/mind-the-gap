@@ -24,15 +24,17 @@
     not(feature = "no-destructive-hardware-tests")
 ))]
 
-use mind_the_gap::pgp::{CertificateKind, SeededSmartcard, DEFAULT_KEY_MAP};
+use mind_the_gap::pgp::{
+    CardSettings, CertificateKind, SeededSmartcard, SubkeyRole, TouchPolicyArg,
+};
 use mind_the_gap::seed::Seed256;
 
 use sequoia_openpgp::cert::Cert;
 use sequoia_openpgp::policy::StandardPolicy;
 
 use card_backend_pcsc::PcscBackend;
-use openpgp_card::ocard::KeyType;
 use openpgp_card::Card;
+use openpgp_card::ocard::KeyType;
 
 use zeroize::Zeroizing;
 
@@ -102,30 +104,21 @@ fn open() -> Card<openpgp_card::state::Open> {
     panic!("no OpenPGP card with identifier '{ident}'; `mind-the-gap pgp status` lists them")
 }
 
-/// Fingerprints of the three subkeys, in `DEFAULT_KEY_MAP` order.
+/// Fingerprints of the three subkeys, in `SubkeyRole::ALL` order.
 fn derived_fingerprints(cert: &Cert) -> Vec<(KeyType, [u8; 20])> {
     let policy = StandardPolicy::new();
     let valid = cert
         .with_policy(&policy, None)
         .expect("derived certificate is not valid under the standard policy");
 
-    DEFAULT_KEY_MAP
+    SubkeyRole::ALL
         .iter()
-        .map(|(kind, is_encryption, code)| {
+        .map(|role| {
+            let kind = role.key_type();
             let subkey = valid
                 .keys()
                 .subkeys()
-                .find(|key| {
-                    key.key_flags().is_some_and(|flags| {
-                        if *is_encryption {
-                            flags.for_storage_encryption() || flags.for_transport_encryption()
-                        } else if *code == 0x02 {
-                            flags.for_signing()
-                        } else {
-                            flags.for_authentication()
-                        }
-                    })
-                })
+                .find(|key| key.key_flags().is_some_and(|flags| role.matches(&flags)))
                 .unwrap_or_else(|| panic!("derived certificate has no {kind:?} subkey"));
 
             let fingerprint: [u8; 20] = subkey
@@ -135,7 +128,7 @@ fn derived_fingerprints(cert: &Cert) -> Vec<(KeyType, [u8; 20])> {
                 .try_into()
                 .expect("fingerprint is not 20 bytes");
 
-            (*kind, fingerprint)
+            (kind, fingerprint)
         })
         .collect()
 }
@@ -165,12 +158,12 @@ fn provision_and_verify_card() {
     let ident = target();
 
     // -- Provision -----------------------------------------------------------------------
-    eprintln!("[1/5] deriving the certificate offline");
+    eprintln!("[1/6] deriving the certificate offline");
     let offline = subject
         .certify(CertificateKind::Full)
         .expect("offline certify failed");
 
-    eprintln!("[2/5] uploading to card {ident} (no touch needed)");
+    eprintln!("[2/6] uploading to card {ident} (no touch needed)");
     let uploaded = subject
         .upload(Some(ident.clone()))
         .expect("upload to card failed");
@@ -182,7 +175,7 @@ fn provision_and_verify_card() {
     );
 
     // -- The crate's own check agrees ----------------------------------------------------
-    eprintln!("[3/5] running check");
+    eprintln!("[3/6] running check");
     subject
         .check(Some(ident.clone()))
         .expect("check disagreed with the card");
@@ -190,7 +183,7 @@ fn provision_and_verify_card() {
     // -- Independent verification --------------------------------------------------------
     //
     // `check` is the thing under test, so read the card directly rather than taking its word.
-    eprintln!("[4/5] asserting card contents independently");
+    eprintln!("[4/6] asserting card contents independently");
     let expected = derived_fingerprints(&offline);
 
     let mut card = open();
@@ -213,14 +206,46 @@ fn provision_and_verify_card() {
     // The user pin we asked for has to be the one in force, and the factory default must not
     // be. Checked in this order so a card that accepts everything still fails.
     transaction
-        .verify_user_pin(secrecy::SecretString::new(TEST_PIN.to_string()))
+        .verify_user_pin(secrecy::SecretString::from(TEST_PIN.to_string()))
         .expect("card rejected the pin we provisioned it with");
 
     drop(transaction);
     drop(card);
 
-    eprintln!("[5/5] gpg sees the card");
+    eprintln!("[5/6] gpg sees the card");
     gpg_sees_the_keys(&expected);
+
+    // -- Post-provisioning configuration ---------------------------------------------------
+    //
+    // `configure` adjusts the card under the derived admin pin without reprovisioning; a
+    // later factory reset by the next run reverts everything, so nothing here persists.
+    eprintln!("[6/6] configure adjusts the provisioned card");
+    subject
+        .configure(
+            Some(ident.clone()),
+            CardSettings {
+                touch: vec![(SubkeyRole::Authentication, TouchPolicyArg::On)],
+                lang: vec![*b"en", *b"de"],
+                url: Some("https://example.com/alice.asc".to_string()),
+                login: Some("alice".to_string()),
+                sign_pin: None,
+            },
+        )
+        .expect("configure failed against the provisioned card");
+
+    // Read back independently of the crate
+    let mut card = open();
+    let mut transaction = card.transaction().expect("cannot start card transaction");
+    assert_eq!(
+        transaction.url().expect("cannot read url"),
+        "https://example.com/alice.asc",
+        "configure did not store the url",
+    );
+    assert_eq!(
+        transaction.login_data().expect("cannot read login data"),
+        b"alice",
+        "configure did not store the login data",
+    );
 }
 
 /// Confirm gpg itself finds the three keys, and clean up the scdaemon that costs.
@@ -230,8 +255,11 @@ fn provision_and_verify_card() {
 /// fails with "No such device" whenever pcscd already holds the reader.
 #[cfg(has_gpg)]
 fn gpg_sees_the_keys(expected: &[(KeyType, [u8; 20])]) {
-    let home = std::env::temp_dir().join(format!("mtg-test-gpg-card-{}", std::process::id()));
-    std::fs::create_dir_all(&home).expect("cannot create throwaway GNUPGHOME");
+    // tempfile gives an unpredictable path, so nothing can pre-place a directory or
+    // symlink there; into_path hands ownership to the ScdaemonGuard below
+    let home = tempfile::tempdir()
+        .expect("cannot create throwaway GNUPGHOME")
+        .keep();
 
     #[cfg(unix)]
     {

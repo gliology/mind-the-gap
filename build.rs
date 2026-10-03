@@ -15,7 +15,7 @@ use std::env;
 use std::path::Path;
 
 /// External binaries the integration tests shell out to
-const OPTIONAL_TOOLS: [&str; 3] = ["openssl", "gpg", "sq"];
+const OPTIONAL_TOOLS: [&str; 4] = ["openssl", "gpg", "sq", "certutil"];
 
 /// Look up a binary in `PATH`
 fn has_tool(name: &str) -> bool {

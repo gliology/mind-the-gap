@@ -48,9 +48,12 @@
     machine.systemctl("start pcscd.service")
     machine.wait_for_unit("pcscd.service")
 
-    # The virtual card announces itself with the FSIJ test identifier
+    # The virtual card announces itself with the FSIJ test identifier. Written to a file
+    # rather than piped: under pipefail an early-exiting grep -q would fail the pipeline
+    # even though the card is there.
     machine.wait_until_succeeds(
-        "mind-the-gap pgp status | grep -q 'Card 0000:00000000'", timeout=120
+        "mind-the-gap pgp status > /tmp/status && grep -q 'Card 0000:00000000' /tmp/status",
+        timeout=120,
     )
 
     # A fixed test mnemonic, never a real one: this seed is in the repository
@@ -62,10 +65,11 @@
     identity = f"-s '{seed}' -n 'Virt Test' -m virt@example.com"
     card = "-c 0000:00000000"
 
-    # Provision the virtual card. --keep-factory-pin on purpose: opcard is reset by
-    # recreating the VM, and the factory pins keep the test independent of pin handling.
+    # Provision the virtual card without a pin, on purpose: opcard is reset by
+    # recreating the VM, and the factory pins keep the test independent of pin
+    # handling. A one-shot upload warns about that instead of refusing.
     machine.succeed(
-        f"mind-the-gap {identity} pgp upload --keep-factory-pin --yes {card} -o /tmp/cert.asc"
+        f"mind-the-gap {identity} pgp upload --yes {card} -o /tmp/cert.asc"
     )
     machine.succeed("grep -q 'BEGIN PGP PUBLIC KEY BLOCK' /tmp/cert.asc")
 
@@ -74,7 +78,7 @@
 
     # And the post-provisioning configuration path works against a conforming card
     machine.succeed(
-        f"mind-the-gap {identity} pgp configure {card} --lang en,de --url https://example.com/virt.asc"
+        f"mind-the-gap {identity} pgp config {card} --lang en,de --url https://example.com/virt.asc"
     )
 
     # A wrong subkey id must be detected before any pin is spent
