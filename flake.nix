@@ -436,6 +436,19 @@
               export LD_LIBRARY_PATH=${lib.makeLibraryPath [ gmp nettle pcsclite ]}:$LD_LIBRARY_PATH
             '';
           };
+
+          # Everything assets/export.py needs to regenerate the mark: shaping and
+          # outline tracing (harfbuzz + fontTools), rasterising (resvg), compression
+          # (oxipng) and the ico assembly (imagemagick). The word font is commercial
+          # and not packaged: point MTG_FONT at it when running the exporter.
+          assets = pkgs.mkShell {
+            nativeBuildInputs = with pkgs; [
+              (python3.withPackages (p: [ p.fonttools p.uharfbuzz ]))
+              resvg
+              oxipng
+              imagemagick
+            ];
+          };
         }
       );
 
@@ -479,7 +492,9 @@
             # binary cache -- untouched
             src = pkgs.lib.fileset.toSource {
               root = ./.;
-              fileset = pkgs.lib.fileset.unions [ ./book.toml ./docs ];
+              # theme/ carries only the favicon overrides; without it here the book
+              # would silently build with mdBook's stock icons
+              fileset = pkgs.lib.fileset.unions [ ./book.toml ./docs ./theme ];
             };
 
             nativeBuildInputs = [ pkgs.mdbook ];

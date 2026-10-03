@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo-512.png" width="160" alt="The Mind the Gap mark: a red shield with a bar reading MIND THE GAP">
+</p>
+
 # Mind the Gap
 
 This repository contains the following:
