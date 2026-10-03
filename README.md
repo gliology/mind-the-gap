@@ -1,153 +1,83 @@
-# Mind the Gap
+<p align="center">
+  <img src="assets/logo-512.png" width="160" alt="The Mind the Gap mark: a red shield with a bar reading MIND THE GAP">
+</p>
 
-DISCLAIMER: THIS IS WIP! DERIVATION PATHS MIGHT CHANGE AND BREAK COMPATIBLITY WITH PREVIOUS VERSIONS.
+# Mind the Gap
 
 This repository contains the following:
 
 - command line utility to generate smart card keys from mnemonic phrases
 - live image based on NixOS to use this tool in an air-gapped environment
 
-## How to use
+The **major version tracks the derivation scheme**: any release within a major re-derives
+the very same keys from a seed, which is what makes a lost card replaceable years later, and
+a scheme change always ships as a new major -- see the
+[derivation chapter](https://gliology.github.io/mind-the-gap/derivation.html).
 
-Install a flake enabled nix (e.g. by following the beginning of [this guide](https://serokell.io/blog/practical-nix-flakes)) and the run the following:
+One trust note worth stating plainly: the OpenPGP implementation is a two-commit fork of
+sequoia, pinned by revision, and that single source is a single point of trust; the
+[security model](https://gliology.github.io/mind-the-gap/introduction.html#security-model)
+spells out what the fork changes and why.
+
+## Quick start
+
+Install a flake enabled nix and build the live image:
 
 ```
 nix build github:gliology/mind-the-gap#iso
 ```
 
-The resulting live image can then be found in `result/iso` and copied to an install media of your choosing.
-
-Once booted you can now uses the `mind-the-gap` command line tool to generate and export any keys you might need. The command line client comes with built-in help and man pages, as well as shell completion to guide you through the process. We recommend the use of the `MIND_THE_...` environment variables to pass parameters to the utility.
-
-To just build and run the `mind-the-gap` tool in your current online environment you can also just run:
+Copy the image from `result/iso` to an install medium and boot it. To try the tool in your
+current online environment instead -- fine for testing, not for production keys:
 
 ```
 nix run github:gliology/mind-the-gap
 ```
 
-While this is a great way to test functionality, it is strongly recommended to use an air-gapped environment for any production level keys.
+Start by minting a seed with `mind-the-gap generate`; the built-in help, man pages and shell
+completion guide you from there.
 
-## How to develop
+Running `mind-the-gap` without a subcommand opens an interactive session, the recommended
+interface for most users: it asks for the seed and optional password once, holds them in process memory only, and
+refuses any line that would put a secret into the session history. The `--seed` and
+`--password` flags and the `MIND_THE_...` environment variables form a second, fully
+scriptable interface for experts and integrations. Arguments and environments are visible
+to other processes, so that interface is for scenarios where the caller takes extra care to
+protect the secrets; the
+[user guide](https://gliology.github.io/mind-the-gap/introduction.html) spells out the
+risks.
 
-The mind-the-gap flake also includes a full development environment including `rust-analyser` and `rustfmt`, which can be accessed via `nix develop`.
+## Documentation
 
-### Mnemonic to primary and subkeys
+- [User guide](https://gliology.github.io/mind-the-gap/) --- how to use the tool, the key
+  derivation scheme and its security model, several cards from one seed, the PIV certificate
+  chain, and the hardware test suites
+- [Developer reference](https://gliology.github.io/mind-the-gap/rustdoc/mind_the_gap/) ---
+  rustdoc for every module, private items included
+- [TODO.md](TODO.md) --- every open item
 
-While the project was inspired by the key derivation cryptography used in bitcoin and substrate, we ended up switching to `argon2id` for our key derivation function.
-This tools generates and accept only 24 word seeds, which is equivalent to 256bits of entropy (and 8 bits of checksum). 
-All keys are derived from this root entropy through multiple rounds of `argon2id` using the recommended parameters for memory constraint environments.
+Build the user guide locally with `nix build .#book`, or serve it with live reload from the
+dev shell via `mdbook serve --open`.
 
-The salt is always set to at least `MINDTHEGAP256HDKD` and optionally followed by an additional context like a password, (sub-)key or application identifiers:
+## Development
 
-```
-256-bit mnemonic seed/
-└── (optional password)/
-    ├── "openpgp"/
-    │   ├── primary key
-    │   ├── (optional subkey id)/
-    │   │   ├── admin pin
-    │   │   ├── signing subkey
-    │   │   ├── decryption subkey
-    │   │   └── authentication subkey
-    │   └── (additinal subkey id)/
-    │       └── any other subkey type
-    └── "piv"/
-        ├── root CA key
-        ├── (optional subkey id)/
-        │   ├── issuing CA key
-        │   ├── mgmnt key
-        │   ├── card identifier
-        │   ├── authentication key    (slot 9A)
-        │   ├── signature key         (slot 9C)
-        │   ├── key management key    (slot 9D)
-        │   └── card authentication   (slot 9E)
-        └── (additinal subkey id)/
-             └── any other subkey generation
-```
-
-Note that the certificate authority key is a *sibling* of the subkey id, not its parent.
-Were it the parent, anyone holding the authority key could re-derive every slot key.
-
-### PIV certificate chain
-
-The PIV backend issues a full X.509 chain rather than a set of self-signed certificates,
-so that the card works with S/MIME, TLS client authentication, SSH and smartcard logon:
+The Rust toolchain is declared once in [`rust-toolchain.toml`](rust-toolchain.toml) and
+honoured by both rustup and the flake, so `nix develop` and a plain `cargo` agree on the
+compiler. CI builds are pushed to a binary cache; substituting from it locally is one
+command:
 
 ```
-Root CA (self-signed, CA:TRUE)
-└── (optional issuing CA, enabled with --intermediate)
-    ├── 9A authentication   digitalSignature            clientAuth, msSmartcardLogon
-    ├── 9C signature        digitalSignature, nonRepudiation   emailProtection
-    ├── 9D key management   keyAgreement                emailProtection, clientAuth
-    └── 9E card auth        digitalSignature            id-PIV-cardAuth
+cachix use mind-the-gap
 ```
 
-All keys are NIST P-256 and every certificate is signed with `ecdsa-with-SHA256`. Slot 9D
-uses `keyAgreement` rather than `keyEncipherment` because these are ECDH keys and RFC 8813
-forbids the latter on EC keys.
+`nix flake check` runs everything CI runs: format, clippy and the test suite, rustdoc, the
+rendered book and its consistency checks, the live system test, and boots the actual iso in
+qemu over both BIOS and UEFI.
 
-Slots 9A, 9C and 9D are bound to the cardholder; slot 9E is bound to the card and carries no
-email address, as required by FIPS 201-3 section 4.2.3. Its subject uses a card identifier
-derived from the seed rather than the card's serial number, so that `piv certify` (which runs
-without any hardware) and `piv upload` produce identical certificates.
+Where things live: user documentation is the mdBook under [`docs/`](docs/), developer
+documentation is rustdoc on the modules and items themselves, open items are in
+[TODO.md](TODO.md), and this README stays a landing page that duplicates none of them.
 
-Export the root certificate with `mind-the-gap piv certify --kind root` and install it as a
-trust anchor. The authorities are additionally written to the card's `msroots` object, where
-the Windows minidriver picks them up.
-
-Certificate generation is fully deterministic: signing uses RFC 6979 deterministic ECDSA
-nonces, and the creation time defaults to the unix epoch, so re-running `piv certify` with
-the same inputs reproduces the same bytes.
-
-### Hardware tests
-
-Both backends have an on-card test suite. They are **destructive** -- the PIV one resets the
-PIV applet, the OpenPGP one factory-resets the OpenPGP applet -- so they are gated behind a
-feature *and* behind naming the card:
-
-```
-gpgconf --kill scdaemon        # scdaemon holds the card exclusively
-
-MTG_HARDWARE_TEST_SERIAL=$(ykman list --serials) \
-  cargo test --features destructive-hardware-tests --test hardware -- --nocapture
-
-MTG_HARDWARE_TEST_CARD=$(mind-the-gap pgp status | awk '/Card/{print $3}') \
-  cargo test --features destructive-hardware-tests --test hardware_pgp -- --nocapture
-```
-
-Each applet is reset independently, so one token can carry both suites -- just not at the same
-time, since they contend for the reader. The PIV suite needs three touches (`check`, the 9A
-signature, the 9D key agreement); the OpenPGP suite needs none.
-
-The second feature, `no-destructive-hardware-tests`, is a safety interlock that must never be
-enabled by hand. The tests compile only when `destructive-hardware-tests` is on and it is off,
-so `cargo test --all-features` -- which turns on both -- compiles them out rather than wiping
-whatever card is plugged in.
-
-See [docs/piv-hardware-testing.md](docs/piv-hardware-testing.md) for what they assert and for
-the manual checklist covering what cannot be automated.
-
-## Open issues:
-
-- Automate the remaining manual checklist items where possible; sections 1-4 now run as
-  `cargo test --features destructive-hardware-tests --test hardware` (see
-  [docs/piv-hardware-testing.md](docs/piv-hardware-testing.md))
-- Finish the last two items of the PIV hardware test checklist in
-  [docs/piv-hardware-testing.md](docs/piv-hardware-testing.md): TLS client auth from a
-  browser, and Thunderbird S/MIME. Everything else -- `piv upload`, `piv check`, per-slot
-  policies, `msroots`, on-card signing and decryption, SSH and TLS client auth -- passed
-  against a YubiKey 5 on 2026-09-17
-- Zeroize the secret copies that remain out of reach without upstream support: transient
-  stack copies made when the 32-byte arrays are moved, and copies held inside foreign
-  crates (`yubikey::MgmKey`'s cipher key, `p256` and `chacha20poly1305` key buffers).
-  Everything under this crate's control is wiped by type now -- every derivation returns
-  `Zeroizing<Seed256>`, the long-lived seeds are stored wrapped, and the mnemonic phrase
-  copies, derived pins and the exported secret-key armor are all zeroizing
-- Archive previous PIV subkey generations in the retired slots (82-95)
-- Test and support other keys (i.e. Solo 2, Nitrokey 3)
-- Investigate use of sequoia piv wrapper `openpgp-piv-sequoia`
-- Investigate u2f integration
-
-## Alternatives:
+## Alternatives
 
 - [sshcerts](https://github.com/obelisk/sshcerts)

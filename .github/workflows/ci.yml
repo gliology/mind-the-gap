@@ -2,26 +2,146 @@ name: Continuous Integration
 
 on: [push, pull_request]
 
+# The jobs only read the repository; cache pushes authenticate through the cachix
+# secrets, not the workflow token
+permissions:
+  contents: read
+
+# A superseded push has nothing left to prove, and each run builds two full isos --
+# stop the old run when a new one starts on the same ref
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  nix-flake-check:
+  # Build the package first, so every downstream job pulls it from the cache
+  package:
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
-        target: [mind-the-gap, iso]
+
+    steps:
+    # Third-party actions are pinned by commit -- a mutable `@main` reference hands whoever
+    # controls that repository a way into this one's CI. Bump the pins deliberately.
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Install nix
+      uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      with:
+        # No install diagnostics leave the runner
+        diagnostic-endpoint: ""
+
+    - name: Check nixpkgs version
+      uses: DeterminateSystems/flake-checker-action@786422608c7bded2bbc9741ad9f91356842bf520 # v14
+      with:
+        # No usage statistics leave the runner
+        send-statistics: false
+
+    # The auth token authorises the push, the signing key signs the paths of the
+    # self-signed cache; pushes are skipped on fork PRs, which carry no secrets
+    - name: Set up binary cache
+      uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+      with:
+        name: mind-the-gap
+        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        signingKey: ${{ secrets.CACHIX_SIGNING_KEY }}
+        skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+
+    - name: Build package
+      run: nix build -L .#mind-the-gap
+
+  # The image reuses the cached package. The book is not here: it is a flake check now,
+  # built once on x86 below, because rendered html is the same on either architecture and
+  # the pages workflow pulls that exact store path out of the cache.
+  image:
+    needs: package
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
     - name: Install nix
-      uses: DeterminateSystems/nix-installer-action@main
+      uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      with:
+        # No install diagnostics leave the runner
+        diagnostic-endpoint: ""
 
-    - name: Setup nix cache
-      uses: DeterminateSystems/magic-nix-cache-action@main
+    - name: Set up binary cache
+      uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+      with:
+        name: mind-the-gap
+        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        signingKey: ${{ secrets.CACHIX_SIGNING_KEY }}
+        skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
 
-    - name: Check nixpkgs version
-      uses: DeterminateSystems/flake-checker-action@main
+    - name: Build image
+      run: nix build -L .#iso
+
+  # The full flake check runs on x86 only: the live-system vm test needs kvm, which the
+  # x86 runners expose and the arm runners do not (actions/runner-images#14062). This is
+  # also where the book is rendered and pushed to the cache.
+  flake-check:
+    needs: package
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Install nix
+      uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      with:
+        # No install diagnostics leave the runner
+        diagnostic-endpoint: ""
+
+    - name: Set up binary cache
+      uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+      with:
+        name: mind-the-gap
+        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        signingKey: ${{ secrets.CACHIX_SIGNING_KEY }}
+        skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
 
     - name: Check nix flake
-      run: nix build .\#${{ matrix.target }}
+      run: nix flake check -L
+
+    # The sandboxed deny check above covers licenses, bans and sources; advisories need
+    # the RustSec database from the network, so they run here, where there is one
+    - name: Check advisories
+      run: nix develop --command cargo deny check advisories
+
+  # Rust checks that need no kvm, run on arm explicitly: the package build itself does
+  # not run the tests, and `nix flake check` above only builds the x86 checks. The arm iso
+  # *boot* is not here -- the arm runners have no kvm, so a full-system boot runs under TCG
+  # instruction emulation and takes over an hour, far too slow for every push. It lives in
+  # the scheduled arm-boot workflow instead.
+  arm-checks:
+    needs: package
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Install nix
+      uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      with:
+        # No install diagnostics leave the runner
+        diagnostic-endpoint: ""
+
+    - name: Set up binary cache
+      uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+      with:
+        name: mind-the-gap
+        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        signingKey: ${{ secrets.CACHIX_SIGNING_KEY }}
+        skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+
+    - name: Run rust checks
+      run: nix build -L .#checks.aarch64-linux.test .#checks.aarch64-linux.clippy .#checks.aarch64-linux.fmt

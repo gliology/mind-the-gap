@@ -6,6 +6,37 @@ than to discover later. This document walks through them for both backends.
 
 Everything below was measured against the tool rather than reasoned about.
 
+## Start an interactive session
+
+Every command in this document needs the seed, and a provisioning session runs many of them.
+Start an interactive session instead of retyping the phrase per command:
+
+```
+mind-the-gap
+```
+
+The session asks for the phrase once, on the first command that needs it, follows up with
+the optional derivation password (empty for none), and keeps both in process memory only:
+nothing reaches the environment, and it is gone when you leave. The commands below then
+read exactly as written, one per prompt line:
+
+```
+mtg> piv upload -k laptop
+mtg> piv upload -k desktop
+```
+
+Each upload asks for the card's user pin on a hidden prompt (leaving it empty keeps the
+factory pin, with a warning). The pin can also be given inline as `-i <pin>`, but a pin on
+the line enters the session history like any other argument, so the prompt is the better
+habit; a `MIND_THE_PIN` variable set when the session started suppresses the question
+entirely.
+
+The two backends verify in opposite orders, visibly so when a card was provisioned from
+the wrong seed: `pgp check` compares fingerprints before spending any pin attempt, so a
+mismatch costs nothing; `piv check` must authenticate the management key first (and take
+its touch, where required), so the wrong seed surfaces as a failed authentication rather
+than a mismatch report.
+
 ## Give every card a subkey id
 
 **Do this first.** Without `--subkey`, every card provisioned from one seed is a cryptographic
@@ -20,9 +51,9 @@ Everything below the subkey id changes with it; the authority above it does not:
 
 | `--subkey` | root CA | 9A key | card id |
 |---|---|---|---|
-| *(none)* | `8689cddf…` | `f3450d17…` | `9482DB69` |
-| `laptop` | `8689cddf…` | `4fc4587c…` | `E1FE3429` |
-| `desktop` | `8689cddf…` | `094d61dc…` | `C40CBAD3` |
+| *(none)* | `8689cddf…` | `f3450d17…` | `mtg1:9482DB69` |
+| `laptop` | `8689cddf…` | `4fc4587c…` | `mtg1:E1FE3429` |
+| `desktop` | `8689cddf…` | `094d61dc…` | `mtg1:C40CBAD3` |
 
 OpenPGP behaves the same way: the primary key is identical across ids, the three subkeys are
 not. So one trust anchor — or one OpenPGP identity — covers every machine, while each card
@@ -232,6 +263,8 @@ support is not urgent.
 
 ## Summary
 
+- Run `mind-the-gap` without arguments for an interactive session that asks for the
+  phrase once and keeps it only in memory.
 - Always set `--subkey`, one per card. The machine name is a good id.
 - It is public, and appears in certificates. Use `--password` if you want secrecy.
 - Signing and authentication need no further thought.
