@@ -1,0 +1,7 @@
+# Words that look like typos but are not:
+#   fpr      - GnuPG colon-format record type for a fingerprint
+#   iif/oif  - nftables input-/output-interface match keywords (live-system.nix)
+[default.extend-words]
+fpr = "fpr"
+iif = "iif"
+oif = "oif"

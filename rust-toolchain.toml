@@ -1,0 +1,7 @@
+# The single declaration of the Rust toolchain, honoured by rustup and -- through fenix's
+# fromToolchainFile -- by the flake. An exact version rather than "stable", so the compiler
+# moves only when this file changes, never as a side effect of `nix flake update`; bumping
+# it also invalidates the manifest hash in flake.nix, see the comment there.
+[toolchain]
+channel = "1.93.1"
+components = ["rustfmt", "clippy", "rust-src", "rust-analyzer"]

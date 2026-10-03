@@ -1,0 +1,45 @@
+name: ARM boot
+
+# The aarch64 iso boot check, kept off the per-push CI. GitHub's hosted arm runners expose
+# no kvm (actions/runner-images#14062), so QEMU boots the image under TCG instruction
+# emulation -- correct but slow enough (over an hour) that running it on every push would
+# risk the six-hour job cap and waste runner time. A weekly run, plus on-demand dispatch,
+# keeps the arm iso's boot path honest without blocking development. Anyone with native
+# arm hardware and kvm can run it in seconds with `nix build .#checks.aarch64-linux.boot-uefi`.
+on:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arm-boot-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  boot-uefi:
+    runs-on: ubuntu-24.04-arm
+    # Well under the 360-minute hard cap, but generous enough for the emulated boot
+    timeout-minutes: 300
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Install nix
+      uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      with:
+        diagnostic-endpoint: ""
+
+    - name: Set up binary cache
+      uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+      with:
+        name: mind-the-gap
+        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        signingKey: ${{ secrets.CACHIX_SIGNING_KEY }}
+        skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+
+    - name: Boot the iso over uefi
+      run: nix build -L .#checks.aarch64-linux.boot-uefi
