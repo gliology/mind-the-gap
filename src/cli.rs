@@ -221,6 +221,44 @@ enum PGPCommand {
         card: Option<String>,
     },
 
+    /// Adjust a provisioned card's settings, authenticated by the derived admin pin
+    ///
+    /// Upload writes sensible defaults; this changes them to your liking afterwards
+    /// without reprovisioning anything. Only the options given are touched. (The PIV
+    /// backend has no counterpart: its pin and touch policies are fixed when a key is
+    /// imported -- set them with `piv upload`'s --pin-policy and --touch-policy.)
+    #[command(group = ArgGroup::new("settings").required(true).multiple(true)
+        .args(["touch", "lang", "url", "login", "sign_pin"]))]
+    Configure {
+        /// Serial number of smart card to configure
+        #[arg(short, long, env = "MIND_THE_CARD")]
+        card: Option<String>,
+
+        /// Touch policy per key, as `<key>=<policy>`
+        ///
+        /// Keys are signing, decryption and authentication; policies are off, on, fixed,
+        /// cached and cached-fixed. The fixed variants lock the setting until the key is
+        /// replaced. Example: --touch signing=on,decryption=cached
+        #[arg(long, value_name = "KEY=POLICY", value_delimiter = ',', value_parser = parse_touch)]
+        touch: Vec<(pgp::SubkeyRole, pgp::TouchPolicyArg)>,
+
+        /// Cardholder language preferences (ISO 639-1), most preferred first
+        #[arg(long, value_name = "LANG", value_delimiter = ',', value_parser = parse_lang)]
+        lang: Vec<[u8; 2]>,
+
+        /// URL where the public certificate can be fetched
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+
+        /// Login data, conventionally an account or user name
+        #[arg(long, value_name = "LOGIN")]
+        login: Option<String>,
+
+        /// Whether one pin entry signs once (the card default) or for the whole session
+        #[arg(long, value_enum, value_name = "VALIDITY")]
+        sign_pin: Option<pgp::SignPinValidity>,
+    },
+
     /// Export key to smartcard
     Upload {
         /// Pin to protect exported keys on smartcards
@@ -396,6 +434,25 @@ fn write_sensitive(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         .write_all(bytes)?;
 
     Ok(())
+}
+
+/// Parse one `<key>=<policy>` pair for `pgp configure --touch`
+fn parse_touch(s: &str) -> Result<(pgp::SubkeyRole, pgp::TouchPolicyArg), String> {
+    use clap::ValueEnum;
+
+    let (key, policy) = s
+        .split_once('=')
+        .ok_or_else(|| format!("'{s}' is not <key>=<policy>, e.g. signing=on"))?;
+
+    Ok((pgp::SubkeyRole::from_str(key, true)?, pgp::TouchPolicyArg::from_str(policy, true)?))
+}
+
+/// Parse one ISO 639-1 language code for `pgp configure --lang`
+fn parse_lang(s: &str) -> Result<[u8; 2], String> {
+    match s.as_bytes() {
+        [a, b] if a.is_ascii_lowercase() && b.is_ascii_lowercase() => Ok([*a, *b]),
+        _ => Err(format!("'{s}' is not a two-letter ISO 639-1 code, e.g. en")),
+    }
 }
 
 fn confirm(backend: &str) -> Result<()> {
@@ -703,6 +760,23 @@ fn run_pgp(identity: Identity, options: PGPOptions, command: PGPCommand) -> Resu
             }
 
             builder.check(card)
+        }
+        PGPCommand::Configure { card, touch, lang, url, login, sign_pin } => {
+            let settings = pgp::CardSettings { touch, lang, url, login, sign_pin };
+            if settings.is_empty() {
+                bail!(
+                    "Nothing to configure: pass at least one of --touch, --lang, --url, \
+                     --login or --sign-pin"
+                );
+            }
+
+            let builder = builder()?;
+
+            if let Some(serial) = card.as_ref() {
+                log::info!("Configuring smartcard: {}", serial);
+            }
+
+            builder.configure(card, settings)
         }
         PGPCommand::Upload { pin, card, yes, keep_factory_pin, output, qr: show_qr } => {
             if pin.is_none() && !keep_factory_pin {
