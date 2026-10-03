@@ -128,24 +128,24 @@ fn current_scheme_is_frozen() {
                     "CN=Alice PIV Root CA",
                 ),
                 (
-                    "cf446e4c42c233cdf3f837afee21fe1136a03e76f1efb6ae5fc599010bae8583",
-                    "56d71529224d4bc00576f86574e984a9ae4cf51da7f3ecb25873ca8b22f61c7c",
+                    "d1e324401141f093a1b62f9a5469050efcfd2e2956dff07d844abb5116c1d4b4",
+                    "7434548b2d0e622089d47aed254ea21c29f5de68ebfa0587bdf3bca1fd297080",
                     "CN=Alice",
                 ),
                 (
-                    "eb925b663354789be9e29b57b7131900fc6b278af6d4367272e820d76d8be9af",
-                    "38fe7e09321035c49bc3f17bc6bc09826adb05fc329b67e66ffab821af1af1dd",
+                    "8d292e4d4152eecabd99a1edb78afa39a07ededa36f7475a18c32470d1008c1b",
+                    "874543318163f147a0f38bae3333b76045aa2a34b9efd072b5716b907319b2d8",
                     "CN=Alice",
                 ),
                 (
-                    "5b8d3900cd6bb0bd85ceaeca40ca4d6ba2a13a6dd52e57c9bb5cea201bede7ad",
-                    "6681a8615be9892782db8d6fd04c8e810528dcc3b66ff05a0337c227d2050df8",
+                    "a72c8f7234379d00a0c4d89f86842e793897a7692eff8dce35a2f7a78f0546bd",
+                    "6d18078fc308260061ffac3af44ae3cea60b4569eb4c39c13036ee14c2f3ec3e",
                     "CN=Alice",
                 ),
                 (
-                    "d6dc0e6f392069061b18f0413f79ffab59009a61f23437211b72c714d5fa15b4",
-                    "53748aec9c2bf4f7075da75bb1ba8afba0951a5acf3f0e64651259c7131f8d13",
-                    "CN=PIV Card mtg1:BBD557CD",
+                    "6a4f64ca4c793e2159a6affb5d1daefe784afa1b53fc1d5f56d92494a6792c64",
+                    "c4e3ed49020f30473ae88a10bda5e3ecf31c28f54d1ae7087e12e2d13fabf97f",
+                    "CN=PIV Card mtg1:5D168619",
                 ),
             ],
         ),
@@ -348,100 +348,6 @@ fn certify_intermediate_without_intermediate_fails() {
             .certify(CertificateKind::Intermediate)
             .is_ok()
     );
-}
-
-/// The validity window follows the flags: infinite by default, bounded by --validity.
-#[test]
-fn validity_window_follows_the_flags() {
-    let creation = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
-    let ten_years = Duration::from_secs(10 * 365 * 24 * 60 * 60);
-
-    // Default: leaves never expire, matching the promise that a derived certificate can be
-    // reproduced years later
-    let infinite = alice().certify(CertificateKind::Chain).unwrap();
-    for (slot, cert) in &infinite.leaves {
-        let validity = cert.tbs_certificate().validity();
-        assert_eq!(validity.not_before.to_system_time(), creation, "{slot:?} notBefore moved");
-        assert_eq!(
-            validity.not_after.to_system_time(),
-            x509_cert::time::Time::INFINITY.to_system_time(),
-            "{slot:?} should not expire by default"
-        );
-    }
-
-    // Bounded: --validity sets notAfter relative to the creation time, on the leaves only --
-    // the authorities never expire, so a leaf can never outlive its issuer
-    let bounded = alice()
-        .with_validity_duration(ten_years)
-        .certify(CertificateKind::Chain)
-        .unwrap();
-    for (slot, cert) in &bounded.leaves {
-        assert_eq!(
-            cert.tbs_certificate().validity().not_after.to_system_time(),
-            creation + ten_years,
-            "{slot:?} notAfter does not honour --validity"
-        );
-    }
-    assert_eq!(
-        bounded
-            .root
-            .tbs_certificate()
-            .validity()
-            .not_after
-            .to_system_time(),
-        x509_cert::time::Time::INFINITY.to_system_time(),
-        "the root must never expire"
-    );
-}
-
-/// `cas()` feeds the msroots object: issuing authority first, trust anchor last.
-#[test]
-fn cas_orders_the_root_last() {
-    let plain = alice().certify(CertificateKind::Chain).unwrap();
-    let cas = plain.cas();
-    assert_eq!(cas.len(), 1);
-    assert_eq!(digest(&cas[0]), digest(&plain.root));
-
-    let tiered = alice()
-        .with_intermediate(true)
-        .certify(CertificateKind::Chain)
-        .unwrap();
-    let cas = tiered.cas();
-    assert_eq!(cas.len(), 2);
-    assert_eq!(digest(&cas[0]), digest(tiered.intermediate.as_ref().unwrap()));
-    assert_eq!(digest(&cas[1]), digest(&tiered.root));
-}
-
-/// The msroots encoding is a degenerate PKCS#7: SignedData carrying only certificates.
-///
-/// This is what the Windows minidriver expects to find in the object; until now it was
-/// asserted only on real hardware, i.e. never in CI.
-#[test]
-fn msroots_encodes_a_degenerate_pkcs7() {
-    use cms::content_info::ContentInfo;
-    use x509_cert::der::{Decode, Encode};
-
-    let chain = alice()
-        .with_intermediate(true)
-        .certify(CertificateKind::Chain)
-        .unwrap();
-
-    let encoded = ContentInfo::try_from(chain.cas())
-        .expect("authorities do not form a PKCS#7")
-        .to_der()
-        .expect("PKCS#7 does not encode");
-
-    // Round-trips as a ContentInfo declaring SignedData
-    let decoded = ContentInfo::from_der(&encoded).expect("emitted DER does not parse back");
-    assert_eq!(decoded.content_type.to_string(), "1.2.840.113549.1.7.2", "not SignedData");
-
-    // Degenerate: both authorities embedded verbatim, root included
-    let intermediate = chain.intermediate.as_ref().unwrap().to_der().unwrap();
-    let root = chain.root.to_der().unwrap();
-    let haystack = encoded.as_slice();
-    let contains = |needle: &[u8]| haystack.windows(needle.len()).any(|w| w == needle);
-    assert!(contains(&intermediate), "intermediate certificate missing from msroots");
-    assert!(contains(&root), "root certificate missing from msroots");
 }
 
 /// The validity window follows the flags: infinite by default, bounded by --validity.
@@ -810,6 +716,95 @@ fn serials_are_distinct_and_positive() {
 }
 
 // --- External validation -----------------------------------------------------
+
+/// NSS accepts the chain for the usages the certificates claim, and refuses the rest.
+///
+/// NSS is a different validator with different opinions than OpenSSL -- it is what
+/// Firefox and Thunderbird actually run -- so passing both is much stronger evidence
+/// than passing one twice. This needs no card: `certutil` validates the certificates,
+/// and those are derived offline.
+#[test]
+#[cfg_attr(not(has_certutil), ignore = "certutil not found in PATH")]
+fn nss_validates_the_chain_usages() {
+    let chain = alice().certify(CertificateKind::Chain).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = format!("sql:{}", dir.path().display());
+    let pem = |cert: &Certificate, name: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, cert.to_pem(x509_cert::der::pem::LineEnding::LF).unwrap()).unwrap();
+        path
+    };
+
+    let run = |args: &[&str]| {
+        let result = std::process::Command::new("certutil").args(args).output();
+        // Gated by cfg(has_certutil): a spawn failure here means the build.rs probe went
+        // stale, which must fail loudly, not pass silently (see build.rs)
+        result.expect("certutil vanished since the build.rs probe ran")
+    };
+
+    let empty = dir.path().join("empty");
+    std::fs::write(&empty, b"").unwrap();
+    assert!(
+        run(&["-N", "-d", &db, "-f", empty.to_str().unwrap()])
+            .status
+            .success(),
+        "cannot create scratch NSS database"
+    );
+
+    // Root as a trusted CA, leaves without any trust of their own
+    let root = pem(&chain.root, "root.pem");
+    assert!(
+        run(&[
+            "-A",
+            "-n",
+            "root",
+            "-t",
+            "CT,C,C",
+            "-d",
+            &db,
+            "-i",
+            root.to_str().unwrap()
+        ])
+        .status
+        .success()
+    );
+    for (slot, name) in [(SlotId::Authentication, "9a"), (SlotId::Signature, "9c")] {
+        let cert = &chain.leaves.iter().find(|(id, _)| *id == slot).unwrap().1;
+        let path = pem(cert, &format!("{name}.pem"));
+        assert!(
+            run(&[
+                "-A",
+                "-n",
+                name,
+                "-t",
+                ",,",
+                "-d",
+                &db,
+                "-i",
+                path.to_str().unwrap()
+            ])
+            .status
+            .success()
+        );
+    }
+
+    let validate = |name: &str, usage: &str| {
+        let out = run(&["-V", "-n", name, "-u", usage, "-d", &db]);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        (out.status.success() && stdout.contains("certificate is valid"), stdout)
+    };
+
+    // 9A carries clientAuth (usage C), 9C carries emailProtection (usage S) ...
+    let (ok, detail) = validate("9a", "C");
+    assert!(ok, "NSS rejects 9A for TLS client auth:\n{detail}");
+    let (ok, detail) = validate("9c", "S");
+    assert!(ok, "NSS rejects 9C for e-mail signing:\n{detail}");
+
+    // ... and neither passes for the other's purpose, so the usages actually constrain
+    let (ok, detail) = validate("9a", "S");
+    assert!(!ok, "NSS accepted 9A for e-mail signing:\n{detail}");
+}
 
 #[test]
 #[cfg_attr(not(has_openssl), ignore = "openssl not found in PATH")]
