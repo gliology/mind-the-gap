@@ -57,6 +57,26 @@ libc = "0.2"
 
 # No-echo terminal prompt for the seed phrase and password, see src/prompt.rs
 rpassword = "7.5"
+
+# Line editing for the interactive session. Default features off so the file-backed
+# history (and its fd-lock dependency) cannot even be compiled in: history lives in
+# memory only and dies with the session.
+rustyline = { version = "17", default-features = false }
+
+# Shell-style splitting of interactive lines, so `-n 'Jane Doe'` works at the prompt
+shlex = "1"
+
+# Alternate-screen QR display and raw-mode key reads, see src/qr.rs. Default features
+# off keeps the event system (and its mio/signal-hook tree) out; this replaces what
+# would otherwise be hand-rolled unsafe termios and ioctl calls, the same trade as
+# rpassword for the prompts.
+crossterm = { version = "0.29", default-features = false }
+
+# Timeout-bounded wait on the tty when telling a bare Esc from an escape sequence;
+# already in crossterm's tree, used directly for its safe poll wrapper
+rustix = { version = "1", features = ["event"] }
+
+# OS entropy for minting seeds and sampling the transcription quiz
 rand_core = { version = "0.9", features = ["os_rng"] }
 
 # Mnemonic handling

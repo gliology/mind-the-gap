@@ -372,6 +372,20 @@
               })
             ];
           }).config.result;
+
+          # The same for PIV: provision the trussed piv-authenticator behind vpcd end to
+          # end -- reset, pin and management key handling, ECC key import with metadata
+          # read-back, and the certificate chain
+          virtual-piv = (nixos-lib.runTest {
+            hostPkgs = pkgs;
+            node.specialArgs = { inherit self; };
+            imports = [
+              (import ./virtual-piv-test.nix {
+                inherit pkgs;
+                piv-vpicc = mkPivVpicc system;
+              })
+            ];
+          }).config.result;
         } // (
           let
             bootChecks = import ./boot-test.nix {
