@@ -1,9 +1,9 @@
 //! The clap command line: argument types, the subcommand tree, and the run loop.
 //!
-//! Secret-bearing arguments are `Zeroizing<String>` and are prompted for when omitted --
-//! values on the command line leak through `ps` and shell history, so the prompt is the
-//! preferred entry and the `MIND_THE_...` environment variables cover only the public
-//! parameters. The handlers wire the seed layer to the [`pgp`] and [`piv`] builders.
+//! Secret-bearing arguments are `Zeroizing<String>`. A one-shot invocation takes them
+//! from flags or `MIND_THE_...` variables and fails when the seed is missing; only the
+//! interactive session prompts, once, so a script can never hang on a hidden prompt.
+//! The handlers wire the seed layer to the [`pgp`] and [`piv`] builders.
 
 // Import helper to add shared commands
 use crate::common;
@@ -13,11 +13,9 @@ use crate::piv;
 use crate::prompt;
 use crate::qr;
 
-use rand_core::{OsRng, TryRngCore};
-
 use std::{path::PathBuf, time::Duration};
 
-use std::io::Write;
+use std::io::{BufRead, IsTerminal, Write};
 use std::{fs, io};
 
 use anyhow::{Result, anyhow, bail};
@@ -34,6 +32,10 @@ use sequoia_openpgp::cert::Cert;
 use sequoia_openpgp::parse::Parse;
 use sequoia_openpgp::serialize::SerializeInto;
 
+use rustyline::config::Config;
+use rustyline::error::ReadlineError;
+use rustyline::history::MemHistory;
+
 use zeroize::Zeroizing;
 
 /// The parsed command line, global arguments plus the subcommand
@@ -45,30 +47,26 @@ use zeroize::Zeroizing;
 pub struct CLI {
     /// Mnemonic seed phrase of root secret
     ///
-    /// Prompted for on the terminal when omitted, which is the preferred way to enter it:
-    /// arguments are visible in `ps` and shell history, environment variables in /proc,
-    /// while the prompt echoes nothing and leaves no trace. Use `generate` to mint one.
+    /// Required for any command that derives keys: a one-shot invocation fails without
+    /// it rather than stopping on a prompt, and no command ever invents a seed on its
+    /// own. Use `generate` to mint one, or run without any subcommand for an
+    /// interactive session, which asks for the phrase once and keeps it off the
+    /// command line entirely.
     #[arg(short, long, global = true, env = "MIND_THE_SEED")]
     seed: Option<Zeroizing<String>>,
 
     /// Optional password to use in root entropy derivation
     ///
-    /// Takes its value only in the equals form, `--password=<PASSWORD>`. Passing the bare
-    /// flag instead prompts for the password on the terminal, asking twice without echoing:
-    /// a password has no checksum, and a typo would silently derive different keys.
-    #[arg(
-        short,
-        long,
-        global = true,
-        env = "MIND_THE_PASSWORD",
-        num_args = 0..=1,
-        require_equals = true
-    )]
-    password: Option<Option<Zeroizing<String>>>,
+    /// A password has no checksum, so a typo silently derives different keys. The
+    /// interactive session asks for it right after the seed phrase, with an empty
+    /// answer meaning none, and lets the derived identifiers be compared against a
+    /// known card before anything is written.
+    #[arg(short, long, global = true, env = "MIND_THE_PASSWORD")]
+    password: Option<Zeroizing<String>>,
 
     /// Optional identifier to include in subkey derivation.
     ///
-    /// Public by design -- it ends up in every certificate -- so it is deliberately not
+    /// Public by design, it ends up in every certificate, so it is deliberately not
     /// treated as a secret anywhere.
     #[arg(short = 'k', long, global = true, env = "MIND_THE_SUBKEY")]
     subkey: Option<String>,
@@ -81,12 +79,20 @@ pub struct CLI {
     #[arg(short = 'm', long, value_delimiter = ',', global = true, env = "MIND_THE_EMAILS")]
     emails: Vec<String>,
 
-    /// The backend and subcommand to run
+    /// Logging filter, like MIND_THE_LOG_LEVEL (the flag wins)
+    ///
+    /// Same grammar as env_logger, e.g. `info` or `mind_the_gap=debug`. Applied when
+    /// the process starts, so it cannot be changed from inside a session; the card
+    /// stacks stay clamped to info either way, see main.rs.
+    #[arg(long, global = true, value_name = "FILTER")]
+    log_level: Option<String>,
+
+    /// The backend and subcommand to run; omitted, an interactive session starts
     #[command(subcommand)]
     backend: Option<Backend>,
 }
 
-#[derive(Subcommand, Clone)]
+#[derive(Subcommand)]
 // PGP and PIV are the established names of these backends and of the subcommands they map to;
 // spelling them `Pgp`/`Piv` would read worse in a domain where both are always capitalised.
 #[allow(clippy::upper_case_acronyms)]
@@ -118,7 +124,7 @@ enum Backend {
             value_name = "KEYS",
             value_delimiter = ',',
             global = true,
-            env = "MIND_THE_SHARED"
+            env = "MIND_THE_PGP_SHARED"
         )]
         shared: Vec<pgp::SharedKey>,
 
@@ -149,7 +155,7 @@ enum Backend {
             value_name = "SLOTS",
             value_delimiter = ',',
             global = true,
-            env = "MIND_THE_SHARED"
+            env = "MIND_THE_PIV_SHARED"
         )]
         shared: Vec<piv::SharedSlot>,
 
@@ -162,16 +168,12 @@ enum Backend {
         org: Option<String>,
 
         /// Organizational unit (OU) to include in all certificate subjects
-        #[arg(long, value_name = "UNIT", global = true, env = "MIND_THE_OU")]
-        ou: Option<String>,
+        #[arg(long, value_name = "UNIT", global = true, env = "MIND_THE_UNIT")]
+        unit: Option<String>,
 
         /// Two-letter ISO country code (C) to include in all certificate subjects
         #[arg(long, value_name = "CC", global = true, env = "MIND_THE_COUNTRY")]
         country: Option<String>,
-
-        /// Card identifier used in the card authentication subject (derived by default)
-        #[arg(long, value_name = "ID", global = true, env = "MIND_THE_CARD_ID")]
-        card_id: Option<String>,
 
         /// Override the per-slot pin policy (ignored for the card authentication slot)
         #[arg(long, value_enum, global = true, env = "MIND_THE_PIN_POLICY")]
@@ -182,7 +184,7 @@ enum Backend {
         touch_policy: Option<piv::TouchPolicyArg>,
 
         /// Do not store the certificate authorities in the card's msroots object
-        #[arg(long, global = true)]
+        #[arg(long, global = true, env = "MIND_THE_NO_MSROOTS")]
         no_msroots: bool,
 
         #[command(subcommand)]
@@ -195,7 +197,7 @@ impl Backend {
     // Kept as a match so both backends line up symmetrically; the `!matches!(..)` form clippy
     // suggests hides the shared shape behind a negation.
     #[allow(clippy::match_like_matches_macro)]
-    fn needs_seed(self) -> bool {
+    fn needs_seed(&self) -> bool {
         match self {
             Backend::Generate => false,
             Backend::PGP { command: PGPCommand::Status, .. } => false,
@@ -229,8 +231,8 @@ enum PGPCommand {
     /// imported -- set them with `piv upload`'s --pin-policy and --touch-policy.)
     #[command(group = ArgGroup::new("settings").required(true).multiple(true)
         .args(["touch", "lang", "url", "login", "sign_pin"]))]
-    Configure {
-        /// Serial number of smart card to configure
+    Config {
+        /// Serial number of smart card to adjust
         #[arg(short, long, env = "MIND_THE_CARD")]
         card: Option<String>,
 
@@ -255,7 +257,7 @@ enum PGPCommand {
         login: Option<String>,
 
         /// Whether one pin entry signs once (the card default) or for the whole session
-        #[arg(long, value_enum, value_name = "VALIDITY")]
+        #[arg(long, value_enum, value_name = "MODE")]
         sign_pin: Option<pgp::SignPinValidity>,
     },
 
@@ -273,13 +275,6 @@ enum PGPCommand {
         #[arg(short, long)]
         yes: bool,
 
-        /// Leave the factory user pin (123456) on the card when --pin is omitted
-        ///
-        /// Without this, upload refuses to provision a card that would still answer to the
-        /// well-known factory pin.
-        #[arg(long)]
-        keep_factory_pin: bool,
-
         /// Optional output path of public cert
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -292,7 +287,7 @@ enum PGPCommand {
     /// Export primary-signed certificates for uids and subkeys
     Certify {
         /// Type of certificate to generate
-        #[arg(short = 't', long, default_value = "generic")]
+        #[arg(short = 't', long, value_enum, default_value_t)]
         kind: CertificateKind,
 
         /// Public certificate output path (QR code shown when omitted)
@@ -323,28 +318,29 @@ enum PGPCommand {
         output: Option<PathBuf>,
 
         /// What the revocation covers
-        ///
-        /// No short form: `-t` is already the reason text on this subcommand.
-        #[arg(long, value_enum, default_value_t)]
+        #[arg(short = 't', long, value_enum, default_value_t)]
         kind: pgp::RevocationKind,
 
-        /// Reason code of revocation
-        #[arg(short, long, default_value = "0")]
+        /// Numeric revocation reason code (RFC 4880)
+        ///
+        /// Long-only on purpose: `-c` means the card everywhere else, and this is typed
+        /// about once per revocation.
+        #[arg(long, default_value_t = 0)]
         code: u8,
 
-        /// Reason string of revocation
-        #[arg(short, long, default_value = "Unspecified")]
-        text: String,
+        /// Human-readable revocation reason
+        #[arg(long, default_value = "Unspecified")]
+        reason: String,
     },
 
     /// Export primary-signed certificates of external keys
     Trust {
         /// External certificate to sign
-        #[arg(short, long)]
+        #[arg(value_name = "FILE")]
         input: PathBuf,
 
         /// Level of verification to certify
-        #[arg(short = 't', long, default_value = "generic")]
+        #[arg(short = 't', long, value_enum, default_value_t)]
         kind: VerificationKind,
 
         /// Public certificate output path (QR code shown when omitted)
@@ -361,7 +357,7 @@ enum PIVCommand {
     /// Export the derived certificate chain
     Certify {
         /// Which part of the chain to export
-        #[arg(short = 't', long, value_enum, default_value = "chain")]
+        #[arg(short = 't', long, value_enum, default_value_t)]
         kind: piv::CertificateKind,
 
         /// Public certificate output path (QR code shown when omitted)
@@ -394,20 +390,13 @@ enum PIVCommand {
         #[arg(short, long)]
         yes: bool,
 
-        /// Leave the factory user pin (123456) on the card when --pin is omitted
-        ///
-        /// Without this, upload refuses to provision a card that would still answer to the
-        /// well-known factory pin.
-        #[arg(long)]
-        keep_factory_pin: bool,
-
         /// Certificate chain output path
         #[arg(short, long)]
         output: Option<PathBuf>,
 
         /// Show the root certificate as a QR code
-        #[arg(short = 'q', long = "qr")]
-        show_qr: bool,
+        #[arg(short, long)]
+        qr: bool,
     },
 }
 
@@ -456,18 +445,44 @@ fn parse_lang(s: &str) -> Result<[u8; 2], String> {
 }
 
 fn confirm(backend: &str) -> Result<()> {
-    println!("Uploading new keys will reset the {backend} smartcard.");
-    println!("This will clear any existing keys or data on the card!");
+    confirm_destruction(&format!(
+        "Uploading new keys will reset the {backend} smartcard.\n\
+         This will clear any existing keys or data on the card!"
+    ))
+}
+
+/// Ask a destructive yes/no question, without side effects on the data channels
+///
+/// The warning and the question go to stderr: stdout may be carrying certificates.
+/// Answers come from stdin only when stdin is a terminal; when it is piped (a session
+/// script, a redirect) the answer is read from the controlling terminal instead, so a
+/// script's next line can never be consumed as a yes. With no terminal either, there
+/// is nobody to ask and --yes is the way to say it in advance.
+fn confirm_destruction(warning: &str) -> Result<()> {
+    eprintln!("{warning}");
+
+    let stdin_is_tty = io::stdin().is_terminal();
+    let mut tty_in = if stdin_is_tty {
+        None
+    } else {
+        Some(std::io::BufReader::new(
+            fs::File::open("/dev/tty")
+                .map_err(|_| anyhow!("Refusing to continue without confirmation, use --yes"))?,
+        ))
+    };
 
     // "yes" proceeds, "no" aborts, and anything else asks again: a typo should cost one
     // more keystroke, not the whole invocation.
     loop {
-        print!("Continue? [yes/no] ");
-        io::stdout().flush()?;
+        eprint!("Continue? [yes/no] ");
 
         let mut input = String::new();
-        if io::stdin().read_line(&mut input)? == 0 {
-            bail!("Refusing to continue without confirmation on stdin, use --yes")
+        let read = match tty_in.as_mut() {
+            Some(reader) => std::io::BufRead::read_line(reader, &mut input)?,
+            None => io::stdin().read_line(&mut input)?,
+        };
+        if read == 0 {
+            bail!("Refusing to continue without confirmation, use --yes")
         }
         match input.trim() {
             "yes" => return Ok(()),
@@ -477,62 +492,106 @@ fn confirm(backend: &str) -> Result<()> {
     }
 }
 
+/// Ignore SIGINT and SIGQUIT for a guard's lifetime, restoring the old handlers after
+///
+/// Death by signal skips every `Drop`, so a Ctrl-C while a secret is on the alternate
+/// screen would strand the terminal with the secret still showing. During a ceremony
+/// the keys simply do nothing; leaving is what the prompts are for.
+#[cfg(unix)]
+struct IgnoreInterrupts(libc::sighandler_t, libc::sighandler_t);
+
+#[cfg(unix)]
+impl IgnoreInterrupts {
+    fn install() -> Self {
+        unsafe {
+            Self(
+                libc::signal(libc::SIGINT, libc::SIG_IGN),
+                libc::signal(libc::SIGQUIT, libc::SIG_IGN),
+            )
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for IgnoreInterrupts {
+    fn drop(&mut self) {
+        unsafe {
+            libc::signal(libc::SIGINT, self.0);
+            libc::signal(libc::SIGQUIT, self.1);
+        }
+    }
+}
+
 /// Mint a new seed phrase and hold it on screen until the user proves it is written down
-fn generate() -> Result<()> {
+///
+/// Returns the minted seed so an interactive session can adopt it; the one-shot path
+/// drops it, since a fresh phrase is only useful once it exists on paper anyway.
+fn generate() -> Result<MnemonicSeed> {
     let seed = MnemonicSeed::generate()?;
     let words = seed.words();
 
-    // The whole ceremony talks to the controlling terminal, never stdout: under
-    // `generate > file` a stdout phrase would land on disk while the wipe below scrubbed
-    // only the file, with nothing to notice it by
-    let mut tty = prompt::tty()?;
+    // The whole ceremony happens on the alternate screen of the controlling terminal,
+    // never stdout: under `generate > file` a stdout phrase would land on disk, and on
+    // the main screen it would survive in scrollback. The RAII guard restores a clean
+    // display on every exit path, errors included, and Ctrl-C is ignored throughout
+    // because a signal death would skip that restoration.
+    #[cfg(unix)]
+    let _guard = IgnoreInterrupts::install();
+    let mut screen = qr::Screen::enter_cooked()?;
 
     loop {
         // Show the phrase, numbered for transcription
-        writeln!(tty)?;
-        writeln!(tty, "This is your new seed phrase. Write it down now, on paper:")?;
-        writeln!(tty)?;
+        writeln!(screen.tty)?;
+        writeln!(screen.tty, "This is your new seed phrase. Write it down now, on paper:")?;
+        writeln!(screen.tty)?;
         for (index, word) in words.iter().enumerate() {
-            write!(tty, "  {:>2}. {:<12}", index + 1, word)?;
+            write!(screen.tty, "  {:>2}. {:<12}", index + 1, word)?;
             if (index + 1) % 4 == 0 {
-                writeln!(tty)?;
+                writeln!(screen.tty)?;
             }
         }
-        writeln!(tty)?;
+        writeln!(screen.tty)?;
 
         prompt::read_ack("Press enter once it is written down... ")?;
 
-        // Wipe screen *and* scrollback, so the phrase survives only on paper
-        write!(tty, "\x1b[2J\x1b[3J\x1b[H")?;
-        tty.flush()?;
+        // Wipe before the quiz, so answers come from paper and not from the screen
+        screen.wipe()?;
 
         // Prove the copy is complete and readable before letting go of the phrase
-        if quiz(&mut tty, &words)? {
+        if quiz(&mut screen.tty, &words)? {
             break;
         }
 
-        writeln!(tty, "That did not match your phrase, compare your copy against the original:")?;
+        writeln!(
+            screen.tty,
+            "That did not match your phrase, compare your copy against the original:"
+        )?;
     }
 
-    write!(tty, "\x1b[2J\x1b[3J\x1b[H")?;
-    tty.flush()?;
+    // Leave the alternate screen before the parting words: they hold no secret and
+    // should stay readable, while everything above vanishes with the screen
+    drop(screen);
 
+    let mut tty = prompt::tty()?;
     writeln!(tty, "Seed phrase confirmed.")?;
-    writeln!(tty, "Enter it at the prompt of any command that is run without --seed.")?;
+    writeln!(tty, "Pass it with --seed where a script needs it.")?;
+    writeln!(tty)?;
+    writeln!(tty, "To provision several cards in one sitting without retyping it, run")?;
+    writeln!(tty, "mind-the-gap without arguments: the interactive session asks for the")?;
+    writeln!(tty, "phrase once and keeps it in memory until you leave.")?;
 
-    Ok(())
+    Ok(seed)
 }
 
 /// Ask for a few randomly chosen words of the phrase
-fn quiz(tty: &mut std::fs::File, words: &[String]) -> Result<bool> {
+fn quiz(tty: &mut impl Write, words: &[String]) -> Result<bool> {
     writeln!(tty, "Confirm your copy by answering from it below.")?;
     writeln!(tty)?;
 
     // Sampled from the OS generator like the phrase itself; rejection keeps them distinct
     let mut indices: Vec<usize> = Vec::new();
     while indices.len() < 3 {
-        let index = OsRng
-            .try_next_u32()
+        let index = getrandom::u32()
             .map_err(|err| anyhow!("Operating system entropy source failed: {err}"))?
             as usize
             % words.len();
@@ -543,7 +602,13 @@ fn quiz(tty: &mut std::fs::File, words: &[String]) -> Result<bool> {
     indices.sort_unstable();
 
     for index in indices {
-        let answer = prompt::read_secret(&format!("Word {}: ", index + 1))?;
+        // An accidental empty Enter re-asks instead of aborting the whole ceremony
+        let answer = loop {
+            match prompt::read_optional_secret(&format!("Word {}: ", index + 1))? {
+                Some(answer) => break answer,
+                None => continue,
+            }
+        };
         if answer.trim() != words[index] {
             return Ok(false);
         }
@@ -557,78 +622,240 @@ pub fn command() -> Command {
     CLI::command()
 }
 
-/// Parse and run clap command line ui
+/// Return the interactive session's clap command, for testing
+pub fn repl_command() -> Command {
+    ReplLine::command()
+}
+
+/// Parse the command line and run: a single subcommand, or the interactive session
 pub fn run() -> Result<()> {
-    let CLI { seed, password, subkey, name, emails, backend } = CLI::parse();
+    let CLI { seed, password, subkey, name, emails, log_level: _, backend } = CLI::parse();
 
-    // A command that derives keys needs the seed; one that only reads a card does not, and
-    // `generate` mints its own. Checked before anything prompts, so `status` never asks.
-    let needs_seed = backend.clone().map(Backend::needs_seed).unwrap_or(false);
-
-    // Prompt for the seed when it is needed and was not supplied. A seed is never invented
-    // behind the user's back: minting a fresh one is what `generate` is for, and it does not
-    // let go until the phrase is written down. The supplied phrase is never echoed back --
-    // it would linger in scrollback next to everything derived from it.
-    let seed: Option<MnemonicSeed> = match (seed, needs_seed) {
-        (Some(text), true) => Some(text.trim().parse()?),
-        (None, true) => Some(prompt::read_secret("Seed phrase: ")?.trim().parse()?),
-        (_, false) => None,
+    let mut session = Session {
+        seed: None,
+        password: None,
+        pending_seed: seed,
+        pending_password: password,
+        password_asked: false,
+        interactive: false,
+        subkey,
+        name,
+        emails,
+        defaults: Stickies::default(),
     };
 
-    // A bare `--password` asks on the terminal instead of taking a value
-    let password = match password {
-        Some(Some(password)) => Some(password),
-        Some(None) if needs_seed => {
-            Some(prompt::read_confirmed("Password: ", "Repeat password: ")?)
-        }
-        _ => None,
-    };
+    match backend {
+        None => repl(session),
+        Some(backend) => {
+            // A one-shot invocation is scriptable or it is nothing: a missing seed is
+            // an error, not a prompt a script would hang on. Only the interactive
+            // session asks, and it asks once.
+            if backend.needs_seed() && session.pending_seed.is_none() {
+                bail!(
+                    "No seed phrase given. Pass --seed (or MIND_THE_SEED), mint one \
+                     with `generate`, or run without a subcommand for an interactive \
+                     session that asks for it once."
+                );
+            }
 
-    // Prepare root seed phrase and password
-    let seed = match (seed, password.as_ref()) {
-        (Some(seed), Some(password)) => Some(seed.with_password(password)),
-        (seed, _) => seed,
-    };
-
-    if needs_seed {
-        if password.is_some() {
-            log::info!("Using the supplied root seed password");
-        }
-
-        // The subkey id is public by design -- it ends up in every certificate -- so echoing
-        // it is harmless and confirms which card is being derived.
-        if let Some(subkey) = subkey.as_ref() {
-            log::info!("Subkey derivation identifier: {}", subkey.as_str());
+            let identity = session.identity(backend.needs_seed(), Overrides::default())?;
+            dispatch(backend, identity)
         }
     }
+}
 
-    // Match backend ...
+/// The state of one invocation or interactive session: secrets are resolved at most
+/// once, the identity fields entered once and overridable per command
+///
+/// Deliberately not `Debug`, like [`CLI`] and for the same reason.
+struct Session {
+    /// The seed with the derivation password folded in, once resolved
+    seed: Option<MnemonicSeed>,
+    /// The resolved derivation password, kept to fold into a later adopted seed
+    password: Option<Zeroizing<String>>,
+    /// Seed text from the command line or environment, consumed on first resolution
+    pending_seed: Option<Zeroizing<String>>,
+    /// The password argument as parsed, consumed on first resolution
+    pending_password: Option<Zeroizing<String>>,
+    /// Whether the session already asked for the password; an empty answer resolves to
+    /// no password but must still count as answered, or a later `generate` would ask
+    /// the same question twice
+    password_asked: bool,
+    /// Whether this session may prompt at all: true only when stdin is a terminal.
+    /// The piped path keeps the one-shot contract: errors and warnings, never a
+    /// prompt a script would hang on.
+    interactive: bool,
+    subkey: Option<String>,
+    name: Option<String>,
+    emails: Vec<String>,
+    /// Backend defaults stored with `set`, applied where a line omits them
+    defaults: Stickies,
+}
+
+/// Session-stored defaults for the backend options a fleet workflow repeats: a line's
+/// own value always wins, these fill the gaps
+#[derive(Default)]
+struct Stickies {
+    date: Option<DateTime<Utc>>,
+    validity: Option<Duration>,
+    shared_pgp: Vec<pgp::SharedKey>,
+    shared_piv: Vec<piv::SharedSlot>,
+    legacy: bool,
+    intermediate: bool,
+    no_msroots: bool,
+    org: Option<String>,
+    unit: Option<String>,
+    country: Option<String>,
+    pin_policy: Option<piv::PinPolicyArg>,
+    touch_policy: Option<piv::TouchPolicyArg>,
+}
+
+/// Per-command overrides of the session's non-secret identity fields
+#[derive(Default)]
+struct Overrides {
+    subkey: Option<String>,
+    name: Option<String>,
+    emails: Vec<String>,
+}
+
+impl Session {
+    /// Resolve the derivation password at most once, from the argument alone: a
+    /// one-shot invocation never prompts for it, so its presence is always visible in
+    /// the invocation that supplied it (the interactive session asks alongside the
+    /// seed instead, through [`Self::ask_password_once`])
+    fn resolve_password(&mut self) -> Option<Zeroizing<String>> {
+        if self.password.is_none() {
+            self.password = self.pending_password.take();
+
+            if self.password.is_some() {
+                log::info!("Using the supplied root seed password");
+            }
+        }
+
+        self.password.clone()
+    }
+
+    /// Ask for the optional password on the terminal, once, with an empty answer
+    /// meaning none
+    ///
+    /// Only the interactive entry points call this, right where the seed itself is
+    /// obtained: the password belongs to the seed, so the session asks for both in one
+    /// ceremony instead of growing a separate command that is easy to forget. A
+    /// password supplied as an argument wins and suppresses the question.
+    fn ask_password_once(&mut self) -> Result<()> {
+        if !self.password_asked && self.password.is_none() && self.pending_password.is_none() {
+            self.password = prompt::read_optional_secret("Password (empty for none): ")?;
+            self.password_asked = true;
+        }
+        Ok(())
+    }
+
+    /// Resolve the seed at most once: supplied text, or a terminal prompt in the
+    /// interactive session (a one-shot invocation without a seed is rejected before
+    /// this is reached, so the prompt can only fire mid-session)
+    ///
+    /// A seed is never invented behind the user's back: minting a fresh one is what
+    /// `generate` is for, and it does not let go until the phrase is written down. The
+    /// supplied phrase is never echoed back, since it would linger in scrollback next
+    /// to everything derived from it.
+    fn resolve_seed(&mut self) -> Result<MnemonicSeed> {
+        if let Some(seed) = &self.seed {
+            return Ok(seed.clone());
+        }
+
+        let text = match self.pending_seed.take() {
+            Some(text) => text,
+            None if self.interactive => {
+                // The password belongs to the seed, so an interactively entered seed
+                // comes with the password question in the same breath; a seed supplied
+                // as an argument keeps its password on the argument side too
+                let text = prompt::read_secret("Seed phrase: ")?;
+                self.ask_password_once()?;
+                text
+            }
+            None => bail!(
+                "No seed phrase given. A piped session never prompts; pass --seed \
+                 (or MIND_THE_SEED) when starting it."
+            ),
+        };
+        let mut seed: MnemonicSeed = text.trim().parse()?;
+
+        if let Some(password) = self.resolve_password() {
+            seed = seed.with_password(&password);
+        }
+
+        self.seed = Some(seed.clone());
+        Ok(seed)
+    }
+
+    /// Adopt a freshly minted seed for the rest of the session, folding in the password
+    ///
+    /// Only the session calls this, right after the `generate` ceremony, so the
+    /// password question belongs here as much as at the seed prompt.
+    fn adopt(&mut self, seed: MnemonicSeed) -> Result<()> {
+        self.pending_seed = None;
+        self.ask_password_once()?;
+        self.seed = Some(match self.resolve_password() {
+            Some(password) => seed.with_password(&password),
+            None => seed,
+        });
+        Ok(())
+    }
+
+    /// Assemble the identity for one command, resolving the seed if the command needs one
+    fn identity(&mut self, needs_seed: bool, overrides: Overrides) -> Result<Identity> {
+        let seed = if needs_seed {
+            Some(self.resolve_seed()?)
+        } else {
+            None
+        };
+        let subkey = overrides.subkey.or_else(|| self.subkey.clone());
+
+        // The subkey id is public by design -- it ends up in every certificate -- so
+        // echoing it is harmless and confirms which card is being derived.
+        if needs_seed && let Some(subkey) = subkey.as_ref() {
+            log::info!("Subkey derivation identifier: {}", subkey.as_str());
+        }
+
+        Ok(Identity {
+            seed,
+            subkey,
+            name: overrides.name.or_else(|| self.name.clone()),
+            emails: if overrides.emails.is_empty() {
+                self.emails.clone()
+            } else {
+                overrides.emails
+            },
+        })
+    }
+}
+
+/// Run one parsed backend invocation against a resolved identity
+fn dispatch(backend: Backend, identity: Identity) -> Result<()> {
     match backend {
-        // ... starting with the seed generation ceremony, which needs no other input
-        Some(Backend::Generate) => generate(),
+        // The seed generation ceremony needs no other input; the one-shot path drops the
+        // minted seed, which lives on paper now, while the session path adopts it
+        Backend::Generate => generate().map(|_| ()),
         // ... then command
-        Some(Backend::PGP { date, subdate, validity, shared, legacy, command }) => run_pgp(
-            Identity { seed, subkey, name, emails },
-            PGPOptions { date, subdate, validity, shared, legacy },
-            command,
-        ),
+        Backend::PGP { date, subdate, validity, shared, legacy, command } => {
+            run_pgp(identity, PGPOptions { date, subdate, validity, shared, legacy }, command)
+        }
         // ... then command
-        Some(Backend::PIV {
+        Backend::PIV {
             date,
             validity,
             intermediate,
             shared,
             retired,
             org,
-            ou,
+            unit,
             country,
-            card_id,
             pin_policy,
             touch_policy,
             no_msroots,
             command,
-        }) => run_piv(
-            Identity { seed, subkey, name, emails },
+        } => run_piv(
+            identity,
             PIVOptions {
                 date,
                 validity,
@@ -636,17 +863,526 @@ pub fn run() -> Result<()> {
                 shared,
                 retired,
                 org,
-                ou,
+                unit,
                 country,
-                card_id,
                 pin_policy,
                 touch_policy,
                 no_msroots,
             },
             command,
         ),
-        None => Ok(CLI::command().print_long_help()?),
     }
+}
+
+/// One line of the interactive session, parsed like a tiny argv
+///
+/// Deliberately not `Debug`, like [`CLI`] and for the same reason. There are no seed or
+/// password arguments here: the secrets are session state, and any line naming them is
+/// rejected before parsing so a secret can never reach the in-memory history. The
+/// identity overrides carry no `env` bindings either: the session captured the
+/// `MIND_THE_...` variables once at startup, and a per-line re-read would silently
+/// resurrect values that `set` changed away. The options *inside* the backends keep
+/// their env fallbacks; the process environment cannot change mid-session, so they
+/// resolve to the same values as a one-shot invocation.
+#[derive(Parser)]
+#[command(name = "mtg", bin_name = "mtg", disable_version_flag = true)]
+struct ReplLine {
+    /// Override the session subkey id for this command only
+    #[arg(short = 'k', long, global = true)]
+    subkey: Option<String>,
+
+    /// Override the session common name for this command only
+    #[arg(short, long, global = true)]
+    name: Option<String>,
+
+    /// Override the session email addresses for this command only
+    #[arg(short = 'm', long, value_delimiter = ',', global = true)]
+    emails: Vec<String>,
+
+    #[command(subcommand)]
+    command: ReplCommand,
+}
+
+/// The verbs available at the session prompt
+#[derive(Subcommand)]
+enum ReplCommand {
+    /// The regular backends, exactly as on the one-shot command line
+    #[command(flatten)]
+    Backend(Backend),
+
+    /// Show the session identity: name, emails, subkey id, never the seed
+    Session,
+
+    /// Change the session identity or stored backend defaults for the rest of the
+    /// session; a command line's own options always win over a stored default
+    #[command(group = ArgGroup::new("fields").required(true).multiple(true)
+        .args(["subkey", "name", "emails", "date", "validity", "shared_pgp",
+               "shared_piv", "legacy", "intermediate", "no_msroots", "org", "unit",
+               "country", "pin_policy", "touch_policy"]))]
+    Set {
+        /// New session subkey id
+        #[arg(short = 'k', long)]
+        subkey: Option<String>,
+
+        /// New session common name
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// New session email addresses
+        #[arg(short = 'm', long, value_delimiter = ',')]
+        emails: Vec<String>,
+
+        /// Default creation date for both backends
+        #[arg(short, long, value_name = "YYYY-MM-DD", value_parser = common::parse_date)]
+        date: Option<DateTime<Utc>>,
+
+        /// Default validity duration for both backends
+        #[arg(short, long, value_name = "DURATION", value_parser = common::parse_duration)]
+        validity: Option<Duration>,
+
+        /// Default PGP keys to derive without the subkey id
+        #[arg(long, value_name = "KEYS", value_delimiter = ',')]
+        shared_pgp: Vec<pgp::SharedKey>,
+
+        /// Default PIV slots to derive without the subkey id
+        #[arg(long, value_name = "SLOTS", value_delimiter = ',')]
+        shared_piv: Vec<piv::SharedSlot>,
+
+        /// Default to the original derivation labels (cannot be unset; restart to clear)
+        #[arg(long)]
+        legacy: bool,
+
+        /// Default to an intermediate issuing CA (cannot be unset; restart to clear)
+        #[arg(long)]
+        intermediate: bool,
+
+        /// Default to skipping the msroots object (cannot be unset; restart to clear)
+        #[arg(long)]
+        no_msroots: bool,
+
+        /// Default organization (O) for PIV subjects
+        #[arg(long, value_name = "ORG")]
+        org: Option<String>,
+
+        /// Default organizational unit (OU) for PIV subjects
+        #[arg(long, value_name = "UNIT")]
+        unit: Option<String>,
+
+        /// Default country (C) for PIV subjects
+        #[arg(long, value_name = "CC")]
+        country: Option<String>,
+
+        /// Default per-slot pin policy for PIV uploads
+        #[arg(long, value_enum)]
+        pin_policy: Option<piv::PinPolicyArg>,
+
+        /// Default per-slot touch policy for PIV uploads
+        #[arg(long, value_enum)]
+        touch_policy: Option<piv::TouchPolicyArg>,
+    },
+
+    /// Reopen the one-time password question; the derived identifiers change with it
+    Password,
+
+    /// Show the tool name and version
+    Version,
+
+    /// Leave the session
+    #[command(alias = "quit")]
+    Exit,
+}
+
+/// Whether the session loop keeps going after a line
+enum Flow {
+    Continue,
+    Exit,
+}
+
+/// Tokens that would name a secret on a session line
+///
+/// The seed and password are fixed for the whole session, and allowing them here would
+/// put a secret into the line editor's history. `-s.../-p...` cover clap's attached
+/// short-value forms; no other flag in the tree starts with either letter.
+fn names_a_secret(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| {
+        token == "--seed"
+            || token.starts_with("--seed=")
+            || token == "--password"
+            || token.starts_with("--password=")
+            || (token.starts_with("-s") && !token.starts_with("--"))
+            || (token.starts_with("-p") && !token.starts_with("--"))
+    })
+}
+
+/// The interactive session: the identity is entered once and every command reuses it
+///
+/// Reading commands and reading secrets never overlap: the line editor holds no
+/// terminal state between lines, and the seed and password prompts talk to `/dev/tty`
+/// through `rpassword`, so a command may prompt mid-session without confusing either.
+fn repl(mut session: Session) -> Result<()> {
+    // Piped input gets a plain reader: no banner, no prompt, no editor, so scripted
+    // sessions and tests see nothing but their own output
+    if !io::stdin().is_terminal() {
+        for line in io::stdin().lock().lines() {
+            if let Flow::Exit = handle_line(&mut session, &line?)? {
+                break;
+            }
+        }
+        return Ok(());
+    }
+
+    session.interactive = true;
+
+    println!("mind-the-gap interactive session");
+    println!("The seed phrase is asked for once, kept only in memory, and gone on exit.");
+    println!("Commands match the command line; `help` lists them, `exit` or Ctrl-D leaves.");
+
+    let mut editor: rustyline::Editor<(), MemHistory> = rustyline::Editor::with_history(
+        Config::builder().auto_add_history(false).build(),
+        MemHistory::new(),
+    )?;
+
+    loop {
+        match editor.readline("mtg> ") {
+            Ok(line) => {
+                // Only clean lines become recallable: a rejected secret-naming line
+                // must not be one arrow press away, and a line the splitter cannot
+                // parse (an unbalanced quote around, say, half a seed phrase) has to
+                // count as secret-bearing rather than slip through unsplit
+                if let Some(tokens) = shlex::split(&line)
+                    && !names_a_secret(&tokens)
+                {
+                    let _ = editor.add_history_entry(&line);
+                }
+                if let Flow::Exit = handle_line(&mut session, &line)? {
+                    return Ok(());
+                }
+            }
+            // Ctrl-C abandons the current line, not the session
+            Err(ReadlineError::Interrupted) => continue,
+            // Ctrl-D leaves like `exit`
+            Err(ReadlineError::Eof) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+/// Ask for a missing upload pin on the terminal, the session's way of taking secrets
+///
+/// Only `upload` gets this: there a missing pin means the card keeps the well-known
+/// factory pin, which deserves a deliberate answer rather than a default. An empty
+/// answer keeps the factory pin, and the upload handler warns about it the same way a
+/// one-shot invocation does. Every other command treats a missing pin as "skip what
+/// needs one", which stays as typed.
+fn ask_upload_pin(backend: &mut Backend) -> Result<()> {
+    let pin = match backend {
+        Backend::PGP { command: PGPCommand::Upload { pin, .. }, .. } => pin,
+        Backend::PIV { command: PIVCommand::Upload { pin, .. }, .. } => pin,
+        _ => return Ok(()),
+    };
+    if pin.is_none() {
+        *pin = prompt::read_optional_secret("User pin (empty keeps the factory pin): ")?;
+    }
+    Ok(())
+}
+
+/// Reopen the one-time password question and re-fold the session's seed
+///
+/// `MnemonicSeed::with_password` keeps the mnemonic, so folding a new password over a
+/// resolved seed is safe; everything derived afterwards changes with it, which is the
+/// point and gets said out loud.
+fn ask_password_again(session: &mut Session) -> Result<()> {
+    if !session.interactive {
+        bail!("A piped session never prompts; start the session with --password instead");
+    }
+    let password = prompt::read_optional_secret("Password (empty for none): ")?;
+    session.password_asked = true;
+    if let Some(seed) = session.seed.take() {
+        session.seed = Some(seed.with_password(password.as_deref().map_or("", |p| p.as_str())));
+        log::warn!("The password changed: every identifier and key derived from now on differs");
+    }
+    session.password = password;
+    Ok(())
+}
+
+/// Fill a command's omitted backend options from the session's stored defaults
+///
+/// A line's own value always wins; the stored default only covers what was left out.
+fn merge_defaults(backend: &mut Backend, d: &Stickies) {
+    match backend {
+        Backend::PGP { date, validity, shared, legacy, .. } => {
+            *date = date.or(d.date);
+            *validity = validity.or(d.validity);
+            if shared.is_empty() {
+                shared.clone_from(&d.shared_pgp);
+            }
+            *legacy |= d.legacy;
+        }
+        Backend::PIV {
+            date,
+            validity,
+            intermediate,
+            shared,
+            org,
+            unit,
+            country,
+            pin_policy,
+            touch_policy,
+            no_msroots,
+            ..
+        } => {
+            *date = date.or(d.date);
+            *validity = validity.or(d.validity);
+            *intermediate |= d.intermediate;
+            if shared.is_empty() {
+                shared.clone_from(&d.shared_piv);
+            }
+            *no_msroots |= d.no_msroots;
+            if org.is_none() {
+                org.clone_from(&d.org);
+            }
+            if unit.is_none() {
+                unit.clone_from(&d.unit);
+            }
+            if country.is_none() {
+                country.clone_from(&d.country);
+            }
+            *pin_policy = pin_policy.or(d.pin_policy);
+            *touch_policy = touch_policy.or(d.touch_policy);
+        }
+        Backend::Generate => {}
+    }
+}
+
+/// Ask for missing identity fields the command will demand, and keep the answers
+///
+/// The session's version of `set`: only the two required-without-default inputs get
+/// this, everything else has a deliberate default. The clap parsers stay untouched;
+/// this runs before dispatch, like the upload pin question.
+fn ask_identity(session: &mut Session, backend: &Backend) -> Result<()> {
+    if !backend.needs_seed() {
+        return Ok(());
+    }
+    if session.name.is_none() {
+        let name = prompt::read_public("Common name: ")?;
+        if !name.is_empty() {
+            session.name = Some(name);
+        }
+    }
+    let wants_emails = matches!(
+        backend,
+        Backend::PGP {
+            command: PGPCommand::Certify { .. }
+                | PGPCommand::Upload { .. }
+                | PGPCommand::Export { .. },
+            ..
+        }
+    );
+    if wants_emails && session.emails.is_empty() {
+        let emails = prompt::read_public("Emails (comma separated): ")?;
+        if !emails.is_empty() {
+            session.emails = emails.split(',').map(|e| e.trim().to_string()).collect();
+        }
+    }
+    Ok(())
+}
+
+/// Parse and run one session line; errors are reported, never fatal to the session
+fn handle_line(session: &mut Session, line: &str) -> Result<Flow> {
+    let Some(tokens) = shlex::split(line) else {
+        log::error!("Unbalanced quotes in the command line");
+        return Ok(Flow::Continue);
+    };
+    if tokens.is_empty() {
+        return Ok(Flow::Continue);
+    }
+
+    if names_a_secret(&tokens) {
+        log::error!("The seed and password are fixed for the session; restart to change them");
+        return Ok(Flow::Continue);
+    }
+
+    // The parser wants a program name in front, mirroring the prompt
+    let line = match ReplLine::try_parse_from(std::iter::once("mtg".into()).chain(tokens)) {
+        Ok(line) => line,
+        Err(err) => {
+            // clap errors carry their own formatting, including help and usage output
+            let _ = err.print();
+            return Ok(Flow::Continue);
+        }
+    };
+
+    let overrides = Overrides { subkey: line.subkey, name: line.name, emails: line.emails };
+
+    // The identity overrides only mean something in front of a backend command; on the
+    // other verbs they would be accepted and silently ignored. `set` is exempt: its own
+    // flags are the same names on purpose, and clap's global propagation hands their
+    // values to both levels.
+    if matches!(
+        line.command,
+        ReplCommand::Session | ReplCommand::Exit | ReplCommand::Backend(Backend::Generate)
+    ) && (overrides.subkey.is_some() || overrides.name.is_some() || !overrides.emails.is_empty())
+    {
+        log::error!(
+            "Identity options do not apply to this command; use `set` to change the session"
+        );
+        return Ok(Flow::Continue);
+    }
+
+    let result = match line.command {
+        ReplCommand::Exit => return Ok(Flow::Exit),
+        ReplCommand::Session => {
+            let show = |label: &str, value: Option<&str>| {
+                println!("  {label}: {}", value.unwrap_or("(not set)"));
+            };
+            show("name", session.name.as_deref());
+            show(
+                "emails",
+                (!session.emails.is_empty())
+                    .then(|| session.emails.join(", "))
+                    .as_deref(),
+            );
+            show("subkey", session.subkey.as_deref());
+            show(
+                "seed",
+                Some(if session.seed.is_some() {
+                    "loaded"
+                } else {
+                    "not loaded"
+                }),
+            );
+            // State only, never the value: the password has no checksum, so whether
+            // one is in effect is the only feedback a user can get
+            show(
+                "password",
+                Some(if session.password.is_some() {
+                    "set"
+                } else if session.password_asked || session.seed.is_some() {
+                    "none"
+                } else {
+                    "not asked yet"
+                }),
+            );
+            let d = &session.defaults;
+            let mut stored: Vec<String> = Vec::new();
+            if let Some(date) = d.date {
+                stored.push(format!("date={}", date.format("%Y-%m-%d")));
+            }
+            if let Some(validity) = d.validity {
+                stored.push(format!("validity={}", humantime::format_duration(validity)));
+            }
+            if !d.shared_pgp.is_empty() {
+                stored.push(format!("shared-pgp={:?}", d.shared_pgp));
+            }
+            if !d.shared_piv.is_empty() {
+                stored.push(format!("shared-piv={:?}", d.shared_piv));
+            }
+            for (flag, on) in [
+                ("legacy", d.legacy),
+                ("intermediate", d.intermediate),
+                ("no-msroots", d.no_msroots),
+            ] {
+                if on {
+                    stored.push(flag.into());
+                }
+            }
+            for (key, value) in [("org", &d.org), ("unit", &d.unit), ("country", &d.country)] {
+                if let Some(value) = value {
+                    stored.push(format!("{key}={value}"));
+                }
+            }
+            if let Some(policy) = d.pin_policy {
+                stored.push(format!("pin-policy={policy:?}"));
+            }
+            if let Some(policy) = d.touch_policy {
+                stored.push(format!("touch-policy={policy:?}"));
+            }
+            show("defaults", (!stored.is_empty()).then(|| stored.join(", ")).as_deref());
+            Ok(())
+        }
+        ReplCommand::Set {
+            subkey,
+            name,
+            emails,
+            date,
+            validity,
+            shared_pgp,
+            shared_piv,
+            legacy,
+            intermediate,
+            no_msroots,
+            org,
+            unit,
+            country,
+            pin_policy,
+            touch_policy,
+        } => {
+            if let Some(subkey) = subkey {
+                session.subkey = Some(subkey);
+            }
+            if let Some(name) = name {
+                session.name = Some(name);
+            }
+            if !emails.is_empty() {
+                session.emails = emails;
+            }
+            let d = &mut session.defaults;
+            d.date = date.or(d.date);
+            d.validity = validity.or(d.validity);
+            if !shared_pgp.is_empty() {
+                d.shared_pgp = shared_pgp;
+            }
+            if !shared_piv.is_empty() {
+                d.shared_piv = shared_piv;
+            }
+            d.legacy |= legacy;
+            d.intermediate |= intermediate;
+            d.no_msroots |= no_msroots;
+            d.org = org.or(d.org.take());
+            d.unit = unit.or(d.unit.take());
+            d.country = country.or(d.country.take());
+            d.pin_policy = pin_policy.or(d.pin_policy);
+            d.touch_policy = touch_policy.or(d.touch_policy);
+            Ok(())
+        }
+        ReplCommand::Password => ask_password_again(session),
+        ReplCommand::Version => {
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        // The session keeps a freshly minted seed, so provisioning can follow directly.
+        // Replacing a seed the session already holds gets the same ceremony as a card
+        // wipe: one typo must not silently re-point every later upload.
+        ReplCommand::Backend(Backend::Generate) => (|| {
+            if session.seed.is_some() || session.pending_seed.is_some() {
+                if !session.interactive {
+                    bail!("The session already holds a seed; a piped session cannot replace it");
+                }
+                confirm_destruction(
+                    "The session already holds a seed; generate will replace it \
+                     for every later command.",
+                )?;
+                session.password_asked = false;
+            }
+            generate().and_then(|seed| session.adopt(seed))
+        })(),
+        ReplCommand::Backend(mut backend) => {
+            let needs_seed = backend.needs_seed();
+            merge_defaults(&mut backend, &session.defaults);
+            let prep = if session.interactive {
+                ask_upload_pin(&mut backend).and_then(|()| ask_identity(session, &backend))
+            } else {
+                Ok(())
+            };
+            prep.and_then(|()| session.identity(needs_seed, overrides))
+                .and_then(|identity| dispatch(backend, identity))
+        }
+    };
+
+    if let Err(err) = result {
+        log::error!("{err:#}");
+    }
+    Ok(Flow::Continue)
 }
 
 /// The resolved identity arguments shared by both backends
@@ -674,9 +1410,8 @@ struct PIVOptions {
     shared: Vec<piv::SharedSlot>,
     retired: Vec<String>,
     org: Option<String>,
-    ou: Option<String>,
+    unit: Option<String>,
     country: Option<String>,
-    card_id: Option<String>,
     pin_policy: Option<piv::PinPolicyArg>,
     touch_policy: Option<piv::TouchPolicyArg>,
     no_msroots: bool,
@@ -689,11 +1424,18 @@ fn run_pgp(identity: Identity, options: PGPOptions, command: PGPCommand) -> Resu
 
     // Built lazily, so a command that needs no builder -- status today, anything later --
     // simply never calls it; the closure moves the identity in and can run at most once
-    let builder = move || -> Result<pgp::SeededSmartcard> {
-        let name = name.ok_or(anyhow!("Requires name to be specified"))?;
+    // Only the commands that mint user ids need emails; check compares keys, revoke
+    // retires them, config touches card data -- none of them builds a uid
+    let needs_emails = matches!(
+        command,
+        PGPCommand::Certify { .. } | PGPCommand::Upload { .. } | PGPCommand::Export { .. }
+    );
 
-        if emails.is_empty() {
-            bail!("Requires at least one email to be specified");
+    let builder = move || -> Result<pgp::SeededSmartcard> {
+        let name = name.ok_or_else(|| anyhow!("No name given, pass --name (or MIND_THE_NAME)"))?;
+
+        if needs_emails && emails.is_empty() {
+            bail!("No email given, pass --emails (or MIND_THE_EMAILS)");
         }
 
         // Prepare pgp cert
@@ -706,7 +1448,9 @@ fn run_pgp(identity: Identity, options: PGPOptions, command: PGPCommand) -> Resu
             pgp::Scheme::Current
         };
 
-        let seed = seed.as_ref().expect("prompted for above when missing");
+        let seed = seed
+            .as_ref()
+            .expect("resolved above when the command needs a seed");
         let mut builder = pgp::SeededSmartcard::with_scheme(&seed.seed(), subkey, name, scheme);
 
         // Add user identities
@@ -761,14 +1505,9 @@ fn run_pgp(identity: Identity, options: PGPOptions, command: PGPCommand) -> Resu
 
             builder.check(card)
         }
-        PGPCommand::Configure { card, touch, lang, url, login, sign_pin } => {
+        PGPCommand::Config { card, touch, lang, url, login, sign_pin } => {
+            // The parser's ArgGroup already demands at least one setting
             let settings = pgp::CardSettings { touch, lang, url, login, sign_pin };
-            if settings.is_empty() {
-                bail!(
-                    "Nothing to configure: pass at least one of --touch, --lang, --url, \
-                     --login or --sign-pin"
-                );
-            }
 
             let builder = builder()?;
 
@@ -778,14 +1517,8 @@ fn run_pgp(identity: Identity, options: PGPOptions, command: PGPCommand) -> Resu
 
             builder.configure(card, settings)
         }
-        PGPCommand::Upload { pin, card, yes, keep_factory_pin, output, qr: show_qr } => {
-            if pin.is_none() && !keep_factory_pin {
-                bail!(
-                    "No --pin supplied: the card would keep the factory user pin \
-                     (123456), usable by anyone who finds it. Pass --pin, or \
-                     --keep-factory-pin to accept that deliberately."
-                );
-            }
+        PGPCommand::Upload { pin, card, yes, output, qr: show_qr } => {
+            common::warn_factory_pin(pin.is_none());
 
             // The OpenPGP card spec requires at least 6 characters for the user pin
             if let Some(pin) = pin.as_ref()
@@ -826,7 +1559,7 @@ fn run_pgp(identity: Identity, options: PGPOptions, command: PGPCommand) -> Resu
                 fs::write(path, &armored)?;
             }
             if show_qr {
-                qr::print_qr(&armored)?;
+                qr::show_qr(&armored, false)?;
             }
 
             Ok(())
@@ -845,7 +1578,7 @@ fn run_pgp(identity: Identity, options: PGPOptions, command: PGPCommand) -> Resu
                 log::info!("Saving certificate to file: {}", path.display());
                 fs::write(path, &armored)?;
             } else {
-                qr::print_qr(&armored)?;
+                qr::show_qr(&armored, false)?;
             }
 
             Ok(())
@@ -873,7 +1606,7 @@ fn run_pgp(identity: Identity, options: PGPOptions, command: PGPCommand) -> Resu
                 write_sensitive(&path, &tsk_bytes)?;
             }
             if show_qr {
-                qr::print_qr(&tsk_bytes)?;
+                qr::show_qr(&tsk_bytes, true)?;
                 log::warn!(
                     "Secret keys were rendered on the terminal, clear the scrollback once transferred (e.g. `clear && printf '\\e[3J'`)"
                 );
@@ -881,11 +1614,11 @@ fn run_pgp(identity: Identity, options: PGPOptions, command: PGPCommand) -> Resu
 
             Ok(())
         }
-        PGPCommand::Revoke { output, kind, code, text } => {
+        PGPCommand::Revoke { output, kind, code, reason } => {
             let builder = builder()?;
 
             // Generate rev cert and save result
-            let raw = builder.revoke(kind, code, &text)?;
+            let raw = builder.revoke(kind, code, &reason)?;
             log::info!("Generated PGP revocation: {:?}", kind);
 
             // Armor the revocation packet (gnupg convention: Kind::PublicKey)
@@ -901,7 +1634,12 @@ fn run_pgp(identity: Identity, options: PGPOptions, command: PGPCommand) -> Resu
                 // retire the identity, so it gets the same treatment as key material
                 write_sensitive(&path, &armored)?;
             } else {
-                qr::print_qr(&armored)?;
+                // A revocation certificate is a capability, so its QR gets the same
+                // no-stdout discipline as key material
+                qr::show_qr(&armored, true)?;
+                log::warn!(
+                    "The revocation certificate was rendered on the terminal, treat the scrollback accordingly"
+                );
             }
 
             Ok(())
@@ -923,7 +1661,7 @@ fn run_pgp(identity: Identity, options: PGPOptions, command: PGPCommand) -> Resu
                 log::info!("Saving certificate to file: {}", path.display());
                 fs::write(path, &armored)?;
             } else {
-                qr::print_qr(&armored)?;
+                qr::show_qr(&armored, false)?;
             }
 
             Ok(())
@@ -934,6 +1672,7 @@ fn run_pgp(identity: Identity, options: PGPOptions, command: PGPCommand) -> Resu
 /// Run one PIV subcommand, assembling the certificate builder on demand
 fn run_piv(identity: Identity, options: PIVOptions, command: PIVCommand) -> Result<()> {
     let Identity { seed, subkey, name, emails } = identity;
+    let emails_empty = emails.is_empty();
     let PIVOptions {
         date,
         validity,
@@ -941,9 +1680,8 @@ fn run_piv(identity: Identity, options: PIVOptions, command: PIVCommand) -> Resu
         shared,
         retired,
         org,
-        ou,
+        unit,
         country,
-        card_id,
         pin_policy,
         touch_policy,
         no_msroots,
@@ -952,11 +1690,13 @@ fn run_piv(identity: Identity, options: PIVOptions, command: PIVCommand) -> Resu
     // Built lazily, so a command that needs no builder -- status today, anything later --
     // simply never calls it; the closure moves the identity in and can run at most once
     let builder = move || -> Result<piv::SeededSmartcard> {
-        let name = name.ok_or(anyhow!("Requires name to be specified"))?;
+        let name = name.ok_or_else(|| anyhow!("No name given, pass --name (or MIND_THE_NAME)"))?;
 
         // Configure and run backend
         log::info!("Generating PIV certificates for '{}'", name);
-        let seed = seed.as_ref().expect("prompted for above when missing");
+        let seed = seed
+            .as_ref()
+            .expect("resolved above when the command needs a seed");
         let mut builder = piv::SeededSmartcard::new(&seed.seed(), subkey, name);
 
         for address in emails.iter() {
@@ -969,7 +1709,7 @@ fn run_piv(identity: Identity, options: PIVOptions, command: PIVCommand) -> Resu
             log::info!("Setting certificate organization: {}", org);
             builder = builder.with_org(org);
         }
-        if let Some(unit) = ou {
+        if let Some(unit) = unit {
             log::info!("Setting certificate organizational unit: {}", unit);
             builder = builder.with_org_unit(unit);
         }
@@ -977,11 +1717,6 @@ fn run_piv(identity: Identity, options: PIVOptions, command: PIVCommand) -> Resu
             log::info!("Setting certificate country: {}", country);
             builder = builder.with_country(country);
         }
-        if let Some(id) = card_id {
-            log::info!("Setting card identifier: {}", id);
-            builder = builder.with_card_id(id);
-        }
-
         if intermediate {
             log::info!("Inserting an intermediate issuing certificate authority");
             builder = builder.with_intermediate(true);
@@ -1014,11 +1749,11 @@ fn run_piv(identity: Identity, options: PIVOptions, command: PIVCommand) -> Resu
 
         // Applied here rather than per command so that certify, check and upload all
         // derive the very same chain
+        // Without --date the creation time stays at the unix epoch, silently: the
+        // deterministic default is the documented design, same as the PGP backend
         if let Some(date) = date {
             log::info!("Setting certificate creation time: {}", date.format("%Y-%m-%d %T"));
             builder = builder.with_creation_time(date.into());
-        } else {
-            log::warn!("No creation date given, using the unix epoch");
         }
 
         if let Some(validity) = validity {
@@ -1056,7 +1791,7 @@ fn run_piv(identity: Identity, options: PIVOptions, command: PIVCommand) -> Resu
                 log::info!("Saving certificates to file: {}", path.display());
                 fs::write(path, encoded.as_bytes())?;
             } else if selected.len() == 1 {
-                qr::print_qr(encoded.as_bytes())?;
+                qr::show_qr(encoded.as_bytes(), false)?;
             } else {
                 bail!(
                     "Refusing to render {} certificates as a QR code, use --output or --kind root",
@@ -1067,6 +1802,15 @@ fn run_piv(identity: Identity, options: PIVOptions, command: PIVCommand) -> Resu
             Ok(())
         }
         PIVCommand::Check { pin, card } => {
+            // A chain derived without emails carries no SANs; against a card that was
+            // provisioned with them, every slot would "mismatch" for the wrong reason
+            if emails_empty {
+                log::warn!(
+                    "No --emails given: if the card was provisioned with emails, every \
+                     certificate will mismatch; pass them exactly as at provisioning"
+                );
+            }
+
             let mut builder = builder()?;
 
             if let Some(pin) = pin.as_ref() {
@@ -1081,14 +1825,8 @@ fn run_piv(identity: Identity, options: PIVOptions, command: PIVCommand) -> Resu
 
             builder.check(card)
         }
-        PIVCommand::Upload { pin, card, yes, keep_factory_pin, output, show_qr } => {
-            if pin.is_none() && !keep_factory_pin {
-                bail!(
-                    "No --pin supplied: the card would keep the factory user pin \
-                     (123456), usable by anyone who finds it. Pass --pin, or \
-                     --keep-factory-pin to accept that deliberately."
-                );
-            }
+        PIVCommand::Upload { pin, card, yes, output, qr: show_qr } => {
+            common::warn_factory_pin(pin.is_none());
 
             // Verify user inputs further. Counted in characters, not bytes: the card takes
             // up to 8 bytes, but a multi-byte character miscounted here would produce an
@@ -1129,7 +1867,7 @@ fn run_piv(identity: Identity, options: PIVOptions, command: PIVCommand) -> Resu
                 fs::write(path, chain.to_pem(piv::CertificateKind::Chain)?.as_bytes())?;
             }
             if show_qr {
-                qr::print_qr(chain.to_pem(piv::CertificateKind::Root)?.as_bytes())?;
+                qr::show_qr(chain.to_pem(piv::CertificateKind::Root)?.as_bytes(), false)?;
             }
 
             Ok(())
