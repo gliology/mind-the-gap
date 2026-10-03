@@ -5,7 +5,7 @@ mod cli {
     use super::*;
 
     #[test]
-    fn cmd_debub_assert() {
+    fn cmd_debug_assert() {
         command().debug_assert()
     }
 }
