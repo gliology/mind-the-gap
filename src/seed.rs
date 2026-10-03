@@ -20,8 +20,20 @@ pub type Seed256 = [u8; 32];
 const DERIVATION_CONTEXT: &[u8] = b"MINDTHEGAP256HDKD";
 
 /// Simple wrapper around argon2 crate to hash byte inputs
+///
+/// Two deliberate, load-bearing choices live here. There is no random salt: determinism
+/// is the product, the same seed must yield the same keys forever, and uniqueness comes
+/// from the 256-bit entropy input instead. And the optional user secret arrives in the
+/// *salt* position, appended to the context, not mixed into the password input: argon2
+/// folds password and salt into its initial state symmetrically, the 17-byte context
+/// clears the 8-byte salt minimum, and moving it would silently re-derive every key.
+///
+/// The parameters are frozen constants of the scheme named by [`SCHEME_VERSION`], the
+/// same way the label grammar is: changing any of them moves every key and therefore
+/// ships as a new major, never as a tuning tweak.
 pub fn argon2id_256(input: &[u8], salt: Option<&[u8]>) -> Zeroizing<Seed256> {
-    // Default setting for memory-constrained environments
+    // Chosen for memory-constrained environments; comfortably above the OWASP floor,
+    // and part of the frozen mtg1 scheme (see above)
     let params = Params::new(64 * 1024, 3, 1, None).unwrap();
 
     // Prepare salt value
@@ -98,11 +110,19 @@ pub fn label(prefix: &str, name: &str) -> Vec<u8> {
 ///
 /// Deliberately not [`label`]: the id is arbitrary text a user chose, so it is neither checked
 /// against the label grammar nor required to be valid UTF-8 beyond what the CLI already
-/// accepts. The prefix is what matters -- no fixed label begins with it, so an id can never
-/// collide with one however exotic it is. `None` and `""` mean the same thing, which is what
-/// makes a card with no subkey id and a `--shared` key agree.
+/// accepts. The prefix is what matters: no fixed label begins with it, so an id can never
+/// collide with one however exotic it is.
+///
+/// No id at all derives under the bare prefix, with no separator; a supplied id, the
+/// empty string included, derives under `sub:<id>`. The two must not coincide: they
+/// produce different certificates, and keys that differ from certificates that agree
+/// is exactly the confusion the label grammar exists to rule out. `--shared` keys and
+/// a card without a subkey id both take the `None` side, so they keep agreeing.
 pub fn sub_label(id: Option<&str>) -> Vec<u8> {
-    [PREFIX_SUB.as_bytes(), b":", id.unwrap_or("").as_bytes()].concat()
+    match id {
+        Some(id) => [PREFIX_SUB.as_bytes(), b":", id.as_bytes()].concat(),
+        None => PREFIX_SUB.as_bytes().to_vec(),
+    }
 }
 
 /// Abstract derivation step

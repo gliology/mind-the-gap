@@ -12,8 +12,6 @@ use anyhow::{Error, anyhow};
 
 use bip39::{Language, Mnemonic};
 
-use rand_core::{OsRng, TryRngCore};
-
 use zeroize::Zeroizing;
 
 /// Simple wrapper to add password and derivation support to mnemonics
@@ -29,14 +27,13 @@ pub struct MnemonicSeed {
 impl MnemonicSeed {
     /// Generate a fresh 24 word mnemonic straight from the operating system's entropy source.
     ///
-    /// `OsRng` on purpose, rather than a userspace generator: the kernel CSPRNG is the sole
-    /// source, with nothing reseeded or buffered in between. This mints new key material, so
-    /// it stays an explicit call -- commands that need a seed prompt for one instead of
-    /// quietly calling this.
+    /// `getrandom` on purpose, rather than a userspace generator: the kernel CSPRNG is
+    /// the sole source, with nothing reseeded or buffered in between. This mints new
+    /// key material, so it stays an explicit call: only the `generate` ceremony and the
+    /// interactive session reach it, never a command that merely lacked its seed.
     pub fn generate() -> Result<Self, Error> {
         let mut entropy = Zeroizing::new([0u8; 32]);
-        OsRng
-            .try_fill_bytes(entropy.as_mut())
+        getrandom::fill(entropy.as_mut())
             .map_err(|err| anyhow!("Operating system entropy source failed: {err}"))?;
 
         Ok(MnemonicSeed {

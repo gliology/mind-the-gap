@@ -137,7 +137,12 @@ the manual checklist covering what cannot be automated.
   browser, and Thunderbird S/MIME. Everything else -- `piv upload`, `piv check`, per-slot
   policies, `msroots`, on-card signing and decryption, SSH and TLS client auth -- passed
   against a YubiKey 5 on 2026-09-17
-- Zerorize secrets properly and consistently
+- Zeroize the secret copies that remain out of reach without upstream support: transient
+  stack copies made when the 32-byte arrays are moved, and copies held inside foreign
+  crates (`yubikey::MgmKey`'s cipher key, `p256` and `chacha20poly1305` key buffers).
+  Everything under this crate's control is wiped by type now -- every derivation returns
+  `Zeroizing<Seed256>`, the long-lived seeds are stored wrapped, and the mnemonic phrase
+  copies, derived pins and the exported secret-key armor are all zeroizing
 - Archive previous PIV subkey generations in the retired slots (82-95)
 - Test and support other keys (i.e. Solo 2, Nitrokey 3)
 - Investigate use of sequoia piv wrapper `openpgp-piv-sequoia`

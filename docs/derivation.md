@@ -5,9 +5,9 @@
 
 While the project was inspired by the key derivation cryptography used in bitcoin and substrate, we ended up switching to `argon2id` for our key derivation function.
 This tools generates and accept only 24 word seeds, which is equivalent to 256bits of entropy (and 8 bits of checksum). 
-All keys are derived from this root entropy through multiple rounds of `argon2id` using the recommended parameters for memory constraint environments.
+All keys are derived from this root entropy through multiple rounds of `argon2id` (64 MiB, three passes, one lane). These parameters are frozen constants of the scheme, exactly like the labels below: tuning them would move every key, so any change ships as a new scheme behind a new major version.
 
-The salt is always set to at least `MINDTHEGAP256HDKD` and optionally followed by an additional context like a password, (sub-)key or application identifiers:
+The salt is always set to at least `MINDTHEGAP256HDKD` and optionally followed by an additional context like a password, (sub-)key or application identifiers. Two properties of this construction are deliberate. There is no random salt, because determinism is the point: the same phrase must re-derive the same keys years later, and uniqueness comes from the 256 bits of seed entropy instead. And the optional password enters in the salt position rather than the password input; argon2 folds both into its initial state symmetrically, so this is equivalent in strength, and the context prefix keeps the salt above the format's minimum length even with no password at all.
 
 ```
 256-bit mnemonic seed/
@@ -65,6 +65,12 @@ entropy derivation, above everything shown here.
 The `sub:` prefix is what keeps the id safe to expose. Without it the id would share a
 namespace with the fixed labels beside it, and an id equal to one of them would silently
 collapse two different keys into one.
+
+No subkey id at all derives under the bare `sub` label, with no separator; a supplied id,
+even an empty one, derives under `sub:<id>`. The two are distinct on purpose: they produce
+visibly different certificates, so they must not quietly agree on keys. Keys derived
+without an id are also what `--shared` keys use, which is how every card can carry the
+same decryption key while the rest differ.
 
 PIV slot keys are named for the *role* they serve (`key:key-management`), not the slot they
 occupy, because the retired slots hold superseded key management keys: an archived key has to
