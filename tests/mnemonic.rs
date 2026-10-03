@@ -11,8 +11,10 @@ fn phrase() -> &'static str {
 fn from_phrase_roundtrips() {
     let ms = MnemonicSeed::from_phrase(phrase()).unwrap();
     // Normalise whitespace: the crate may canonicalise spacing
-    assert_eq!(ms.phrase().split_whitespace().collect::<Vec<_>>(),
-               phrase().split_whitespace().collect::<Vec<_>>());
+    assert_eq!(
+        ms.phrase().split_whitespace().collect::<Vec<_>>(),
+        phrase().split_whitespace().collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -25,14 +27,20 @@ fn seed_is_deterministic() {
 #[test]
 fn password_changes_seed() {
     let ms = MnemonicSeed::from_phrase(phrase()).unwrap();
-    let ms_with_pw = MnemonicSeed::from_phrase(phrase()).unwrap().with_password("x");
+    let ms_with_pw = MnemonicSeed::from_phrase(phrase())
+        .unwrap()
+        .with_password("x");
     assert_ne!(ms.seed(), ms_with_pw.seed());
 }
 
 #[test]
 fn password_is_deterministic() {
-    let ms1 = MnemonicSeed::from_phrase(phrase()).unwrap().with_password("password");
-    let ms2 = MnemonicSeed::from_phrase(phrase()).unwrap().with_password("password");
+    let ms1 = MnemonicSeed::from_phrase(phrase())
+        .unwrap()
+        .with_password("password");
+    let ms2 = MnemonicSeed::from_phrase(phrase())
+        .unwrap()
+        .with_password("password");
     assert_eq!(ms1.seed(), ms2.seed());
 }
 

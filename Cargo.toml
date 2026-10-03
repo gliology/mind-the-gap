@@ -1,12 +1,37 @@
 [package]
 name = "mind-the-gap"
 description = "Derive smart card keys and certs from mnemonic seeds"
+# The major version tracks the derivation scheme: 0.x derived under the legacy scheme
+# (`mtg0`, OpenPGP only), 1.x derives under the current labelled scheme (`mtg1`). A future
+# scheme change is a breaking change by definition and bumps the major.
 version = "0.2.2"
-authors = ["Florian Franzen <florian@gli.al"]
+authors = ["Florian Franzen <florian@gli.al>"]
 license = "LGPL-3.0-or-later"
-edition = "2021"
+repository = "https://github.com/gliology/mind-the-gap"
+readme = "README.md"
+edition = "2024"
+# Matches the toolchain pinned in rust-toolchain.toml
+rust-version = "1.93"
 default-run = "mind-the-gap"
-#build = "build.rs"
+build = "build.rs"
+
+[features]
+# Hardware tests are DESTRUCTIVE. They reset the attached YubiKey, wiping every key,
+# certificate and object on it, and they refuse to run unless the target card's serial is
+# named explicitly:
+#
+#     MTG_HARDWARE_TEST_SERIAL=<serial> cargo test --features destructive-hardware-tests --test piv_hardware
+#
+# Use a spare card. See docs/piv-hardware-tests.md.
+destructive-hardware-tests = []
+
+# Safety interlock -- never enable this by hand.
+#
+# `--all-features` turns on *every* feature, so without this a routine
+# `cargo test --all-features` would silently wipe whatever card happened to be plugged in.
+# The hardware tests compile only when `destructive-hardware-tests` is on and this is off,
+# so enabling both -- exactly what `--all-features` does -- compiles them out instead.
+no-destructive-hardware-tests = []
 
 [dependencies]
 # Command line interface
@@ -26,6 +51,12 @@ humantime = "2.1"
 
 # Clear sensitive data
 zeroize = "1.1"
+
+# Restore default SIGPIPE handling, so piping into `head` does not panic
+libc = "0.2"
+
+# No-echo terminal prompt for the seed phrase and password, see src/prompt.rs
+rpassword = "7.5"
 rand_core = { version = "0.9", features = ["os_rng"] }
 
 # Mnemonic handling
@@ -39,20 +70,42 @@ base64 = "0.22"
 qrcode = { version = "0.14", default-features = false }
 
 # OpenPGP and Smartcard modules
-sequoia-openpgp = { git = "https://gitlab.com/gli.al/sequoia.git", tag = "openpgp/v2.2.0-mtg0" }
+#
+# Pinned by revision rather than by tag: a tag can be force-moved and `cargo update` would
+# follow it, and this fork's two-commit patch set is load-bearing for reproducibility (see
+# the security model in the README). The revision is tag openpgp/v2.2.0-mtg0.
+sequoia-openpgp = { git = "https://gitlab.com/gli.al/sequoia.git", rev = "8ea683342764b6dedbf86e8d106d026266412e4d" }
 openpgp-card = "0.5"
 card-backend-pcsc = "0.5"
 secrecy = "0.8"
 
 # Yubikey PIV module
 yubikey = { version = "0.9.0-pre.0",  features = [ "untested" ]}
-x509-cert = "0.3.0-rc.4"
-der = "0.8"
-spki = { version = "0.8", features = [ "fingerprint" ]}
+# Features declared explicitly: `builder` gates CertificateBuilder/BuilderProfile *and* the
+# TryFrom<SubjectPublicKeyInfoRef> impls for Subject/AuthorityKeyIdentifier, `hazmat` gates
+# Time::INFINITY. They currently also arrive via yubikey's own dependency, but relying on
+# feature unification would break on a yubikey patch release.
+x509-cert = { version = "0.3.0-rc.4", features = [ "builder", "hazmat", "pem" ]}
+der = { version = "0.8", features = [ "oid", "alloc", "flagset" ]}
+spki = { version = "0.8", features = [ "fingerprint", "alloc" ]}
+# Degenerate PKCS#7 (certs-only SignedData) for the YubiKey msroots object.
+# Pins x509-cert 0.3.0-rc.4 and der/spki 0.8.0-rc.*, which unify with the releases above.
+cms = { version = "0.3.0-pre.2", features = [ "std" ]}
+# NOTE: this is sha2 0.10 while yubikey/ecdsa pull sha2 0.11. Two majors coexist fine here
+# because no sha2 type crosses the boundary -- do not "fix" this by bumping it.
 sha2 = "0.10"
+# Default features already give arithmetic + ecdsa + pem(-> pkcs8) + std(-> alloc), which is
+# exactly the set x509-cert's Builder::build bounds require.
 p256 = "0.14.0-rc.9"
-ed25519-dalek = { version = "3.0.0-pre.7", features = [ "alloc", "pkcs8" ]}
-pem-rfc7468 = "1.0"
 
 [lib]
 doctest = false
+
+[dev-dependencies]
+# Unpredictable, self-cleaning temp paths for the tests that shell out to external tools
+tempfile = "3"
+# The on-card key agreement test (tests/piv_hardware.rs) needs `ecdh`, which is not in p256's
+# default feature set. Kept here rather than on the main dependency so that a production
+# build does not carry it -- Cargo unifies features per build, so test targets get it and
+# `cargo build` does not.
+p256 = { version = "0.14.0-rc.9", features = [ "ecdh" ] }

@@ -12,14 +12,32 @@ mod tests {
 
     #[test]
     fn test_argon2() {
-        assert_eq!(argon2id_256(DEFAULT_INPUT, None), DEFAULT_HASH);
+        assert_eq!(*argon2id_256(DEFAULT_INPUT, None), DEFAULT_HASH);
     }
 
-    // TODO: Bring back benchmarking
-    /*
-    #[bench]
-    fn bench_argon2(b: &mut Bencher) {
-        b.iter(|| argon2id_256(DEFAULT_INPUT, None));
+    /// Report the wall-clock cost of one derivation.
+    ///
+    /// The parameters (64 MiB, t=3) are a security property: every secret flows through
+    /// this funnel, and each level of the derivation tree costs one pass, so knowing when
+    /// the price moves matters in both directions. Ignored by default because wall-clock
+    /// time is machine-dependent -- this prints, it does not assert:
+    ///
+    /// ```text
+    /// cargo test --test argon -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "benchmark: prints the per-derivation cost, nothing to assert"]
+    fn derivation_cost() {
+        const ROUNDS: u32 = 10;
+
+        let start = std::time::Instant::now();
+        for index in 0..ROUNDS {
+            argon2id_256(DEFAULT_INPUT, Some(&index.to_le_bytes()));
+        }
+
+        eprintln!(
+            "argon2id_256: {:?} per derivation over {ROUNDS} rounds",
+            start.elapsed() / ROUNDS
+        );
     }
-    */
 }

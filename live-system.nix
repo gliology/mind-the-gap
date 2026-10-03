@@ -48,7 +48,7 @@
 
   services.udev.packages = [ pkgs.yubikey-personalization pkgs.solo2-cli ];
 
-  # Live system lacks persistens storage, so protect pstore
+  # Live system lacks persistent storage, so protect pstore
   environment.etc."systemd/pstore.conf".text = ''
     [PStore]
     Unlink=no
