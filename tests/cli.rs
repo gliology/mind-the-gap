@@ -228,6 +228,99 @@ exit
     assert_ne!(a, b, "the line's own --date did not override the stored default");
 }
 
+/// `--algorithm` is accepted by both backends, from the line and from the environment, and
+/// it changes the derived output.
+#[test]
+fn curve_selects_the_key_algorithms() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let piv = |args: &[&str], env: Option<&str>, name: &str| {
+        let path = dir.path().join(name);
+        let mut cmd = bin();
+        if let Some(algorithm) = env {
+            cmd.env("MIND_THE_ALGORITHM", algorithm);
+        }
+        let out = identity(&mut cmd)
+            .args([
+                "piv",
+                "certify",
+                "--kind",
+                "root",
+                "-o",
+                path.to_str().unwrap(),
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "piv certify failed: {:?}", out);
+        std::fs::read(&path).unwrap()
+    };
+
+    let default = piv(&[], None, "default.pem");
+    let p256 = piv(&["--algorithm", "p256"], None, "p256.pem");
+    let ed25519 = piv(&["--algorithm", "curve25519"], None, "ed25519.pem");
+    let from_env = piv(&[], Some("curve25519"), "env.pem");
+
+    assert_eq!(default, p256, "PIV does not default to P-256");
+    assert_ne!(p256, ed25519, "--algorithm curve25519 changed nothing");
+    assert_eq!(ed25519, from_env, "MIND_THE_ALGORITHM is not honoured");
+
+    let pgp = |args: &[&str], name: &str| {
+        let path = dir.path().join(name);
+        let out = identity(&mut bin())
+            .args(["pgp", "certify", "-o", path.to_str().unwrap()])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "pgp certify failed: {:?}", out);
+        std::fs::read(&path).unwrap()
+    };
+
+    let default = pgp(&[], "pgp-default.asc");
+    let curve25519 = pgp(&["--algorithm", "curve25519"], "pgp-25519.asc");
+    let p256 = pgp(&["--algorithm", "p256"], "pgp-p256.asc");
+
+    assert_eq!(default, curve25519, "PGP does not default to Curve25519");
+    assert_ne!(default, p256, "--algorithm p256 changed nothing");
+
+    // The legacy scheme predates the algorithm segment and refuses the other algorithm
+    let out = identity(&mut bin())
+        .args(["pgp", "--legacy", "--algorithm", "p256", "certify"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "--legacy accepted --algorithm p256");
+    assert!(stderr.contains("--legacy"), "the refusal does not name --legacy:\n{stderr}");
+}
+
+/// `set --algorithm` is a session default for both backends, and a line's own value wins.
+#[test]
+fn set_curve_sticks_in_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.pem");
+    let b = dir.path().join("b.pem");
+    let c = dir.path().join("c.pem");
+    let script = format!(
+        "piv certify --kind root --algorithm curve25519 -o {a}
+set --algorithm curve25519
+piv certify --kind root -o {b}
+piv certify --kind root --algorithm p256 -o {c}
+exit
+",
+        a = a.display(),
+        b = b.display(),
+        c = c.display()
+    );
+
+    let out = repl(&script, &["-s", TEST_PHRASE, "-n", "Jane"]);
+    assert!(out.status.success(), "session died: {:?}", out);
+    let a = std::fs::read(&a).unwrap();
+    let b = std::fs::read(&b).unwrap();
+    let c = std::fs::read(&c).unwrap();
+    assert_eq!(a, b, "the stored algorithm default was not applied");
+    assert_ne!(b, c, "the line's own --algorithm did not override the stored default");
+}
+
 /// The version verb prints name and version inside the session.
 #[test]
 fn version_verb_works_in_session() {

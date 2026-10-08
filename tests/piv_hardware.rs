@@ -19,6 +19,12 @@
 //! `upload` needs none: it installs the management key touch-free and only arms the
 //! requirement afterwards.
 //!
+//! The checklist runs on P-256, the default chain. Its card-level half is also available
+//! on its own, for either algorithm, as ignored tests (`cargo test ... -- --ignored`): the
+//! virtual PIV check runs those against the trussed card in a VM, and on real hardware
+//! the Curve25519 one needs a token importing Ed25519 and X25519 PIV keys, which is
+//! YubiKey firmware 5.7 or later.
+//!
 //! The end use of section 5 runs here too, driven headless against the tools real clients
 //! are built on: a TLS client-auth handshake over 9A, S/MIME signing over 9C, 9D key
 //! agreement through the standard PKCS#11 interface, SSH authentication with 9A against a
@@ -32,13 +38,15 @@
     not(feature = "no-destructive-hardware-tests")
 ))]
 
-use mind_the_gap::piv::{CertificateKind, SeededSmartcard};
-use mind_the_gap::seed::Seed256;
+use mind_the_gap::piv::{CertChain, CertificateKind, SeededSmartcard};
+use mind_the_gap::seed::{Algorithm, Seed256};
 
 use p256::ecdh;
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{DerSignature, VerifyingKey};
 use p256::{PublicKey, SecretKey};
+
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 use x509_cert::Certificate;
 use x509_cert::der::Encode;
@@ -103,15 +111,29 @@ fn open() -> YubiKey {
         .expect("cannot open the card named by MTG_HARDWARE_TEST_SERIAL")
 }
 
-/// The P-256 public key a certificate carries
-fn verifying_key(cert: &Certificate) -> VerifyingKey {
-    VerifyingKey::from_sec1_bytes(
-        cert.tbs_certificate()
-            .subject_public_key_info()
-            .subject_public_key
-            .raw_bytes(),
-    )
-    .expect("slot certificate does not carry a P-256 point")
+/// The algorithm a slot holds its key under, read off its certificate's SPKI
+fn slot_algorithm(cert: &Certificate) -> AlgorithmId {
+    match cert
+        .tbs_certificate()
+        .subject_public_key_info()
+        .algorithm
+        .oid
+        .to_string()
+        .as_str()
+    {
+        "1.2.840.10045.2.1" => AlgorithmId::EccP256,
+        "1.3.101.112" => AlgorithmId::Ed25519,
+        "1.3.101.110" => AlgorithmId::X25519,
+        other => panic!("slot certificate carries an unexpected key algorithm: {other}"),
+    }
+}
+
+/// The raw subject public key a certificate carries
+fn public_key_bytes(cert: &Certificate) -> &[u8] {
+    cert.tbs_certificate()
+        .subject_public_key_info()
+        .subject_public_key
+        .raw_bytes()
 }
 
 fn leaf(chain: &mind_the_gap::piv::CertChain, slot: SlotId) -> &Certificate {
@@ -159,102 +181,7 @@ fn provision_and_verify_card() {
     let subject = subject();
     let serial = target();
 
-    // -- Section 1: provision ------------------------------------------------------------
-    //
-    // Build the chain offline first. If this disagrees with what `upload` returns, the card
-    // path has diverged from the reproducible one.
-    eprintln!("[1/12] deriving the chain offline");
-    let offline = subject
-        .certify(CertificateKind::Chain)
-        .expect("offline certify failed");
-
-    // No touch here: `upload` installs the management key touch-free and only switches the
-    // requirement on once provisioning has succeeded
-    eprintln!("[2/12] uploading to card {serial}");
-    let uploaded = on_card("upload", subject.upload(Some(serial.clone())));
-
-    assert_eq!(
-        uploaded
-            .to_pem(CertificateKind::Chain)
-            .expect("uploaded chain does not encode"),
-        offline
-            .to_pem(CertificateKind::Chain)
-            .expect("offline chain does not encode"),
-        "upload and certify produced different chains",
-    );
-
-    eprintln!("[3/12] running check -- TOUCH THE TOKEN when it blinks");
-    on_card("check", subject.check(Some(serial.clone())));
-
-    // -- Section 2: what actually landed -------------------------------------------------
-    //
-    // `check` reports policy and msroots mismatches as warnings rather than failures, so
-    // neither is actually asserted by the call above. Do it here, where a regression fails.
-    eprintln!("[4/12] asserting slot policies and certificates");
-    let mut token = open();
-
-    for (slot, pin_policy, touch_policy) in EXPECTED_POLICIES {
-        let metadata = piv::metadata(&mut token, slot)
-            .unwrap_or_else(|e| panic!("cannot read {slot:?} metadata: {e}"));
-
-        assert_eq!(
-            metadata.policy,
-            Some((pin_policy, touch_policy)),
-            "{slot:?} policy is not {pin_policy:?}/{touch_policy:?}",
-        );
-
-        // Byte-identical, not merely "a certificate is present"
-        let on_card = yubikey::certificate::Certificate::read(&mut token, slot)
-            .unwrap_or_else(|e| panic!("cannot read {slot:?} certificate: {e}"));
-        assert_eq!(
-            on_card.cert.to_der().expect("card cert does not encode"),
-            leaf(&offline, slot).to_der().expect("leaf does not encode"),
-            "{slot:?} certificate on card differs from the derived one",
-        );
-    }
-
-    // -- Section 4: msroots --------------------------------------------------------------
-    //
-    // Checked before the signing steps because it needs no PIN and no touch.
-    eprintln!("[5/12] asserting msroots");
-    let expected = cms::content_info::ContentInfo::try_from(offline.cas())
-        .expect("authorities do not form a PKCS#7")
-        .to_der()
-        .expect("PKCS#7 does not encode");
-    let roots = MsRoots::read(&mut token)
-        .expect("cannot read msroots")
-        .expect("no authorities stored in msroots");
-    assert_eq!(
-        AsRef::<[u8]>::as_ref(&roots),
-        expected.as_slice(),
-        "msroots does not hold the derived certificate authorities",
-    );
-
-    // -- Card identifiers ----------------------------------------------------------------
-    //
-    // Windows smartcard logon and much middleware refuse a card carrying neither, and a
-    // freshly reset YubiKey has neither, so their presence is entirely down to `upload`.
-    eprintln!("[6/12] asserting CHUID and CCC");
-    let chuid = ChuId::get(&mut token).expect("no CHUID on card, Windows logon needs one");
-    assert_ne!(
-        chuid.uuid().as_bytes(),
-        &[0u8; 16],
-        "CHUID carries a zero Card UUID, so the template was written without our identifier",
-    );
-
-    let ccc = CccId::get(&mut token).expect("no CCC on card");
-    assert_ne!(
-        ccc.card_id().expect("CCC card identifier unreadable").0,
-        [0u8; 14],
-        "CCC carries a zero card identifier",
-    );
-
-    // -- Section 3: on-card signing ------------------------------------------------------
-    eprintln!("[7/12] on-card signing and key agreement");
-    card_authentication_needs_no_pin(&mut token, &offline);
-    signature_slot_refuses_without_pin(&mut token);
-    authentication_slot_signs(&mut token, &offline);
-    key_management_slot_agrees(&mut token, &offline);
+    let (offline, token) = provision_and_verify(&subject, &serial, 12);
 
     // -- Section 5: end use through PKCS#11 ----------------------------------------------
     //
@@ -290,6 +217,141 @@ fn provision_and_verify_card() {
 
     eprintln!("[12/12] NSS recognises the card, its keys and the chain (no touch)");
     nss_recognises_card(dir.path(), &module, &root);
+}
+
+/// The card-level half of the checklist on P-256, without the PKCS#11 end use.
+///
+/// What the virtual PIV check runs against the trussed card, where no PKCS#11 stack is
+/// configured around it. Ignored so that `cargo test` on a real token runs the full
+/// checklist above once rather than provisioning the card twice.
+#[test]
+#[ignore = "the card-level half of the checklist above, run by the virtual PIV check"]
+fn provision_and_verify_p256_card() {
+    provision_and_verify(&subject(), &target(), 7);
+}
+
+/// The card-level half of the checklist on Curve25519: Ed25519 slot keys and authorities,
+/// an X25519 key management key, and the card signing and agreeing with each of them.
+///
+/// The virtual PIV check runs it against the trussed card. On real hardware it needs a
+/// token that imports both algorithms, which is YubiKey firmware 5.7 or later, hence
+/// ignored. The end-use steps through PKCS#11 stay with the P-256 run: OpenSC's PIV
+/// driver does not drive these slots yet.
+#[test]
+#[ignore = "needs a card that imports Ed25519 (0xE0) and X25519 (0xE1) PIV keys"]
+fn provision_and_verify_curve25519_card() {
+    let subject = subject().with_algorithm(Algorithm::Curve25519);
+    let serial = target();
+
+    provision_and_verify(&subject, &serial, 7);
+}
+
+/// Sections 1 to 4 of the checklist: provision, then assert what landed on the card and
+/// that the card signs and agrees with it. Returns the chain and the open token for the
+/// steps that follow; `total` is only for the step counter in the progress lines.
+fn provision_and_verify(
+    subject: &SeededSmartcard,
+    serial: &str,
+    total: usize,
+) -> (CertChain, YubiKey) {
+    // -- Section 1: provision ------------------------------------------------------------
+    //
+    // Build the chain offline first. If this disagrees with what `upload` returns, the card
+    // path has diverged from the reproducible one.
+    eprintln!("[1/{total}] deriving the chain offline");
+    let offline = subject
+        .certify(CertificateKind::Chain)
+        .expect("offline certify failed");
+
+    // No touch here: `upload` installs the management key touch-free and only switches the
+    // requirement on once provisioning has succeeded
+    eprintln!("[2/{total}] uploading to card {serial}");
+    let uploaded = on_card("upload", subject.upload(Some(serial.to_string())));
+
+    assert_eq!(
+        uploaded
+            .to_pem(CertificateKind::Chain)
+            .expect("uploaded chain does not encode"),
+        offline
+            .to_pem(CertificateKind::Chain)
+            .expect("offline chain does not encode"),
+        "upload and certify produced different chains",
+    );
+
+    eprintln!("[3/{total}] running check -- TOUCH THE TOKEN when it blinks");
+    on_card("check", subject.check(Some(serial.to_string())));
+
+    // -- Section 2: what actually landed -------------------------------------------------
+    //
+    // `check` reports policy and msroots mismatches as warnings rather than failures, so
+    // neither is actually asserted by the call above. Do it here, where a regression fails.
+    eprintln!("[4/{total}] asserting slot policies and certificates");
+    let mut token = open();
+
+    for (slot, pin_policy, touch_policy) in EXPECTED_POLICIES {
+        let metadata = piv::metadata(&mut token, slot)
+            .unwrap_or_else(|e| panic!("cannot read {slot:?} metadata: {e}"));
+
+        assert_eq!(
+            metadata.policy,
+            Some((pin_policy, touch_policy)),
+            "{slot:?} policy is not {pin_policy:?}/{touch_policy:?}",
+        );
+
+        // Byte-identical, not merely "a certificate is present"
+        let on_card = yubikey::certificate::Certificate::read(&mut token, slot)
+            .unwrap_or_else(|e| panic!("cannot read {slot:?} certificate: {e}"));
+        assert_eq!(
+            on_card.cert.to_der().expect("card cert does not encode"),
+            leaf(&offline, slot).to_der().expect("leaf does not encode"),
+            "{slot:?} certificate on card differs from the derived one",
+        );
+    }
+
+    // -- Section 4: msroots --------------------------------------------------------------
+    //
+    // Checked before the signing steps because it needs no PIN and no touch.
+    eprintln!("[5/{total}] asserting msroots");
+    let expected = cms::content_info::ContentInfo::try_from(offline.cas())
+        .expect("authorities do not form a PKCS#7")
+        .to_der()
+        .expect("PKCS#7 does not encode");
+    let roots = MsRoots::read(&mut token)
+        .expect("cannot read msroots")
+        .expect("no authorities stored in msroots");
+    assert_eq!(
+        AsRef::<[u8]>::as_ref(&roots),
+        expected.as_slice(),
+        "msroots does not hold the derived certificate authorities",
+    );
+
+    // -- Card identifiers ----------------------------------------------------------------
+    //
+    // Windows smartcard logon and much middleware refuse a card carrying neither, and a
+    // freshly reset YubiKey has neither, so their presence is entirely down to `upload`.
+    eprintln!("[6/{total}] asserting CHUID and CCC");
+    let chuid = ChuId::get(&mut token).expect("no CHUID on card, Windows logon needs one");
+    assert_ne!(
+        chuid.uuid().as_bytes(),
+        &[0u8; 16],
+        "CHUID carries a zero Card UUID, so the template was written without our identifier",
+    );
+
+    let ccc = CccId::get(&mut token).expect("no CCC on card");
+    assert_ne!(
+        ccc.card_id().expect("CCC card identifier unreadable").0,
+        [0u8; 14],
+        "CCC carries a zero card identifier",
+    );
+
+    // -- Section 3: on-card signing ------------------------------------------------------
+    eprintln!("[7/{total}] on-card signing and key agreement");
+    card_authentication_needs_no_pin(&mut token, &offline);
+    signature_slot_refuses_without_pin(&mut token, &offline);
+    authentication_slot_signs(&mut token, &offline);
+    key_management_slot_agrees(&mut token, &offline);
+
+    (offline, token)
 }
 
 /// The OpenSC PKCS#11 module and OpenSSL's pkcs11 provider, exported by the dev shell.
@@ -929,14 +991,14 @@ fn nss_recognises_card(dir: &std::path::Path, module: &str, root: &std::path::Pa
 /// token-level "login required" flag, so `pkcs11-tool` logs in whether or not it is asked to,
 /// which tests OpenSC's policy rather than the card's. Going straight at the card is
 /// unambiguous.
-fn card_authentication_needs_no_pin(token: &mut YubiKey, chain: &mind_the_gap::piv::CertChain) {
+fn card_authentication_needs_no_pin(token: &mut YubiKey, chain: &CertChain) {
     let message = b"card authentication";
+    let cert = leaf(chain, SlotId::CardAuthentication);
 
-    let signature =
-        piv::sign_data(token, &sha256(message), AlgorithmId::EccP256, SlotId::CardAuthentication)
-            .expect("9E refused to sign without a PIN, but its policy is PinPolicy::Never");
+    let signature = sign(token, message, cert, SlotId::CardAuthentication)
+        .expect("9E refused to sign without a PIN, but its policy is PinPolicy::Never");
 
-    verify(&signature, message, leaf(chain, SlotId::CardAuthentication), "9E");
+    verify(&signature, message, cert, "9E");
 }
 
 /// Slot 9C refuses to sign until the PIN is presented, every time.
@@ -944,27 +1006,26 @@ fn card_authentication_needs_no_pin(token: &mut YubiKey, chain: &mind_the_gap::p
 /// The negative half of `PinPolicy::Always`: the slot metadata merely *records* the policy,
 /// this proves the card enforces it. Cheap to run -- the card rejects on the PIN check,
 /// before it ever waits for a touch.
-fn signature_slot_refuses_without_pin(token: &mut YubiKey) {
-    let result =
-        piv::sign_data(token, &sha256(b"signature slot"), AlgorithmId::EccP256, SlotId::Signature);
+fn signature_slot_refuses_without_pin(token: &mut YubiKey, chain: &CertChain) {
+    let result = sign(token, b"signature slot", leaf(chain, SlotId::Signature), SlotId::Signature);
 
     assert!(result.is_err(), "9C signed without a PIN, but its policy is PinPolicy::Always",);
 }
 
 /// Slot 9A signs once the PIN is presented, and the signature verifies under its certificate.
-fn authentication_slot_signs(token: &mut YubiKey, chain: &mind_the_gap::piv::CertChain) {
+fn authentication_slot_signs(token: &mut YubiKey, chain: &CertChain) {
     token
         .verify_pin(TEST_PIN.as_bytes())
         .expect("card rejected the PIN we provisioned it with");
 
     let message = b"authentication slot";
+    let cert = leaf(chain, SlotId::Authentication);
 
     eprintln!("      9A signing -- TOUCH THE TOKEN when it blinks");
-    let signature =
-        piv::sign_data(token, &sha256(message), AlgorithmId::EccP256, SlotId::Authentication)
-            .expect("9A refused to sign after a PIN and a touch");
+    let signature = sign(token, message, cert, SlotId::Authentication)
+        .expect("9A refused to sign after a PIN and a touch");
 
-    verify(&signature, message, leaf(chain, SlotId::Authentication), "9A");
+    verify(&signature, message, cert, "9A");
 }
 
 /// Slot 9D performs ECDH on the card, and agrees with the same computation done off it.
@@ -973,15 +1034,15 @@ fn authentication_slot_signs(token: &mut YubiKey, chain: &mind_the_gap::piv::Cer
 /// `openssl cms -encrypt` accepts the certificate; only the card can show that the key
 /// actually derives the same shared secret. Done as raw ECDH rather than a CMS round trip so
 /// that it needs no OpenSSL engine configuration.
-fn key_management_slot_agrees(token: &mut YubiKey, chain: &mind_the_gap::piv::CertChain) {
+fn key_management_slot_agrees(token: &mut YubiKey, chain: &CertChain) {
     let cert = leaf(chain, SlotId::KeyManagement);
-    let card_public = PublicKey::from_sec1_bytes(
-        cert.tbs_certificate()
-            .subject_public_key_info()
-            .subject_public_key
-            .raw_bytes(),
-    )
-    .expect("9D certificate does not carry a P-256 point");
+
+    if slot_algorithm(cert) == AlgorithmId::X25519 {
+        return x25519_key_management_slot_agrees(token, cert);
+    }
+
+    let card_public = PublicKey::from_sec1_bytes(public_key_bytes(cert))
+        .expect("9D certificate does not carry a P-256 point");
 
     // Fixed rather than random: the card's key is what is under test, our side only has to
     // be a valid scalar, and a constant keeps the test deterministic.
@@ -1007,19 +1068,74 @@ fn key_management_slot_agrees(token: &mut YubiKey, chain: &mind_the_gap::piv::Ce
     );
 }
 
+/// The X25519 twin of the P-256 agreement above: the card takes the peer's raw 32-byte
+/// point and returns the raw shared secret, which `x25519-dalek` has to reproduce.
+fn x25519_key_management_slot_agrees(token: &mut YubiKey, cert: &Certificate) {
+    let card_public: [u8; 32] = public_key_bytes(cert)
+        .try_into()
+        .expect("9D certificate does not carry an X25519 point");
+    let ephemeral = StaticSecret::from([0x2bu8; 32]);
+    let point = X25519PublicKey::from(&ephemeral);
+
+    eprintln!("      9D key agreement -- TOUCH THE TOKEN when it blinks");
+    let on_card =
+        piv::decrypt_data(token, point.as_bytes(), AlgorithmId::X25519, SlotId::KeyManagement)
+            .expect("9D refused to perform key agreement");
+
+    let off_card = ephemeral.diffie_hellman(&X25519PublicKey::from(card_public));
+
+    assert_eq!(
+        on_card.as_slice(),
+        off_card.as_bytes(),
+        "9D derived a different shared secret than the same key does off the card",
+    );
+}
+
 fn sha256(data: &[u8]) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     Sha256::digest(data).to_vec()
 }
 
-/// `signature` is checked over `message`, not over its digest: the card signs a pre-computed
-/// hash, while `Verifier::verify` hashes what it is given, so handing it the digest would
-/// hash the hash.
-fn verify(signature: &[u8], message: &[u8], cert: &Certificate, slot: &str) {
-    let signature = DerSignature::from_bytes(signature)
-        .unwrap_or_else(|e| panic!("{slot} signature is not DER: {e}"));
+/// Sign `message` in `slot`, the way its algorithm wants it: ECDSA takes the digest, the
+/// card never hashing for it, while pure Ed25519 hashes internally and takes the message.
+fn sign(
+    token: &mut YubiKey,
+    message: &[u8],
+    cert: &Certificate,
+    slot: SlotId,
+) -> yubikey::Result<yubikey::Buffer> {
+    match slot_algorithm(cert) {
+        AlgorithmId::Ed25519 => piv::sign_data(token, message, AlgorithmId::Ed25519, slot),
+        algorithm => piv::sign_data(token, &sha256(message), algorithm, slot),
+    }
+}
 
-    verifying_key(cert)
-        .verify(message, &signature)
-        .unwrap_or_else(|e| panic!("{slot} signature does not verify under its certificate: {e}"));
+/// `signature` is checked over `message`, not over its digest: the card signs a pre-computed
+/// hash for ECDSA, while `Verifier::verify` hashes what it is given, so handing it the digest
+/// would hash the hash.
+fn verify(signature: &[u8], message: &[u8], cert: &Certificate, slot: &str) {
+    match slot_algorithm(cert) {
+        AlgorithmId::Ed25519 => {
+            let key = ed25519_dalek::VerifyingKey::from_bytes(
+                public_key_bytes(cert)
+                    .try_into()
+                    .expect("slot certificate does not carry an Ed25519 point"),
+            )
+            .expect("slot certificate does not carry an Ed25519 point");
+            let signature = ed25519_dalek::Signature::from_slice(signature)
+                .unwrap_or_else(|e| panic!("{slot} signature is not an Ed25519 signature: {e}"));
+            key.verify(message, &signature).unwrap_or_else(|e| {
+                panic!("{slot} signature does not verify under its certificate: {e}")
+            });
+        }
+        _ => {
+            let key = VerifyingKey::from_sec1_bytes(public_key_bytes(cert))
+                .expect("slot certificate does not carry a P-256 point");
+            let signature = DerSignature::from_bytes(signature)
+                .unwrap_or_else(|e| panic!("{slot} signature is not DER: {e}"));
+            key.verify(message, &signature).unwrap_or_else(|e| {
+                panic!("{slot} signature does not verify under its certificate: {e}")
+            });
+        }
+    }
 }

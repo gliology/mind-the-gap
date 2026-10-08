@@ -24,7 +24,7 @@
     # virtual-piv check. Pinned to our fork until the ECC import, GET METADATA and
     # Yubico client compatibility work is upstreamed to trussed-dev
     piv-authenticator = {
-      url = "github:FlorianFranzen/piv-authenticator/ecc-import";
+      url = "github:FlorianFranzen/piv-authenticator/mtg-integration";
       flake = false;
     };
   };
@@ -159,6 +159,31 @@
                 ++ (with pkgs; [ sequoia-sq gnupg openssl ]);
             });
           };
+
+          # The destructive PIV suite as a binary the virtual PIV check can run: the
+          # card-level entry points prove on-card signing and key agreement, which `piv
+          # check` cannot (it compares public keys). The check above compiles the same
+          # suite and discards it; this keeps the test executable, with the libraries the
+          # card stack loads at runtime on its path.
+          pivSuite = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
+
+            pname = "mind-the-gap-piv-suite";
+            doCheck = false;
+            cargoBuildCommand =
+              "cargo test --profile release --no-run --features destructive-hardware-tests --test piv_hardware";
+
+            nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ];
+
+            # The harness names the binary with a hash; it is the one executable file
+            # among the metadata next to it
+            installPhaseCommand = ''
+              mkdir -p $out/bin
+              cp "$(find target/release/deps -maxdepth 1 -type f -executable -name 'piv_hardware-*')" \
+                $out/bin/piv-suite
+              wrapProgram "$out/bin/piv-suite" --prefix LD_LIBRARY_PATH : "${libPath}"
+            '';
+          });
         };
 
       rust = forEachSystem mkRust;
@@ -231,6 +256,24 @@
         };
 
       # The live iso with the nixos test backdoor baked in, used by the boot checks only;
+      # The virtual PIV check for one algorithm, see virtual-piv-test.nix
+      mkVirtualPivTest = system: algorithm:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          nixos-lib = import (pkgs.path + "/nixos/lib") { };
+        in
+        (nixos-lib.runTest {
+          hostPkgs = pkgs;
+          node.specialArgs = { inherit self; };
+          imports = [
+            (import ./virtual-piv-test.nix {
+              inherit pkgs algorithm;
+              piv-vpicc = mkPivVpicc system;
+              piv-suite = rust.${system}.pivSuite;
+            })
+          ];
+        }).config.result;
+
       # packages.iso remains the clean image
       mkInstrumentedIso = system:
         (nixpkgs.lib.nixosSystem {
@@ -373,19 +416,13 @@
             ];
           }).config.result;
 
-          # The same for PIV: provision the trussed piv-authenticator behind vpcd end to
-          # end -- reset, pin and management key handling, ECC key import with metadata
-          # read-back, and the certificate chain
-          virtual-piv = (nixos-lib.runTest {
-            hostPkgs = pkgs;
-            node.specialArgs = { inherit self; };
-            imports = [
-              (import ./virtual-piv-test.nix {
-                inherit pkgs;
-                piv-vpicc = mkPivVpicc system;
-              })
-            ];
-          }).config.result;
+          # The same for PIV, once per algorithm: provision the trussed piv-authenticator
+          # behind vpcd end to end -- reset, pin and management key handling, key import
+          # with metadata read-back, the certificate chain -- then run the card-level
+          # half of the destructive suite against it, so the card is seen signing and
+          # agreeing with the keys it took
+          virtual-piv = mkVirtualPivTest system "p256";
+          virtual-piv-curve25519 = mkVirtualPivTest system "curve25519";
         } // (
           let
             bootChecks = import ./boot-test.nix {

@@ -27,7 +27,7 @@
 use mind_the_gap::pgp::{
     CardSettings, CertificateKind, SeededSmartcard, SubkeyRole, TouchPolicyArg,
 };
-use mind_the_gap::seed::Seed256;
+use mind_the_gap::seed::{Algorithm, Seed256};
 
 use sequoia_openpgp::cert::Cert;
 use sequoia_openpgp::policy::StandardPolicy;
@@ -154,7 +154,25 @@ impl Drop for ScdaemonGuard {
 
 #[test]
 fn provision_and_verify_card() {
-    let subject = subject();
+    provision_and_verify(subject());
+}
+
+/// The same checklist with `--algorithm p256`: ECDSA signing and authentication keys and an
+/// ECDH decryption key, which a YubiKey 5 imports as readily as Curve25519 ones.
+///
+/// Shares the card with the run above, so the two must not interleave: run this suite
+/// with `--test-threads 1`. Each run factory-resets the applet first, so their order is
+/// immaterial.
+#[test]
+fn provision_and_verify_p256_card() {
+    provision_and_verify(
+        subject()
+            .with_algorithm(Algorithm::P256)
+            .expect("the current scheme takes any algorithm"),
+    );
+}
+
+fn provision_and_verify(subject: SeededSmartcard) {
     let ident = target();
 
     // -- Provision -----------------------------------------------------------------------

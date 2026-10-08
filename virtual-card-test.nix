@@ -83,5 +83,14 @@
 
     # A wrong subkey id must be detected before any pin is spent
     machine.fail(f"mind-the-gap {identity} -k other pgp check {card}")
+
+    # The same card takes a P-256 certificate: ECDSA signing and authentication keys and
+    # an ECDH decryption key, which opcard imports on every slot. A re-upload factory
+    # resets the applet, so the Curve25519 keys above make way rather than clash.
+    machine.succeed(
+        f"mind-the-gap {identity} pgp upload --yes --algorithm p256 {card} -o /tmp/p256.asc"
+    )
+    machine.succeed(f"mind-the-gap {identity} pgp check --algorithm p256 {card}")
+    machine.fail(f"mind-the-gap {identity} pgp check {card}")
   '';
 }

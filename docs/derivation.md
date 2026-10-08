@@ -49,12 +49,41 @@ label of the form `<prefix>:<name>`, where names are lowercase and hyphenated:
 | `app` | application subtree | intermediate seed |
 | `sub` | subtree scoped to the subkey id | intermediate seed |
 | `key` | key material | 256 bits |
+| `key:<name>:<segment>` | key material bound to one algorithm | 256 bits (384 on P-384, see below) |
 | `id` | identifier material | truncated to what the format takes |
 | `pin` | something a person types | ASCII |
 
 The prefix carries the use case, so two derivations cannot agree just because their names
-match: `key:authentication` and `id:authentication` are different bytes, as are PIV's
-`key:authentication` and PGP's, which sit under different `app:` subtrees.
+match: `key:authentication:p256` and `id:authentication` are different bytes, as are PIV's
+`key:authentication:p256` and PGP's, which sit under different `app:` subtrees.
+
+## The algorithm segment
+
+Every asymmetric key carries the algorithm it is derived for as a third label segment, behind
+a second colon: `key:signature:ed25519`, `key:key-management:p256`. The segment names what the
+bytes become, with the RFC names rather than OpenPGP's: `p256` for ECDSA and ECDH on NIST
+P-256, `p384` for the same on NIST P-384, `ed25519` for Ed25519 signing keys and `x25519` for
+X25519 key agreement keys. A key with no such choice, such as the PIV management key (AES),
+has no segment.
+
+`--algorithm` picks the algorithm for a whole backend at once, authorities and primary
+included, and the defaults are what each backend has always produced: OpenPGP derives
+Curve25519 keys, PIV P-256 ones. Switching a card to another algorithm derives under
+different labels, so the chains share no key material, and none can be computed from another.
+
+| backend | key | `--algorithm curve25519` (OpenPGP default) | `--algorithm p256` (PIV default) | `--algorithm p384` (PIV only) |
+|---|---|---|---|---|
+| OpenPGP | primary, signing, authentication | EdDSA on Ed25519 | ECDSA on P-256 | refused |
+| OpenPGP | decryption | ECDH on Curve25519 | ECDH on P-256 (SHA-256, AES-128 KDF) | refused |
+| PIV | root CA, issuing CA, 9A, 9C, 9E | Ed25519 | ECDSA P-256 | ECDSA P-384, SHA-384 signatures |
+| PIV | 9D and retired generations | X25519 | ECDH P-256 | ECDH P-384 |
+
+Card support decides which algorithm a deployment can use: every YubiKey 5 takes both curves
+for OpenPGP and P-256 and P-384 for PIV (as does a YubiKey 4), and firmware 5.7 adds Ed25519
+and X25519 PIV keys; Nitrokey's opcard takes both for OpenPGP, and the trussed PIV app takes
+all three as it runs in CI. P-384 exists for PIV consumers that insist on it, such as a
+binary cache signing key; the OpenPGP backend refuses it. The `--legacy` OpenPGP scheme
+predates the segment and only ever derived Curve25519 keys, so it refuses `--algorithm`.
 
 **The subkey id is public.** It ends up in the labels and, once recorded in a certificate,
 in the certificate too, so treat it as a name rather than a secret. Use it to say *which card*
@@ -107,6 +136,17 @@ patched `sequoia-openpgp` saves by dropping its per-signature salt notation (abo
 see [below](#the-forked-sequoia-openpgp)). The trade is deliberate: the salt was random
 padding, the notation is load bearing, and the certificate stays comfortably within QR code
 capacity.
+
+## P-384 scalars
+
+One argon2id output is 256 bits and a P-384 secret scalar takes 384, so a P-384 key is
+assembled from two outputs. With `A = argon2id(parent, "key:<name>:p384")` and
+`B = argon2id(A, "key:p384-extend")`, the scalar is the 48 big-endian bytes `A || B[0..16]`.
+Like every NIST scalar it has to lie in `[1, n-1]`; a candidate outside is rejected and `A`
+moves on to `argon2id(A, "key:p384-retry")` before the extension is taken again. `n` begins
+with 192 one bits, so a rejection is a 2^-190 event that only keeps the definition total.
+`B` adds width, not entropy: the key is as strong as the 256-bit `A`, which is already
+beyond what P-384 itself offers (192 bits).
 
 ## The forked `sequoia-openpgp`
 

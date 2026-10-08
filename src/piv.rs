@@ -1,17 +1,19 @@
-//! The PIV backend: a P-256 X.509 chain from seeds, and uploads to YubiKeys.
+//! The PIV backend: an X.509 chain from seeds, and uploads to YubiKeys.
 //!
 //! [`SeededSmartcard`] derives a root certificate authority, an optional issuing authority
-//! and the four slot keys (9A, 9C, 9D, 9E), issues the chain with RFC 6979 deterministic
-//! ECDSA so re-runs are byte-identical, and writes keys, certificates, identifiers and
-//! per-slot policies to the card through the `yubikey` crate. The chain layout and its
-//! constraints are documented in the certificates chapter,
+//! and the four slot keys (9A, 9C, 9D, 9E) on NIST P-256, on NIST P-384 with
+//! [`Algorithm::P384`] or, with [`Algorithm::Curve25519`], as Ed25519 and X25519 keys. The
+//! chain is signed with RFC 6979 deterministic ECDSA or pure Ed25519 so re-runs are
+//! byte-identical, and keys, certificates, identifiers and per-slot policies are written to
+//! the card through the `yubikey` crate. The chain layout and its constraints are documented
+//! in the certificates chapter,
 //! <https://gliology.github.io/mind-the-gap/piv-certificates.html>.
 
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
 use crate::common;
-use crate::seed::{self, Seed256, Seed256Derive};
+use crate::seed::{self, Algorithm, Seed256, Seed256Derive};
 
 use anyhow::{Result, anyhow, bail};
 
@@ -27,6 +29,8 @@ use cms::content_info::ContentInfo;
 
 use p256::ecdsa::{DerSignature, SigningKey};
 
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+
 use x509_cert::builder::profile::BuilderProfile;
 use x509_cert::builder::{Builder, CertificateBuilder};
 use x509_cert::der::oid::db::rfc5280::{ID_KP_CLIENT_AUTH, ID_KP_EMAIL_PROTECTION};
@@ -41,12 +45,14 @@ use x509_cert::serial_number::SerialNumber;
 use x509_cert::time::{Time, Validity};
 use x509_cert::{Certificate as X509Certificate, PkiPath, TbsCertificate};
 
-use der::asn1::Ia5String;
+use der::asn1::{BitString, Ia5String};
 use der::flagset::FlagSet;
 use der::{Encode, EncodePem};
 
 use sha2::{Digest, Sha256};
-use spki::{ObjectIdentifier, SubjectPublicKeyInfoOwned, SubjectPublicKeyInfoRef};
+use spki::{
+    AlgorithmIdentifierOwned, ObjectIdentifier, SubjectPublicKeyInfoOwned, SubjectPublicKeyInfoRef,
+};
 use zeroize::Zeroizing;
 
 /// Configuration of key slots to be generated and uploaded.
@@ -72,6 +78,12 @@ const DEFAULT_KEY_SLOTS: [(SlotId, SlotRole, PinPolicy, TouchPolicy); 4] = [
 /// Dummy pin used to lock card
 const DUMMY_PIN: [u8; 8] = [0xff; 8];
 
+/// The factory management key of every PIV card in the Yubico ecosystem, whatever its
+/// algorithm
+const DEFAULT_MANAGEMENT_KEY: [u8; 24] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8,
+];
+
 /// Derivation name for the root certificate authority key
 const NAME_ROOT_CA: &str = "root-ca";
 
@@ -95,6 +107,22 @@ const NAME_CHUID_ID: &str = "chuid";
 
 /// Derivation name for the CCC card identifier
 const NAME_CCC_ID: &str = "ccc";
+
+/// Role a slot plays, by which its key is derived and its algorithm chosen
+///
+/// A retired slot holds a superseded key management key, so it plays that role.
+fn slot_role(slot: SlotId) -> SlotRole {
+    match slot {
+        SlotId::Retired(_) => SlotRole::KeyManagement,
+        other => {
+            DEFAULT_KEY_SLOTS
+                .iter()
+                .find(|(candidate, ..)| *candidate == other)
+                .expect("slot is one of DEFAULT_KEY_SLOTS")
+                .1
+        }
+    }
+}
 
 /// Derivation name for a slot's key, by the *role* it plays rather than where it sits
 ///
@@ -139,12 +167,6 @@ const CCC_TEMPLATE: [u8; CccId::BYTE_SIZE] = [
 
 /// Offset of the 14-byte card identifier within [`CCC_TEMPLATE`]
 const CCC_ID_OFFSET: usize = 9;
-
-/// Maximum number of re-derivations while searching for a valid P-256 scalar.
-///
-/// A rejection happens with probability of roughly 2^-32 per draw, so in practice the first
-/// candidate is always accepted; the bound merely keeps the function total.
-const MAX_SCALAR_TRIES: usize = 8;
 
 /// `id-PIV-cardAuth` -- NIST SP 800-73-4 Part 1, Appendix B.
 ///
@@ -392,6 +414,24 @@ impl SlotRole {
     fn is_user_bound(&self) -> bool {
         *self != SlotRole::CardAuthentication
     }
+
+    /// Label segment of this role's key under `algorithm`: key management agrees, the rest sign
+    fn algorithm_segment(&self, algorithm: Algorithm) -> &'static str {
+        match self {
+            SlotRole::KeyManagement => algorithm.agreement_segment(),
+            _ => algorithm.signing_segment(),
+        }
+    }
+
+    /// The card algorithm this role's key takes when the chain is derived with `algorithm`
+    fn card_algorithm(&self, algorithm: Algorithm) -> AlgorithmId {
+        match (algorithm, self) {
+            (Algorithm::P256, _) => AlgorithmId::EccP256,
+            (Algorithm::P384, _) => AlgorithmId::EccP384,
+            (Algorithm::Curve25519, SlotRole::KeyManagement) => AlgorithmId::X25519,
+            (Algorithm::Curve25519, _) => AlgorithmId::Ed25519,
+        }
+    }
 }
 
 /// Distinguished name attributes shared by every tier of the chain
@@ -553,30 +593,147 @@ impl CertChain {
     }
 }
 
-/// Derive a *valid* P-256 secret scalar, re-deriving deterministically on rejection.
-///
-/// A uniform 256-bit string is only a valid NIST P-256 private key when it lies in
-/// `[1, n-1]`; `SecretKey::from_bytes` performs exactly that range and zero check.
-fn derive_p256_scalar(parent: &Seed256, path: Option<&[u8]>) -> Result<Zeroizing<Seed256>> {
-    let mut candidate = parent.derive(path);
-
-    for _ in 0..MAX_SCALAR_TRIES {
-        // `into()` hands p256 a transient `FieldBytes` copy that is beyond our wiping
-        if p256::SecretKey::from_bytes(&(*candidate).into()).is_ok() {
-            return Ok(candidate);
-        }
-
-        log::warn!("Derived scalar outside the P-256 group order, re-deriving");
-        candidate = candidate.key("p256-retry");
-    }
-
-    bail!("Failed to derive a valid P-256 scalar")
+/// A certificate authority's signing key, in whichever algorithm the chain is built
+enum IssuerKey {
+    P256(SigningKey),
+    P384(p384::ecdsa::SigningKey),
+    Ed25519(ed25519_dalek::SigningKey),
 }
 
-/// Derive a P-256 signing key from a seed
-fn derive_p256_key(parent: &Seed256, path: Option<&[u8]>) -> Result<SigningKey> {
-    let bytes = derive_p256_scalar(parent, path)?;
-    SigningKey::from_bytes(&(*bytes).into()).map_err(|err| anyhow!("Invalid P-256 scalar: {err}"))
+impl IssuerKey {
+    /// Derive the authority key for `name` under `parent`
+    fn derive(parent: &Seed256, name: &str, algorithm: Algorithm) -> Result<Self> {
+        let label = seed::algorithm_label(name, algorithm.signing_segment());
+        match algorithm {
+            Algorithm::P256 => {
+                let bytes = seed::derive_p256_scalar(parent, Some(&label))?;
+                SigningKey::from_bytes(&(*bytes).into())
+                    .map(IssuerKey::P256)
+                    .map_err(|err| anyhow!("Invalid P-256 scalar: {err}"))
+            }
+            Algorithm::P384 => {
+                let bytes = seed::derive_p384_scalar(parent, Some(&label))?;
+                p384::ecdsa::SigningKey::from_slice(&bytes)
+                    .map(IssuerKey::P384)
+                    .map_err(|err| anyhow!("Invalid P-384 scalar: {err}"))
+            }
+            // Any 32 bytes are an Ed25519 seed, so no rejection sampling here
+            Algorithm::Curve25519 => Ok(IssuerKey::Ed25519(ed25519_dalek::SigningKey::from_bytes(
+                &parent.derive(Some(&label)),
+            ))),
+        }
+    }
+
+    /// The public half, as it goes into the authority's own certificate
+    fn spki(&self) -> Result<SubjectPublicKeyInfoOwned> {
+        Ok(match self {
+            IssuerKey::P256(key) => SubjectPublicKeyInfoOwned::from_key(key.verifying_key())?,
+            IssuerKey::P384(key) => SubjectPublicKeyInfoOwned::from_key(key.verifying_key())?,
+            IssuerKey::Ed25519(key) => SubjectPublicKeyInfoOwned::from_key(&key.verifying_key())?,
+        })
+    }
+}
+
+/// A slot's private key: the raw bytes the card imports, and the algorithm they are for
+///
+/// The bytes are a vector because their width follows the algorithm: 48 for a P-384
+/// scalar, 32 for everything else.
+struct SlotKey {
+    algorithm: AlgorithmId,
+    bytes: Zeroizing<Vec<u8>>,
+}
+
+impl SlotKey {
+    /// Derive the key for `role` under `parent` and `label`
+    fn derive(
+        parent: &Seed256,
+        label: &[u8],
+        role: SlotRole,
+        algorithm: Algorithm,
+    ) -> Result<Self> {
+        let algorithm = role.card_algorithm(algorithm);
+        let bytes = match algorithm {
+            AlgorithmId::EccP256 => {
+                Zeroizing::new(seed::derive_p256_scalar(parent, Some(label))?.to_vec())
+            }
+            AlgorithmId::EccP384 => seed::derive_p384_scalar(parent, Some(label))?,
+            // Ed25519 takes any 32 bytes as its seed, X25519 clamps on use; the card does
+            // the same with the very same bytes, so neither needs rejection sampling
+            _ => Zeroizing::new(parent.derive(Some(label)).to_vec()),
+        };
+
+        Ok(SlotKey { algorithm, bytes })
+    }
+
+    /// The public half, encoded exactly as the card reports it through `GET METADATA`
+    ///
+    /// That equality is what `upload` and `check` compare on, byte for byte. The X25519
+    /// encoding is spelled out because `x25519-dalek` has no SPKI support: RFC 8410 gives
+    /// the algorithm no parameters and the raw 32-byte point as the subject key.
+    fn spki(&self) -> Result<SubjectPublicKeyInfoOwned> {
+        Ok(match self.algorithm {
+            AlgorithmId::EccP256 => {
+                let key = SigningKey::from_slice(&self.bytes)
+                    .map_err(|err| anyhow!("Invalid P-256 scalar: {err}"))?;
+                SubjectPublicKeyInfoOwned::from_key(key.verifying_key())?
+            }
+            AlgorithmId::EccP384 => {
+                let key = p384::ecdsa::SigningKey::from_slice(&self.bytes)
+                    .map_err(|err| anyhow!("Invalid P-384 scalar: {err}"))?;
+                SubjectPublicKeyInfoOwned::from_key(key.verifying_key())?
+            }
+            AlgorithmId::Ed25519 => SubjectPublicKeyInfoOwned::from_key(
+                &ed25519_dalek::SigningKey::from_bytes(&*self.seed()?).verifying_key(),
+            )?,
+            AlgorithmId::X25519 => SubjectPublicKeyInfoOwned {
+                algorithm: AlgorithmIdentifierOwned { oid: piv::OID_X25519, parameters: None },
+                subject_public_key: BitString::from_bytes(
+                    X25519PublicKey::from(&StaticSecret::from(*self.seed()?)).as_bytes(),
+                )?,
+            },
+            other => bail!("{other:?} is not a slot key algorithm this backend derives"),
+        })
+    }
+
+    /// The bytes as the 32-byte seed the Curve25519 keys take
+    fn seed(&self) -> Result<Zeroizing<Seed256>> {
+        let mut seed = Zeroizing::new([0u8; 32]);
+        if self.bytes.len() != seed.len() {
+            bail!("{:?} key is {} bytes, not 32", self.algorithm, self.bytes.len());
+        }
+        seed.copy_from_slice(&self.bytes);
+        Ok(seed)
+    }
+
+    /// Import this key into `slot`, with the card's own import for its algorithm family
+    fn import(
+        &self,
+        token: &mut YubiKey,
+        slot: SlotId,
+        touch_policy: TouchPolicy,
+        pin_policy: PinPolicy,
+    ) -> Result<()> {
+        match self.algorithm {
+            AlgorithmId::EccP256 | AlgorithmId::EccP384 => piv::import_ecc_key(
+                token,
+                slot,
+                self.algorithm,
+                &self.bytes,
+                touch_policy,
+                pin_policy,
+            )?,
+            _ => piv::import_cv_key(
+                token,
+                slot,
+                self.algorithm,
+                &self.bytes,
+                touch_policy,
+                pin_policy,
+            )?,
+        }
+
+        Ok(())
+    }
 }
 
 /// Serial number from the last 20 bytes of the subject public key fingerprint.
@@ -600,27 +757,33 @@ fn issue<P: BuilderProfile>(
     profile: P,
     validity: Validity,
     subject_pki: SubjectPublicKeyInfoOwned,
-    issuer: &SigningKey,
+    issuer: &IssuerKey,
 ) -> Result<X509Certificate> {
     let serial = serial_for(&subject_pki)?;
     let builder = CertificateBuilder::new(profile, serial, validity, subject_pki)?;
 
     // The explicit signature type is required: SigningKey implements Signer for more than
     // one signature representation. Deliberately `build`, not `build_with_rng`: ECDSA here
-    // uses RFC 6979 deterministic nonces, which is what makes the output reproducible.
-    Ok(builder.build::<_, DerSignature>(issuer)?)
+    // uses RFC 6979 deterministic nonces and Ed25519 is deterministic by construction,
+    // which is what makes the output reproducible.
+    Ok(match issuer {
+        IssuerKey::P256(key) => builder.build::<_, DerSignature>(key)?,
+        IssuerKey::P384(key) => builder.build::<_, p384::ecdsa::DerSignature>(key)?,
+        IssuerKey::Ed25519(key) => builder.build::<_, ed25519_dalek::Signature>(key)?,
+    })
 }
 
-/// Config to create a P-256 PIV certificate chain
+/// Config to create a PIV certificate chain
 pub struct SeededSmartcard {
-    /// Seed used for the root certificate authority key
-    primary: Zeroizing<Seed256>,
-
-    /// Application seed every generation's subseed descends from
+    /// Application seed the root authority and every generation's subseed descend from
     ///
-    /// Kept so that a *previous* generation can be re-derived for archival, which is the one
-    /// place this card needs a subseed other than its own.
+    /// The root authority is a *sibling* of the subseeds, not their parent: were it the
+    /// parent, anyone holding the authority key could re-derive every slot key. Kept so
+    /// that a *previous* generation can be re-derived for archival, too.
     root: Zeroizing<Seed256>,
+
+    /// Algorithm every asymmetric key in the chain is derived with
+    algorithm: Algorithm,
 
     /// Seed used for the issuing authority, management key and all slot keys
     subseed: Zeroizing<Seed256>,
@@ -653,8 +816,6 @@ pub struct SeededSmartcard {
     /// Whether to insert an intermediate issuing certificate authority
     intermediate: bool,
 
-    /// Override for the derived card identifier used in the slot 9E subject
-
     /// Override for the per-slot pin policy, ignored for slot 9E
     pin_policy: Option<PinPolicy>,
 
@@ -671,10 +832,7 @@ impl SeededSmartcard {
         // Derive application specific root seed
         let root = seed.app("piv");
 
-        // Derive seed for the root authority and everything below the subkey id. The root
-        // authority is a *sibling* of the subseed, not its parent: were it the parent (as it
-        // used to be), anyone holding the authority key could re-derive every slot key.
-        let primary = root.key(NAME_ROOT_CA);
+        // Derive everything below the subkey id
         let subseed = root.sub(subkey.as_deref());
 
         // What the subseed would have been with no subkey id at all. Identical to `subseed`
@@ -682,8 +840,8 @@ impl SeededSmartcard {
         let shared_seed = root.sub(None);
 
         SeededSmartcard {
-            primary,
             root,
+            algorithm: Algorithm::P256,
             subseed,
             shared_seed,
             retired: vec![],
@@ -704,6 +862,15 @@ impl SeededSmartcard {
     /// Set the pin to install on the card in place of the PIV default
     pub fn with_pin(mut self, pin: Zeroizing<String>) -> Self {
         self.pin = Some(pin);
+        self
+    }
+
+    /// Derive the whole chain with `algorithm`, authorities included
+    ///
+    /// Every algorithm derives under its own labels, so switching a card between algorithms shares
+    /// no key material between the two chains.
+    pub fn with_algorithm(mut self, algorithm: Algorithm) -> Self {
+        self.algorithm = algorithm;
         self
     }
 
@@ -759,6 +926,8 @@ impl SeededSmartcard {
     /// that generation's subseed under the very same label the live 9D key uses. Deriving it
     /// by role rather than by slot is what lets an archived key be re-derived at all.
     fn key_source(&self, slot: SlotId) -> Result<(Zeroizing<Seed256>, Vec<u8>)> {
+        let segment = slot_role(slot).algorithm_segment(self.algorithm);
+
         if let SlotId::Retired(retired) = slot {
             let index = usize::from(u8::from(retired).saturating_sub(FIRST_RETIRED_SLOT));
             let generation = self
@@ -768,12 +937,18 @@ impl SeededSmartcard {
 
             return Ok((
                 self.root.sub(Some(generation)),
-                seed::label(seed::PREFIX_KEY, NAME_KEY_MANAGEMENT),
+                seed::algorithm_label(NAME_KEY_MANAGEMENT, segment),
             ));
         }
 
         // A deliberate copy of the slot's parent seed, wiped when the caller is done with it
-        Ok((Zeroizing::new(*self.seed_for(slot)), seed::label(seed::PREFIX_KEY, slot_name(slot))))
+        Ok((Zeroizing::new(*self.seed_for(slot)), seed::algorithm_label(slot_name(slot), segment)))
+    }
+
+    /// The private key a slot holds, derived the same way whether it is certified or imported
+    fn slot_key(&self, slot: SlotId) -> Result<SlotKey> {
+        let (seed, label) = self.key_source(slot)?;
+        SlotKey::derive(&seed, &label, slot_role(slot), self.algorithm)
     }
 
     /// Slot each archived generation is written to, newest first from 0x82
@@ -1114,7 +1289,7 @@ impl SeededSmartcard {
     /// Derive the whole chain from the seed, without touching a card
     fn generate_chain(&self) -> Result<CertChain> {
         // Root authority: self-signed trust anchor
-        let root_key = derive_p256_key(&self.primary, None)?;
+        let root_key = IssuerKey::derive(&self.root, NAME_ROOT_CA, self.algorithm)?;
         let root_dn = self.identity.root_dn()?;
         let root = issue(
             PivRootCa {
@@ -1122,21 +1297,18 @@ impl SeededSmartcard {
                 path_len: if self.intermediate { 1 } else { 0 },
             },
             self.ca_validity()?,
-            SubjectPublicKeyInfoOwned::from_key(root_key.verifying_key())?,
+            root_key.spki()?,
             &root_key,
         )?;
 
         // Optional issuing authority, scoped to this subkey generation
         let issuing = if self.intermediate {
-            let key = derive_p256_key(
-                &self.subseed,
-                Some(&seed::label(seed::PREFIX_KEY, NAME_ISSUING_CA)),
-            )?;
+            let key = IssuerKey::derive(&self.subseed, NAME_ISSUING_CA, self.algorithm)?;
             let subject = self.identity.issuing_dn(self.subkey.as_deref())?;
             let cert = issue(
                 PivIssuingCa { subject, issuer: root_dn.clone() },
                 self.ca_validity()?,
-                SubjectPublicKeyInfoOwned::from_key(key.verifying_key())?,
+                key.spki()?,
                 &root_key,
             )?;
             Some((key, cert))
@@ -1168,8 +1340,7 @@ impl SeededSmartcard {
 
         let mut leaves = Vec::with_capacity(plan.len());
         for (slot, role, generation) in plan {
-            let (seed, label) = self.key_source(slot)?;
-            let key = derive_p256_key(&seed, Some(&label))?;
+            let key = self.slot_key(slot)?;
 
             let profile = PivLeaf {
                 // An archived key is qualified by the generation it came from rather than the
@@ -1188,12 +1359,7 @@ impl SeededSmartcard {
                 },
             };
 
-            let cert = issue(
-                profile,
-                validity,
-                SubjectPublicKeyInfoOwned::from_key(key.verifying_key())?,
-                issuer_key,
-            )?;
+            let cert = issue(profile, validity, key.spki()?, issuer_key)?;
 
             leaves.push((slot, cert));
         }
@@ -1255,8 +1421,11 @@ impl SeededSmartcard {
         log::info!("Resetting smart card");
         token.reset_device()?;
 
-        // Authenticate with default key
-        token.authenticate(&MgmKey::get_default(token)?)?;
+        // Authenticate with the default key in whatever algorithm the reset installed: the
+        // firmware version table behind `MgmKey::get_default` only knows YubiKeys
+        let algorithm = MgmAlgorithmId::current(token)?;
+        let default = MgmKey::from_bytes(DEFAULT_MANAGEMENT_KEY, Some(algorithm))?;
+        token.authenticate(&default)?;
 
         // Install our management key, but *without* the touch requirement for now.
         //
@@ -1289,20 +1458,12 @@ impl SeededSmartcard {
         for (slot, cert) in &chain.leaves {
             log::info!("Generating and uploading {:?} subkey", slot);
 
-            // The very same rejection sampled bytes have to reach the card, otherwise the
-            // on-card key and the key we just certified would diverge.
-            let (seed, label) = self.key_source(*slot)?;
-            let bytes = derive_p256_scalar(&seed, Some(&label))?;
+            // The very same derived bytes have to reach the card, otherwise the on-card key
+            // and the key we just certified would diverge.
+            let key = self.slot_key(*slot)?;
             let (pin_policy, touch_policy) = self.policies_for(*slot);
 
-            piv::import_ecc_key(
-                token,
-                *slot,
-                AlgorithmId::EccP256,
-                &*bytes,
-                touch_policy,
-                pin_policy,
-            )?;
+            key.import(token, *slot, touch_policy, pin_policy)?;
 
             // Invariant: the card has to hold the key we certified
             let on_card = piv::metadata(token, *slot)?

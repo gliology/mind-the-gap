@@ -12,6 +12,7 @@ use crate::pgp::{self, CertificateKind, VerificationKind};
 use crate::piv;
 use crate::prompt;
 use crate::qr;
+use crate::seed::Algorithm;
 
 use std::{path::PathBuf, time::Duration};
 
@@ -132,6 +133,10 @@ enum Backend {
         #[arg(long, global = true, env = "MIND_THE_LEGACY")]
         legacy: bool,
 
+        /// Algorithm to derive every key with (Curve25519 by default; p384 is PIV-only)
+        #[arg(long, value_enum, global = true, env = "MIND_THE_ALGORITHM")]
+        algorithm: Option<Algorithm>,
+
         #[command(subcommand)]
         command: PGPCommand,
     },
@@ -186,6 +191,10 @@ enum Backend {
         /// Do not store the certificate authorities in the card's msroots object
         #[arg(long, global = true, env = "MIND_THE_NO_MSROOTS")]
         no_msroots: bool,
+
+        /// Algorithm to derive every key with, authorities included (P-256 by default)
+        #[arg(long, value_enum, global = true, env = "MIND_THE_ALGORITHM")]
+        algorithm: Option<Algorithm>,
 
         #[command(subcommand)]
         command: PIVCommand,
@@ -708,6 +717,7 @@ struct Stickies {
     country: Option<String>,
     pin_policy: Option<piv::PinPolicyArg>,
     touch_policy: Option<piv::TouchPolicyArg>,
+    algorithm: Option<Algorithm>,
 }
 
 /// Per-command overrides of the session's non-secret identity fields
@@ -837,9 +847,11 @@ fn dispatch(backend: Backend, identity: Identity) -> Result<()> {
         // minted seed, which lives on paper now, while the session path adopts it
         Backend::Generate => generate().map(|_| ()),
         // ... then command
-        Backend::PGP { date, subdate, validity, shared, legacy, command } => {
-            run_pgp(identity, PGPOptions { date, subdate, validity, shared, legacy }, command)
-        }
+        Backend::PGP { date, subdate, validity, shared, legacy, algorithm, command } => run_pgp(
+            identity,
+            PGPOptions { date, subdate, validity, shared, legacy, algorithm },
+            command,
+        ),
         // ... then command
         Backend::PIV {
             date,
@@ -853,6 +865,7 @@ fn dispatch(backend: Backend, identity: Identity) -> Result<()> {
             pin_policy,
             touch_policy,
             no_msroots,
+            algorithm,
             command,
         } => run_piv(
             identity,
@@ -868,6 +881,7 @@ fn dispatch(backend: Backend, identity: Identity) -> Result<()> {
                 pin_policy,
                 touch_policy,
                 no_msroots,
+                algorithm,
             },
             command,
         ),
@@ -918,7 +932,7 @@ enum ReplCommand {
     #[command(group = ArgGroup::new("fields").required(true).multiple(true)
         .args(["subkey", "name", "emails", "date", "validity", "shared_pgp",
                "shared_piv", "legacy", "intermediate", "no_msroots", "org", "unit",
-               "country", "pin_policy", "touch_policy"]))]
+               "country", "pin_policy", "touch_policy", "algorithm"]))]
     Set {
         /// New session subkey id
         #[arg(short = 'k', long)]
@@ -979,6 +993,10 @@ enum ReplCommand {
         /// Default per-slot touch policy for PIV uploads
         #[arg(long, value_enum)]
         touch_policy: Option<piv::TouchPolicyArg>,
+
+        /// Default algorithm for both backends
+        #[arg(long, value_enum)]
+        algorithm: Option<Algorithm>,
     },
 
     /// Reopen the one-time password question; the derived identifiers change with it
@@ -1110,13 +1128,14 @@ fn ask_password_again(session: &mut Session) -> Result<()> {
 /// A line's own value always wins; the stored default only covers what was left out.
 fn merge_defaults(backend: &mut Backend, d: &Stickies) {
     match backend {
-        Backend::PGP { date, validity, shared, legacy, .. } => {
+        Backend::PGP { date, validity, shared, legacy, algorithm, .. } => {
             *date = date.or(d.date);
             *validity = validity.or(d.validity);
             if shared.is_empty() {
                 shared.clone_from(&d.shared_pgp);
             }
             *legacy |= d.legacy;
+            *algorithm = algorithm.or(d.algorithm);
         }
         Backend::PIV {
             date,
@@ -1129,6 +1148,7 @@ fn merge_defaults(backend: &mut Backend, d: &Stickies) {
             pin_policy,
             touch_policy,
             no_msroots,
+            algorithm,
             ..
         } => {
             *date = date.or(d.date);
@@ -1149,6 +1169,7 @@ fn merge_defaults(backend: &mut Backend, d: &Stickies) {
             }
             *pin_policy = pin_policy.or(d.pin_policy);
             *touch_policy = touch_policy.or(d.touch_policy);
+            *algorithm = algorithm.or(d.algorithm);
         }
         Backend::Generate => {}
     }
@@ -1297,6 +1318,9 @@ fn handle_line(session: &mut Session, line: &str) -> Result<Flow> {
             if let Some(policy) = d.touch_policy {
                 stored.push(format!("touch-policy={policy:?}"));
             }
+            if let Some(algorithm) = d.algorithm {
+                stored.push(format!("algorithm={algorithm:?}"));
+            }
             show("defaults", (!stored.is_empty()).then(|| stored.join(", ")).as_deref());
             Ok(())
         }
@@ -1316,6 +1340,7 @@ fn handle_line(session: &mut Session, line: &str) -> Result<Flow> {
             country,
             pin_policy,
             touch_policy,
+            algorithm,
         } => {
             if let Some(subkey) = subkey {
                 session.subkey = Some(subkey);
@@ -1343,6 +1368,7 @@ fn handle_line(session: &mut Session, line: &str) -> Result<Flow> {
             d.country = country.or(d.country.take());
             d.pin_policy = pin_policy.or(d.pin_policy);
             d.touch_policy = touch_policy.or(d.touch_policy);
+            d.algorithm = algorithm.or(d.algorithm);
             Ok(())
         }
         ReplCommand::Password => ask_password_again(session),
@@ -1400,6 +1426,7 @@ struct PGPOptions {
     validity: Option<Duration>,
     shared: Vec<pgp::SharedKey>,
     legacy: bool,
+    algorithm: Option<Algorithm>,
 }
 
 /// The PIV backend's certificate options, as parsed
@@ -1415,12 +1442,13 @@ struct PIVOptions {
     pin_policy: Option<piv::PinPolicyArg>,
     touch_policy: Option<piv::TouchPolicyArg>,
     no_msroots: bool,
+    algorithm: Option<Algorithm>,
 }
 
 /// Run one PGP subcommand, assembling the certificate builder on demand
 fn run_pgp(identity: Identity, options: PGPOptions, command: PGPCommand) -> Result<()> {
     let Identity { seed, subkey, name, emails } = identity;
-    let PGPOptions { date, subdate, validity, shared, legacy } = options;
+    let PGPOptions { date, subdate, validity, shared, legacy, algorithm } = options;
 
     // Built lazily, so a command that needs no builder -- status today, anything later --
     // simply never calls it; the closure moves the identity in and can run at most once
@@ -1452,6 +1480,12 @@ fn run_pgp(identity: Identity, options: PGPOptions, command: PGPCommand) -> Resu
             .as_ref()
             .expect("resolved above when the command needs a seed");
         let mut builder = pgp::SeededSmartcard::with_scheme(&seed.seed(), subkey, name, scheme);
+
+        // Applied before anything else derives: the algorithm is part of every key's label
+        if let Some(algorithm) = algorithm {
+            log::info!("Deriving {algorithm:?} keys");
+            builder = builder.with_algorithm(algorithm)?;
+        }
 
         // Add user identities
         for address in emails.into_iter() {
@@ -1685,6 +1719,7 @@ fn run_piv(identity: Identity, options: PIVOptions, command: PIVCommand) -> Resu
         pin_policy,
         touch_policy,
         no_msroots,
+        algorithm,
     } = options;
 
     // Built lazily, so a command that needs no builder -- status today, anything later --
@@ -1698,6 +1733,11 @@ fn run_piv(identity: Identity, options: PIVOptions, command: PIVCommand) -> Resu
             .as_ref()
             .expect("resolved above when the command needs a seed");
         let mut builder = piv::SeededSmartcard::new(&seed.seed(), subkey, name);
+
+        if let Some(algorithm) = algorithm {
+            log::info!("Deriving {algorithm:?} keys");
+            builder = builder.with_algorithm(algorithm);
+        }
 
         for address in emails.iter() {
             log::info!("Adding SAN for email: {}", address);

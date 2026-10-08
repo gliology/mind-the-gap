@@ -149,7 +149,9 @@ it.
 ## Prerequisites
 
 A YubiKey 5 series (or any PIV token supporting AES-256 management keys and P-256 import), a
-CCID reader, and a running `pcscd` (a socket-activated `pcscd.socket` is enough).
+CCID reader, and a running `pcscd` (a socket-activated `pcscd.socket` is enough). The
+Curve25519 run of the suite (`--ignored`, see below) additionally needs a token that imports
+Ed25519 and X25519 keys: YubiKey firmware 5.7 or later, or the patched trussed PIV app.
 
 All of the tooling is in the project's dev shell, so just:
 

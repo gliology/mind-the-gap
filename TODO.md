@@ -17,6 +17,10 @@
   issue #40): a written-containers bitmap in the persistent state (maintained in
   `ContainerStorage::save`/reset, checked in GET DATA and the key history object)
   would answer NotFound without touching external flash; propose upstream
+- Curve25519 PIV end use: the card-level suite runs on both curves in CI, but the
+  PKCS#11 steps (TLS, S/MIME, SSH, NSS) stay with the P-256 run until OpenSC's PIV driver
+  drives Ed25519 and X25519 slots; the Curve25519 hardware entry also awaits a real token
+  (YubiKey 5.7+, or the Solo 2 build on the EVK)
 - canokey-qemu (a QEMU USB device implementing PIV and OpenPGP) remains the
   transport-covering alternative to the vpcd checks
 - Solo 2: VALIDATED ON EVK HARDWARE (2026-09-30, rev 0A LPCXpresso55S69): `piv upload`

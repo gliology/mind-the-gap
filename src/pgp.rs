@@ -1,14 +1,15 @@
 //! The OpenPGP backend: certificates from seeds, and uploads to OpenPGP cards.
 //!
-//! [`SeededSmartcard`] re-derives an ed25519/cv25519 key set -- a primary plus signing,
-//! decryption and authentication subkeys -- from its seeds, and either exports it as a
-//! certificate or imports it into a card through `openpgp-card`. Determinism is the point:
+//! [`SeededSmartcard`] re-derives a key set -- a primary plus signing, decryption and
+//! authentication subkeys, Ed25519 and X25519 by default or NIST P-256 with
+//! [`Algorithm::P256`] -- from its seeds, and either exports it as a certificate or imports
+//! it into a card through `openpgp-card`. Determinism is the point:
 //! creation times default to fixed values and the patched `sequoia-openpgp` drops its
 //! per-signature salt, so the same seed reproduces the same bytes -- see the derivation
 //! chapter, <https://gliology.github.io/mind-the-gap/derivation.html>.
 
 use crate::common;
-use crate::seed::{self, Seed256, Seed256Derive};
+use crate::seed::{self, Algorithm, Seed256, Seed256Derive};
 
 use std::convert::TryFrom;
 use std::time::{Duration, SystemTime};
@@ -17,7 +18,15 @@ use anyhow::{Result, anyhow, bail};
 
 use zeroize::Zeroizing;
 
+/// Why `--algorithm p384` stops at the OpenPGP backend
+///
+/// The curve exists for PIV chains whose consumers insist on P-384. Deriving OpenPGP keys
+/// on it would add a third set of labels to a frozen scheme for no card that asked for it.
+const P384_REFUSED: &str =
+    "P-384 is a PIV-only curve: the OpenPGP backend derives on p256 or curve25519";
+
 use openpgp::cert::{Cert, CertRevocationBuilder, SubkeyRevocationBuilder};
+use openpgp::crypto::mpi::{MPI, ProtectedMPI, SecretKeyMaterial};
 use openpgp::crypto::{KeyPair, Password, mpi};
 use openpgp::fmt::hex;
 use openpgp::packet::key::Key4;
@@ -27,7 +36,8 @@ use openpgp::packet::{self, Key, UserID, key};
 use openpgp::policy::StandardPolicy;
 use openpgp::serialize::SerializeInto;
 use openpgp::types::{
-    Features, HashAlgorithm, KeyFlags, ReasonForRevocation, SignatureType, SymmetricAlgorithm,
+    Curve as PgpCurve, Features, HashAlgorithm, KeyFlags, PublicKeyAlgorithm, ReasonForRevocation,
+    SignatureType, SymmetricAlgorithm,
 };
 use openpgp::{Packet, Result as PGPResult};
 use sequoia_openpgp as openpgp;
@@ -37,7 +47,7 @@ use secrecy::SecretString;
 use card_backend_pcsc::PcscBackend;
 
 use openpgp_card::ocard::KeyType;
-use openpgp_card::ocard::algorithm::Curve;
+use openpgp_card::ocard::algorithm::Curve as CardCurve;
 use openpgp_card::ocard::crypto::{CardUploadableKey, EccKey, EccType, PrivateKeyMaterial};
 use openpgp_card::{Card, Error as CardError};
 
@@ -119,6 +129,9 @@ pub const DEFAULT_KEY_TYPES: [KeyType; 3] = [
 /// user ids for the same person. The binding signature is the only part that is genuinely per
 /// card, and it survives a merge with each subkey keeping its own.
 const NOTATION_SUBKEY: &str = "subkey@mind-the-gap.gli.al";
+
+/// Derivation name of the primary key under the current scheme
+const NAME_PRIMARY: &str = "primary";
 
 /// Which set of derivation labels to use
 ///
@@ -268,9 +281,18 @@ impl SubkeyRole {
         }
     }
 
-    /// Whether the role takes an encryption (cv25519) key rather than a signing (ed25519) one
+    /// Whether the role takes a key agreement key rather than a signing one
     fn is_encryption(self) -> bool {
         matches!(self, SubkeyRole::Decryption)
+    }
+
+    /// Label segment of this role's key under `algorithm`, see [`seed::algorithm_label`]
+    fn algorithm_segment(self, algorithm: Algorithm) -> &'static str {
+        if self.is_encryption() {
+            algorithm.agreement_segment()
+        } else {
+            algorithm.signing_segment()
+        }
     }
 
     /// The key flags the subkey is bound with
@@ -368,10 +390,18 @@ fn open_card(target: Option<String>) -> Result<Card<Open>> {
     Ok(card)
 }
 
-/// Config to create an ed25519/cv25519 user cert
+/// Config to create an OpenPGP user cert
 pub struct SeededSmartcard {
-    /// Seed used for primary key
+    /// Application seed the primary key and every subseed descend from
+    ///
+    /// Kept so that the primary can be re-derived when the algorithm changes after construction
+    root: Zeroizing<Seed256>,
+
+    /// Raw secret of the primary key, derived for `algorithm`
     seed: Zeroizing<Seed256>,
+
+    /// Algorithm every key is derived with; the legacy scheme knows only Curve25519
+    algorithm: Algorithm,
 
     /// Seed used for all subkeys
     subseed: Zeroizing<Seed256>,
@@ -430,17 +460,24 @@ impl SeededSmartcard {
         // Derive seed for primary and subkeys. `shared_seed` is what the subseed would have
         // been with no subkey id at all, which is identical to `subseed` when none was given
         // -- that is what makes `--shared` a no-op for a single card.
+        let algorithm = Algorithm::Curve25519;
         let (seed, subseed, shared_seed) = match scheme {
             Scheme::Legacy => (
                 root.derive(Some(&[0x01])),
                 root.derive(subkey.as_ref().map(|k| k.as_bytes())),
                 root.derive(None),
             ),
-            Scheme::Current => (root.key("primary"), root.sub(subkey.as_deref()), root.sub(None)),
+            Scheme::Current => (
+                root.algorithm_key(NAME_PRIMARY, algorithm.signing_segment()),
+                root.sub(subkey.as_deref()),
+                root.sub(None),
+            ),
         };
 
         SeededSmartcard {
+            root,
             seed,
+            algorithm,
             subseed,
             shared_seed,
             shared: vec![],
@@ -461,6 +498,30 @@ impl SeededSmartcard {
         self
     }
 
+    /// Derive every key with `algorithm`, the primary included
+    ///
+    /// Each algorithm derives under its own labels, so a certificate in one algorithm shares no key
+    /// material with the same seed's certificate on the other. The legacy scheme predates
+    /// the algorithm segment and only ever produced Curve25519 keys, so it refuses anything else.
+    pub fn with_algorithm(mut self, algorithm: Algorithm) -> Result<Self> {
+        if algorithm == Algorithm::P384 {
+            bail!(P384_REFUSED);
+        }
+        if self.scheme == Scheme::Legacy && algorithm != Algorithm::Curve25519 {
+            bail!(
+                "The legacy scheme derives Curve25519 keys only: drop --legacy to pick another algorithm"
+            );
+        }
+
+        self.algorithm = algorithm;
+        if self.scheme == Scheme::Current {
+            let label = seed::algorithm_label(NAME_PRIMARY, algorithm.signing_segment());
+            self.seed = self.derive_secret(&self.root, Some(&label), false)?;
+        }
+
+        Ok(self)
+    }
+
     /// Label a subkey is derived under
     ///
     /// The legacy labels are the OpenPGP key flag values themselves, which ties the derivation
@@ -469,8 +530,89 @@ impl SeededSmartcard {
     fn label_for(&self, role: SubkeyRole) -> Vec<u8> {
         match self.scheme {
             Scheme::Legacy => role.code().to_le_bytes().to_vec(),
-            Scheme::Current => seed::label(seed::PREFIX_KEY, role.name()),
+            Scheme::Current => {
+                seed::algorithm_label(role.name(), role.algorithm_segment(self.algorithm))
+            }
         }
+    }
+
+    /// Derive the raw secret of one key for the configured algorithm
+    ///
+    /// What comes out is exactly what the card imports: a valid P-256 scalar, an Ed25519
+    /// seed, or a clamped X25519 scalar (Curve25519 paper, section 3: clear bits 0, 1, 2 of
+    /// the first byte, clear bit 7 and set bit 6 of the last).
+    fn derive_secret(
+        &self,
+        parent: &Seed256,
+        label: Option<&[u8]>,
+        agreement: bool,
+    ) -> PGPResult<Zeroizing<Seed256>> {
+        match self.algorithm {
+            Algorithm::P256 => seed::derive_p256_scalar(parent, label),
+            Algorithm::P384 => bail!(P384_REFUSED),
+            Algorithm::Curve25519 => {
+                let mut bytes = parent.derive(label);
+                if agreement {
+                    bytes[0] &= 0b1111_1000;
+                    bytes[31] &= !0b1000_0000;
+                    bytes[31] |= 0b0100_0000;
+                }
+                Ok(bytes)
+            }
+        }
+    }
+
+    /// Turn a raw secret into a key of the type its role takes under the configured algorithm
+    fn secret_key<R: key::KeyRole>(
+        &self,
+        bytes: &Seed256,
+        agreement: bool,
+        time: SystemTime,
+    ) -> PGPResult<Key4<key::SecretParts, R>> {
+        match (self.algorithm, agreement) {
+            (Algorithm::Curve25519, true) => Key4::import_secret_cv25519(bytes, None, None, time),
+            (Algorithm::Curve25519, false) => Key4::import_secret_ed25519(bytes, time),
+            (Algorithm::P384, _) => bail!(P384_REFUSED),
+            (Algorithm::P256, _) => {
+                // sequoia has no P-256 import, so the packet is assembled from its parts:
+                // the uncompressed SEC1 point (0x04 || x || y) split into the MPI point
+                // encoding, and the scalar as the secret
+                let secret = p256::SecretKey::from_bytes(&(*bytes).into())?;
+                let point = secret.public_key().to_sec1_bytes();
+                let q = MPI::new_point(&point[1..33], &point[33..65], 256);
+                let scalar = ProtectedMPI::from(bytes.to_vec());
+
+                if agreement {
+                    // The KDF parameters RFC 6637 recommends for P-256 and sequoia's own
+                    // defaults, spelled out because those are not reachable from here
+                    Key4::with_secret(
+                        time,
+                        PublicKeyAlgorithm::ECDH,
+                        mpi::PublicKey::ECDH {
+                            curve: PgpCurve::NistP256,
+                            q,
+                            hash: HashAlgorithm::SHA256,
+                            sym: SymmetricAlgorithm::AES128,
+                        },
+                        SecretKeyMaterial::ECDH { scalar }.into(),
+                    )
+                } else {
+                    Key4::with_secret(
+                        time,
+                        PublicKeyAlgorithm::ECDSA,
+                        mpi::PublicKey::ECDSA { curve: PgpCurve::NistP256, q },
+                        SecretKeyMaterial::ECDSA { scalar }.into(),
+                    )
+                }
+            }
+        }
+    }
+
+    /// The primary key, re-derived from its raw secret
+    fn primary_key(&self) -> PGPResult<SecretPrimaryKey> {
+        Ok(self
+            .secret_key(&self.seed, false, self.creation_time())?
+            .into())
     }
 
     /// Admin pin for this card
@@ -750,8 +892,7 @@ impl SeededSmartcard {
     /// Helper to create primary key-based signer
     fn new_primary_signer(&self) -> PGPResult<KeyPair> {
         // Generate primary key.
-        let primary: SecretPrimaryKey =
-            Key4::import_secret_ed25519(&*self.seed, self.creation_time())?.into();
+        let primary = self.primary_key()?;
 
         let signer = primary
             .clone()
@@ -764,8 +905,7 @@ impl SeededSmartcard {
     /// Generate a primary certificate
     fn generate_primary(&self) -> PGPResult<Cert> {
         // Generate and self-sign primary key.
-        let primary: SecretPrimaryKey =
-            Key4::import_secret_ed25519(&*self.seed, self.creation_time())?.into();
+        let primary = self.primary_key()?;
 
         // Optionally encrypt the primary key copy for the certificate
         let mut primary_enc = primary.clone();
@@ -783,8 +923,7 @@ impl SeededSmartcard {
     /// Generate a self-signed primary certificate
     fn generate_signed_primary(&self) -> PGPResult<Cert> {
         // Generate and self-sign primary key.
-        let primary: SecretPrimaryKey =
-            Key4::import_secret_ed25519(&*self.seed, self.creation_time())?.into();
+        let primary = self.primary_key()?;
 
         let mut signer = primary
             .clone()
@@ -831,8 +970,7 @@ impl SeededSmartcard {
     /// Append self-signed subkeys to a primary certificate
     fn append_subkeys(&self, mut cert: Cert) -> PGPResult<Cert> {
         // Generate primary key and signer
-        let primary: SecretPrimaryKey =
-            Key4::import_secret_ed25519(&*self.seed, self.creation_time())?.into();
+        let primary = self.primary_key()?;
 
         let mut signer = primary
             .clone()
@@ -846,21 +984,12 @@ impl SeededSmartcard {
             let flags = role.flags();
 
             // Derive subkey specific seed and turn into key
-            let mut seed = self.seed_for(role).derive(Some(&self.label_for(role)));
-
-            let mut subkey: SecretSubKey =
-                if flags.for_transport_encryption() || flags.for_storage_encryption() {
-                    // Curve25519 Paper, Sec. 3:
-                    // A user can, for example, generate 32 uniform random bytes, clear bits 0, 1, 2 of the first
-                    // byte, clear bit 7 of the last byte, and set bit 6 of the last byte.
-                    seed[0] &= 0b1111_1000;
-                    seed[31] &= !0b1000_0000;
-                    seed[31] |= 0b0100_0000;
-
-                    Key4::import_secret_cv25519(&*seed, None, None, subkey_creation_time)?.into()
-                } else {
-                    Key4::import_secret_ed25519(&*seed, subkey_creation_time)?.into()
-                };
+            let agreement = role.is_encryption();
+            let seed =
+                self.derive_secret(self.seed_for(role), Some(&self.label_for(role)), agreement)?;
+            let mut subkey: SecretSubKey = self
+                .secret_key(&seed, agreement, subkey_creation_time)?
+                .into();
 
             // Sign subkey with primary
             let mut builder = SignatureBuilder::new(SignatureType::SubkeyBinding)
@@ -1096,32 +1225,39 @@ impl SeededSmartcard {
                 .map_err(|e| anyhow!("Key creation time error: {}", e))?
                 .as_secs() as u32;
 
-            // Extract public key bytes from cert MPI (0x40-prefixed for 25519 keys)
+            // Extract public key bytes from cert MPI (0x40-prefixed for 25519 keys, the
+            // uncompressed 0x04 point for P-256, which is what the card wants for both)
             let pub_bytes = match subkey.key().mpis() {
                 mpi::PublicKey::EdDSA { q, .. } => q.value().to_vec(),
+                mpi::PublicKey::ECDSA { q, .. } => q.value().to_vec(),
                 mpi::PublicKey::ECDH { q, .. } => q.value().to_vec(),
                 _ => bail!("{:?} key has unexpected algorithm in cert", kt),
             };
 
-            // Re-derive the raw private seed bytes
-            let mut seed = self.seed_for(role).derive(Some(&self.label_for(role)));
+            // Re-derive the raw private key bytes, exactly as they went into the certificate
+            let agreement = role.is_encryption();
+            let seed =
+                self.derive_secret(self.seed_for(role), Some(&self.label_for(role)), agreement)?;
 
-            // Apply Cv25519 clamping for decryption key
-            if role.is_encryption() {
-                seed[0] &= 0b1111_1000;
-                seed[31] &= !0b1000_0000;
-                seed[31] |= 0b0100_0000;
-            }
-
-            let (oid, ecc_type) = if role.is_encryption() {
-                (Curve::Curve25519.oid(), EccType::ECDH)
-            } else {
-                (Curve::Ed25519.oid(), EccType::EdDSA)
+            let (oid, ecc_type) = match (self.algorithm, agreement) {
+                (Algorithm::Curve25519, true) => (CardCurve::Curve25519.oid(), EccType::ECDH),
+                (Algorithm::Curve25519, false) => (CardCurve::Ed25519.oid(), EccType::EdDSA),
+                (Algorithm::P256, true) => (CardCurve::NistP256r1.oid(), EccType::ECDH),
+                (Algorithm::P256, false) => (CardCurve::NistP256r1.oid(), EccType::ECDSA),
+                (Algorithm::P384, _) => bail!(P384_REFUSED),
             };
+
+            // OpenPGP cards take the X25519 scalar big-endian, the way GnuPG stores it,
+            // where RFC 7748 and everything derived here is little-endian: sent as is,
+            // the card would hold a different key than the certificate advertises
+            let mut private_bytes = Zeroizing::new(seed.to_vec());
+            if matches!(self.algorithm, Algorithm::Curve25519) && agreement {
+                private_bytes.reverse();
+            }
 
             let key = RawEccKey {
                 oid,
-                private_bytes: Zeroizing::new(seed.to_vec()),
+                private_bytes,
                 public_bytes: pub_bytes,
                 ecc_type,
                 fingerprint: CardFingerprint::from(fp_bytes),
@@ -1152,8 +1288,7 @@ impl SeededSmartcard {
         let creation_time = self.creation_time();
 
         // Derive signing key
-        let primary: SecretPrimaryKey =
-            Key4::import_secret_ed25519(&*self.seed, creation_time)?.into();
+        let primary = self.primary_key()?;
 
         let mut signer = primary
             .clone()
@@ -1181,8 +1316,7 @@ impl SeededSmartcard {
 
         // A subkey is revoked by its *primary*, which is what makes this possible at all: the
         // primary is re-derivable from the seed, so a card can be retired without it present
-        let primary: SecretPrimaryKey =
-            Key4::import_secret_ed25519(&*self.seed, creation_time)?.into();
+        let primary = self.primary_key()?;
         let mut signer = primary
             .clone()
             .into_keypair()

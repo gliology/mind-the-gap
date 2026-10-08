@@ -1,4 +1,6 @@
-use mind_the_gap::seed::{Seed256, Seed256Derive, argon2id_256};
+use mind_the_gap::seed::{
+    Algorithm, Seed256, Seed256Derive, algorithm_label, argon2id_256, derive_p384_scalar, label,
+};
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD_NO_PAD;
@@ -45,4 +47,54 @@ fn argon_with_salt() {
     assert_ne!(without_salt, with_salt);
     // And the result is deterministic
     assert_eq!(with_salt, argon2id_256(DEFAULT_INPUT, Some(b"test")));
+}
+
+/// The algorithm is a label segment of its own, behind a second colon.
+#[test]
+fn algorithm_label_has_the_segment_on_its_own() {
+    assert_eq!(algorithm_label("signature", "p256"), b"key:signature:p256");
+    assert_eq!(algorithm_label("key-management", "x25519"), b"key:key-management:x25519");
+
+    // An algorithm-qualified key is a different key from the bare name, and from each other
+    let seed: Seed256 = [7u8; 32];
+    let bare = seed.derive(Some(&label("key", "signature")));
+    let p256 = seed.algorithm_key("signature", Algorithm::P256.signing_segment());
+    let ed25519 = seed.algorithm_key("signature", Algorithm::Curve25519.signing_segment());
+    assert_ne!(*bare, *p256);
+    assert_ne!(*bare, *ed25519);
+    assert_ne!(*p256, *ed25519);
+}
+
+/// Key agreement keys get their own segment name on Curve25519, signing keys theirs; P-256
+/// serves both roles under one name.
+#[test]
+fn curve_segments_name_the_algorithm() {
+    assert_eq!(Algorithm::P256.signing_segment(), "p256");
+    assert_eq!(Algorithm::P256.agreement_segment(), "p256");
+    assert_eq!(Algorithm::P384.signing_segment(), "p384");
+    assert_eq!(Algorithm::P384.agreement_segment(), "p384");
+    assert_eq!(Algorithm::Curve25519.signing_segment(), "ed25519");
+    assert_eq!(Algorithm::Curve25519.agreement_segment(), "x25519");
+}
+
+/// A P-384 scalar is 48 bytes, reproducible, and laid out exactly as the derivation chapter
+/// documents: the labelled argon2id output, then 16 bytes of its `key:p384-extend` child.
+#[test]
+fn p384_scalar_is_the_documented_construction() {
+    let path = algorithm_label("signature", "p384");
+    let scalar = derive_p384_scalar(&SEED, Some(&path)).unwrap();
+
+    assert_eq!(scalar.len(), 48);
+    assert_eq!(*scalar, *derive_p384_scalar(&SEED, Some(&path)).unwrap());
+
+    let first = SEED.derive(Some(&path));
+    let second = first.key("p384-extend");
+    assert_eq!(&scalar[..32], &first[..]);
+    assert_eq!(&scalar[32..], &second[..16]);
+
+    // A valid key, and a different one under a different label
+    assert!(p384::SecretKey::from_slice(&scalar).is_ok());
+    let other =
+        derive_p384_scalar(&SEED, Some(&algorithm_label("authentication", "p384"))).unwrap();
+    assert_ne!(*scalar, *other);
 }

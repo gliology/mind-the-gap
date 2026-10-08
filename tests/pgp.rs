@@ -1,11 +1,14 @@
 use mind_the_gap::pgp::{CertificateKind, Scheme, SeededSmartcard, SharedKey, VerificationKind};
-use mind_the_gap::seed::Seed256;
+use mind_the_gap::seed::{Algorithm, Seed256};
 
 use sequoia_openpgp::crypto::Signer;
+use sequoia_openpgp::crypto::mpi;
 use sequoia_openpgp::parse::Parse;
 use sequoia_openpgp::policy::StandardPolicy;
 use sequoia_openpgp::serialize::SerializeInto;
-use sequoia_openpgp::types::{HashAlgorithm, PublicKeyAlgorithm, SignatureType};
+use sequoia_openpgp::types::{
+    Curve as PgpCurve, HashAlgorithm, PublicKeyAlgorithm, SignatureType, SymmetricAlgorithm,
+};
 use sequoia_openpgp::{Cert, Packet};
 
 use std::time::{Duration, SystemTime};
@@ -197,6 +200,119 @@ fn certify_primary_uses_ed25519() {
         .certify(CertificateKind::default())
         .unwrap();
     assert_eq!(cert.primary_key().key().pk_algo(), PublicKeyAlgorithm::EdDSA);
+}
+
+/// `--algorithm p256` switches the whole certificate: ECDSA primary, signing and authentication
+/// subkeys, an ECDH decryption subkey, all on NIST P-256 with the RFC 6637 KDF parameters.
+#[test]
+fn p256_certificate_is_ecdsa_and_ecdh_throughout() {
+    let cert = builder(&SEED_A, "Alice", "alice@example.com")
+        .with_algorithm(Algorithm::P256)
+        .unwrap()
+        .certify(CertificateKind::default())
+        .unwrap();
+
+    assert_eq!(cert.primary_key().key().pk_algo(), PublicKeyAlgorithm::ECDSA);
+    match cert.primary_key().key().mpis() {
+        mpi::PublicKey::ECDSA { curve, .. } => assert_eq!(*curve, PgpCurve::NistP256),
+        other => panic!("primary key is not an ECDSA key: {other:?}"),
+    }
+
+    let policy = StandardPolicy::new();
+    let vc = cert.with_policy(&policy, None).unwrap();
+    assert_eq!(vc.keys().subkeys().count(), 3);
+
+    for ka in vc.keys().subkeys() {
+        let flags = ka.key_flags().unwrap();
+        match ka.key().mpis() {
+            mpi::PublicKey::ECDH { curve, hash, sym, .. } => {
+                assert!(flags.for_transport_encryption(), "ECDH on a non-encryption subkey");
+                assert_eq!(*curve, PgpCurve::NistP256);
+                assert_eq!(*hash, HashAlgorithm::SHA256, "KDF hash is not the RFC 6637 one");
+                assert_eq!(*sym, SymmetricAlgorithm::AES128, "KDF cipher is not the RFC 6637 one");
+            }
+            mpi::PublicKey::ECDSA { curve, .. } => {
+                assert!(
+                    flags.for_signing() || flags.for_authentication(),
+                    "ECDSA on the encryption subkey"
+                );
+                assert_eq!(*curve, PgpCurve::NistP256);
+            }
+            other => panic!("subkey has the wrong algorithm: {other:?}"),
+        }
+    }
+}
+
+/// A P-256 certificate is usable, not just well formed: the signing subkey signs under
+/// the policy and the certificate validates.
+#[test]
+fn p256_certificate_is_valid_under_policy() {
+    let cert = builder(&SEED_A, "Alice", "alice@example.com")
+        .with_algorithm(Algorithm::P256)
+        .unwrap()
+        .certify(CertificateKind::default())
+        .unwrap();
+    let policy = StandardPolicy::new();
+    let vc = cert.with_policy(&policy, None).unwrap();
+    assert!(vc.keys().subkeys().for_signing().next().is_some());
+    assert!(
+        vc.keys()
+            .subkeys()
+            .for_transport_encryption()
+            .next()
+            .is_some()
+    );
+    assert!(vc.keys().subkeys().for_authentication().next().is_some());
+}
+
+/// The two algorithms derive under different labels, so they never share a key.
+#[test]
+fn curves_share_no_keys() {
+    let fingerprints = |algorithm| {
+        let cert = builder(&SEED_A, "Alice", "alice@example.com")
+            .with_algorithm(algorithm)
+            .unwrap()
+            .certify(CertificateKind::default())
+            .unwrap();
+        cert.keys()
+            .map(|key| key.key().fingerprint())
+            .collect::<Vec<_>>()
+    };
+
+    let a = fingerprints(Algorithm::Curve25519);
+    let b = fingerprints(Algorithm::P256);
+    for fp in &a {
+        assert!(!b.contains(fp), "{fp} appears under both algorithms");
+    }
+}
+
+/// The legacy scheme predates the algorithm segment and only ever produced Curve25519 keys.
+#[test]
+fn legacy_scheme_refuses_p256() {
+    let err = match SeededSmartcard::with_scheme(&SEED_A, None, "Alice".into(), Scheme::Legacy)
+        .with_algorithm(Algorithm::P256)
+    {
+        Ok(_) => panic!("the legacy scheme accepted P-256"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("--legacy"), "error does not name the cause: {err}");
+
+    // Asking for the algorithm it already derives is not an error
+    SeededSmartcard::with_scheme(&SEED_A, None, "Alice".into(), Scheme::Legacy)
+        .with_algorithm(Algorithm::Curve25519)
+        .unwrap();
+}
+
+/// P-384 is a PIV-only curve: the OpenPGP backend refuses it rather than derive under
+/// labels no OpenPGP card asked for.
+#[test]
+fn p384_is_refused() {
+    let err =
+        match SeededSmartcard::new(&SEED_A, None, "Alice".into()).with_algorithm(Algorithm::P384) {
+            Ok(_) => panic!("the OpenPGP backend accepted P-384"),
+            Err(err) => err,
+        };
+    assert!(err.to_string().contains("PIV-only"), "error does not name the cause: {err}");
 }
 
 // --- Revocation packet content test ---
@@ -455,33 +571,12 @@ fn legacy_scheme_is_frozen() {
     }
 }
 
-/// The current `mtg1` scheme is frozen.
-///
-/// The 1.x versioning promise is that any release re-derives the very same keys from a
-/// seed -- that is what makes a lost card replaceable years later. These vectors are that
-/// promise in executable form: a one-character change to a label constant, a prefix or the
-/// argon2 parameters would pass every other test while orphaning every provisioned card,
-/// and this test is what fails instead. Do not update these values within a major version;
-/// a derivation change ships as `mtg2` behind a new major.
-#[test]
-fn current_scheme_is_frozen() {
-    let vectors = [
-        (
-            None,
-            "811C40264981F67C6695CEE7739BA493C65A1A5D",
-            "9D61F6503A6D74F7725965F833ECC45B682346D8",
-            "DFB9F6C53EB1A862B49C98933831C5D23285891A",
-            "8A210557EB9266A0309B985508F05297FC762D2E",
-        ),
-        (
-            Some("laptop"),
-            "811C40264981F67C6695CEE7739BA493C65A1A5D",
-            "0DE3997A6005EF24F9AF799F02DB35320E0B33A0",
-            "6C48123A01DA46BE3EA1416401D58C465D0A0AEF",
-            "A68626428E7F49B690E8A82DC7065B4C54E59873",
-        ),
-    ];
+/// One frozen key set: subkey id, then the primary, signing, decryption and authentication
+/// fingerprints
+type FrozenKeys = (Option<&'static str>, &'static str, &'static str, &'static str, &'static str);
 
+/// Assert that `algorithm` still derives exactly `vectors` under the current scheme
+fn assert_current_scheme_frozen(algorithm: Algorithm, vectors: [FrozenKeys; 2]) {
     for (id, primary, signing, decryption, authentication) in vectors {
         let cert = SeededSmartcard::with_scheme(
             &SEED_A,
@@ -489,6 +584,8 @@ fn current_scheme_is_frozen() {
             "Alice".into(),
             Scheme::Current,
         )
+        .with_algorithm(algorithm)
+        .unwrap()
         .add_email("alice@example.com")
         .unwrap()
         .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
@@ -513,6 +610,61 @@ fn current_scheme_is_frozen() {
             assert_eq!(key.key().fingerprint().to_hex(), expected, "subkey moved for {id:?}",);
         }
     }
+}
+
+/// The current `mtg1` scheme is frozen.
+///
+/// The 1.x versioning promise is that any release re-derives the very same keys from a
+/// seed -- that is what makes a lost card replaceable years later. These vectors are that
+/// promise in executable form: a one-character change to a label constant, a prefix or the
+/// argon2 parameters would pass every other test while orphaning every provisioned card,
+/// and this test is what fails instead. Do not update these values within a major version;
+/// a derivation change ships as `mtg2` behind a new major.
+#[test]
+fn current_scheme_is_frozen() {
+    assert_current_scheme_frozen(
+        Algorithm::Curve25519,
+        [
+            (
+                None,
+                "88430F06B9F752ED2C341C36DE2AF5541838E809",
+                "AB00BE7F835649188EAB5EE4A17BD588482B384C",
+                "C97628A82FD1E82E546A625AB99670FFA38B11E6",
+                "32C45264B695C2207EEF47559E0C7978DE44E988",
+            ),
+            (
+                Some("laptop"),
+                "88430F06B9F752ED2C341C36DE2AF5541838E809",
+                "309AB6A06915C4E882C6DC068E0E96A1737672E3",
+                "43F267E09AA430865C2231C467BB656C575DEC64",
+                "15FFADF10464C79DA450A4F0FC71E4523479F307",
+            ),
+        ],
+    );
+}
+
+/// The P-256 half of the same promise: `--algorithm p256` is part of `mtg1` and frozen with it.
+#[test]
+fn current_scheme_is_frozen_on_p256() {
+    assert_current_scheme_frozen(
+        Algorithm::P256,
+        [
+            (
+                None,
+                "022412B9B9C415FE99ECB1151B5B0F1FBDF2B3B1",
+                "FA1D7D6AC880837C13F60F0886E1F118C99FE935",
+                "77F2BDD072EF09FF12FF5C48C765E70B2E10100D",
+                "7832C9B23902DE38CBEC5F6049380BDF9701B68D",
+            ),
+            (
+                Some("laptop"),
+                "022412B9B9C415FE99ECB1151B5B0F1FBDF2B3B1",
+                "527C736AE891638340027B85FA9B38F89A250FAE",
+                "1525D466A14E657B947CB297A57A7121F7265DA0",
+                "0188C936832FD954C674DC41AEB42B6118B3B23A",
+            ),
+        ],
+    );
 }
 
 /// The current scheme is a different scheme, not a rename.

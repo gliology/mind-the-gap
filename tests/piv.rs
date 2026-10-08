@@ -1,5 +1,5 @@
 use mind_the_gap::piv::{CertificateKind, SeededSmartcard, SharedSlot, SlotRole};
-use mind_the_gap::seed::Seed256;
+use mind_the_gap::seed::{Algorithm, Seed256};
 
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{DerSignature, VerifyingKey};
@@ -42,26 +42,62 @@ fn digest(cert: &Certificate) -> Vec<u8> {
     Sha256::digest(cert.to_der().unwrap()).to_vec()
 }
 
-/// Verify that `issuer` really signed `cert`
+/// `id-ecPublicKey`, the SPKI algorithm of every P-256 key (RFC 5480)
+const ID_EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
+/// `ecdsa-with-SHA256` (RFC 5758)
+const ECDSA_WITH_SHA256: &str = "1.2.840.10045.4.3.2";
+/// `ecdsa-with-SHA384` (RFC 5758)
+const ECDSA_WITH_SHA384: &str = "1.2.840.10045.4.3.3";
+/// `secp384r1`, the named curve parameter of a P-384 key (RFC 5480)
+const SECP384R1: &str = "1.3.132.0.34";
+/// `id-Ed25519`, both as key and as signature algorithm (RFC 8410)
+const ID_ED25519: &str = "1.3.101.112";
+/// `id-X25519` (RFC 8410)
+const ID_X25519: &str = "1.3.101.110";
+
+/// Verify that `issuer` really signed `cert`, in whichever algorithm the issuer uses
 fn verifies_under(cert: &Certificate, issuer: &Certificate) -> bool {
-    let spki = issuer
-        .tbs_certificate()
-        .subject_public_key_info()
-        .to_der()
-        .unwrap();
-    let key = VerifyingKey::from_sec1_bytes(
-        issuer
-            .tbs_certificate()
-            .subject_public_key_info()
-            .subject_public_key
-            .raw_bytes(),
-    )
-    .unwrap_or_else(|_| panic!("issuer SPKI is not a P-256 point: {spki:?}"));
-
+    let spki = issuer.tbs_certificate().subject_public_key_info();
+    let point = spki.subject_public_key.raw_bytes();
     let tbs = cert.tbs_certificate().to_der().unwrap();
-    let signature = DerSignature::from_bytes(cert.signature().raw_bytes()).unwrap();
 
-    key.verify(&tbs, &signature).is_ok()
+    match spki.algorithm.oid.to_string().as_str() {
+        // Both NIST curves share the key algorithm; the uncompressed point's width tells them
+        // apart (1 + 2 * 48 bytes on P-384)
+        ID_EC_PUBLIC_KEY if point.len() == 97 => {
+            let key = p384::ecdsa::VerifyingKey::from_sec1_bytes(point)
+                .unwrap_or_else(|_| panic!("issuer SPKI is not a P-384 point: {spki:?}"));
+            let signature =
+                p384::ecdsa::DerSignature::from_bytes(cert.signature().raw_bytes()).unwrap();
+            key.verify(&tbs, &signature).is_ok()
+        }
+        ID_EC_PUBLIC_KEY => {
+            let key = VerifyingKey::from_sec1_bytes(point)
+                .unwrap_or_else(|_| panic!("issuer SPKI is not a P-256 point: {spki:?}"));
+            let signature = DerSignature::from_bytes(cert.signature().raw_bytes()).unwrap();
+            key.verify(&tbs, &signature).is_ok()
+        }
+        ID_ED25519 => {
+            let key = ed25519_dalek::VerifyingKey::from_bytes(point.try_into().unwrap())
+                .unwrap_or_else(|_| panic!("issuer SPKI is not an Ed25519 point: {spki:?}"));
+            let signature =
+                ed25519_dalek::Signature::from_slice(cert.signature().raw_bytes()).unwrap();
+            key.verify(&tbs, &signature).is_ok()
+        }
+        other => panic!("issuer SPKI is on an unexpected algorithm: {other}"),
+    }
+}
+
+/// The SPKI and signature algorithm identifiers of a certificate
+fn algorithms(cert: &Certificate) -> (String, String) {
+    (
+        cert.tbs_certificate()
+            .subject_public_key_info()
+            .algorithm
+            .oid
+            .to_string(),
+        cert.signature_algorithm().oid.to_string(),
+    )
 }
 
 fn key_usage(cert: &Certificate) -> KeyUsage {
@@ -110,79 +146,229 @@ fn certify_is_deterministic() {
 /// behind a new major.
 #[test]
 fn current_scheme_is_frozen() {
+    assert_current_scheme_frozen(
+        Algorithm::P256,
+        [
+            (
+                None,
+                [
+                    (
+                        "ab8c5adc194c66ed2163f08d4606a753133005840f5e5448f602a0af93bd6cf4",
+                        "861b8296ec2ebe1cb370b18db1e0ade1bc55b4eeb7f117aee85e7260be782c08",
+                        "CN=Alice PIV Root CA",
+                    ),
+                    (
+                        "c55a30e8647a8912b07ba6f76d6abb6fcb4efad9dfaa0f7d691320d64c11d6ea",
+                        "15c3cd1d34a5be9499f195b6f0a6daa0455b28f15f419335e0bc67a0a8a07c0f",
+                        "CN=Alice",
+                    ),
+                    (
+                        "ec7e41c73cd76ec8b7283332a0202a775dbf616096d05d18732ff0a211dfc0b1",
+                        "f97b5ee9339aa13a79ff5fe962261c0e6fcff9760d5c96a0043410eb554c8de6",
+                        "CN=Alice",
+                    ),
+                    (
+                        "db4389e005f73edf3cfa500c81c9e28683c4beae122192c2ee21ebaedf2fdd00",
+                        "6e764fe53fc1c906afc7cf2c215d9c07355fd7d84bdf6600ce91d993f54e38e4",
+                        "CN=Alice",
+                    ),
+                    (
+                        "93d0d7b044eb08ad6f62a20668e1f17b0838dc918c472a9cd7020d223f3970c3",
+                        "5c2d5504506e5eafec3a6e1d86d6623ccbaca96f6e1d51ab3b89d3204d0c986b",
+                        "CN=PIV Card mtg1:5D168619",
+                    ),
+                ],
+            ),
+            (
+                Some("laptop"),
+                [
+                    (
+                        "ab8c5adc194c66ed2163f08d4606a753133005840f5e5448f602a0af93bd6cf4",
+                        "861b8296ec2ebe1cb370b18db1e0ade1bc55b4eeb7f117aee85e7260be782c08",
+                        "CN=Alice PIV Root CA",
+                    ),
+                    (
+                        "5f22bc03848271a3b6e524b9e327eaceef0ae31b379ffa4bb3511bb3f189eda7",
+                        "d004f480344e9ea8d889cffd004158c1027ba2def6d116a3c08fa6a291d594d1",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "555ad0a77ef68e4eb556d49551d0a948685077c64956d61fc5bda926c7a751ab",
+                        "2765c5a08e03db99b74fb7b82fbefbd564e54083bf669f36529e254c9b2cdf37",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "e274fd327152f629470240f968efc8a42fe133a1b6816a920a03aedf422e0cd3",
+                        "fbd4b7ffc16fb0622bdad2d2478976148346d3655cdadcb26ee5c9514b3abe2a",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "d8498196b0d80ec125cc48549465624b0eb9d15f2f35c9d98cedbf434a124036",
+                        "36f92866b4769436a85e775eeccf50c7f3b187756c92aac6dc75771e2614bd5e",
+                        "CN=PIV Card mtg1:95BCA3CF",
+                    ),
+                ],
+            ),
+        ],
+    );
+}
+
+/// The Curve25519 half of the same promise: `--algorithm curve25519` is part of `mtg1` and
+/// frozen with it, Ed25519 signatures included (they are deterministic, so the DER pins).
+#[test]
+fn current_scheme_is_frozen_on_curve25519() {
+    assert_current_scheme_frozen(
+        Algorithm::Curve25519,
+        [
+            (
+                None,
+                [
+                    (
+                        "215875f0a056960c48ab72d9031eb87fef9e56935bc74220d96739f7eb0890cc",
+                        "614b41693fc5d41a9241b3f900737cb38b46aa82d065301cc50e0fad2a1a2618",
+                        "CN=Alice PIV Root CA",
+                    ),
+                    (
+                        "39d78d631f03041f9da16a4588cbfbea092404f25cdadae8895c807307e9cc5e",
+                        "fcfe945cff1a90da139c9eec97320eb336630495526a11e94600180e33a0b784",
+                        "CN=Alice",
+                    ),
+                    (
+                        "d303bcbb992f935e68ba7ea07f8a846410fe13e58169550c3dae3f61c0209f95",
+                        "40fa233d768183c48704c0efe1da9120f6f9a87cecd29edb7ad36b7cbde18c85",
+                        "CN=Alice",
+                    ),
+                    (
+                        "d32cf40d03e67f4de0ea55541e673b0c64bb3d1861ebc039735e7684ac5e4791",
+                        "5d807a2cc1d5b96848925078c051d0c4a6c10345c1ccb6bf56d1942a3e4a7b85",
+                        "CN=Alice",
+                    ),
+                    (
+                        "374b218d39ed4756bd703891fc765fbb75b97e3f3e5a3b110423547a622d1c59",
+                        "57f022cbbb2c3c69107fecfbd13b1028fe49fa9c42fcd8412c29c592e6f4c810",
+                        "CN=PIV Card mtg1:5D168619",
+                    ),
+                ],
+            ),
+            (
+                Some("laptop"),
+                [
+                    (
+                        "215875f0a056960c48ab72d9031eb87fef9e56935bc74220d96739f7eb0890cc",
+                        "614b41693fc5d41a9241b3f900737cb38b46aa82d065301cc50e0fad2a1a2618",
+                        "CN=Alice PIV Root CA",
+                    ),
+                    (
+                        "b29e70e6954f77a46ddbfe461e3b873dd8fdd8df5d93b3b556ad3984dcf72fb4",
+                        "e68f98eb34a215c78c965ea92aaee4a6952626aca990bf2fdf3e5fcc856308e1",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "8cfc7e206526f869ef0a551255bcc3267f3be9ff9a6e0900c0a0da6e132568be",
+                        "2d70219c85a1a174556eee0cfd9c073cfec06987fb03a499a97fe355c6ac0ca6",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "db0dbbf7d26cdbddc439020ba9e717e24459204e53e7c1597935cb9a10b747a4",
+                        "bdd7bdcb938dff7fb1abdbe6f37fb04996775bae0892684e2754082909846fab",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "630220975eccb9267282b921887a9166958e837506053a6a2c7398a59b0a4c5e",
+                        "82b30e1aa6300c20d27576494ef2e4dd32c844f9851674077392fb835e504a4a",
+                        "CN=PIV Card mtg1:95BCA3CF",
+                    ),
+                ],
+            ),
+        ],
+    );
+}
+
+/// The P-384 third of the same promise: `--algorithm p384` derives under its own labels and the
+/// documented 48-byte construction, and is frozen with the rest of `mtg1`. ECDSA signatures
+/// use RFC 6979 nonces, so the certificate DER pins as well.
+#[test]
+fn current_scheme_is_frozen_on_p384() {
+    assert_current_scheme_frozen(
+        Algorithm::P384,
+        [
+            (
+                None,
+                [
+                    (
+                        "189c2070280dba26725e96dbb16fb86a20b98115c8aeb18c4656c25f262f4187",
+                        "b5cc125940a7bd667bfc3fe9035a84ededce92f6918490416183aa869c78a04a",
+                        "CN=Alice PIV Root CA",
+                    ),
+                    (
+                        "2b3fd7575f7799de806830f0452b473647b42eab745b117c451460e9e0f56302",
+                        "8ebbafc08a686ba6822ef7892a76bb44915c82f2f233853e7e81da9db6de583b",
+                        "CN=Alice",
+                    ),
+                    (
+                        "bd7177425a6d6234a9b1872b3cafd4d70e399481bab163e50d2ddf967e6ae175",
+                        "9f6b68ef3662a2be96ea69b6973f083ff0ddbe948a51e7e1351077850d814fcc",
+                        "CN=Alice",
+                    ),
+                    (
+                        "9430d9eda51e0e30bd85972ce5d6584ef35bb48751a3d631fd514e1b0067ee92",
+                        "f9264506cdc9cf78b1dbd707e303e307035141eb49c910d5e7b5322b5c193f96",
+                        "CN=Alice",
+                    ),
+                    (
+                        "77f5cf472efe6df02b9ff7a0512488575bd384934d41b1702e8adbc71c733d40",
+                        "3b57d967b44279224150515024408d298930d8934eda117b3779e794992fa8a7",
+                        "CN=PIV Card mtg1:5D168619",
+                    ),
+                ],
+            ),
+            (
+                Some("laptop"),
+                [
+                    (
+                        "189c2070280dba26725e96dbb16fb86a20b98115c8aeb18c4656c25f262f4187",
+                        "b5cc125940a7bd667bfc3fe9035a84ededce92f6918490416183aa869c78a04a",
+                        "CN=Alice PIV Root CA",
+                    ),
+                    (
+                        "aaec61040c30ae1e3fdb62590d4ebde9b3f51856aa183db8e6198a9e079e2251",
+                        "3d18d4459c45ec40abc62990509ac1cc2f07d67d08607cd40d9fa4207ae6f231",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "224679124975033922323ddb5121c35da9cf86fc0e068bfe7c7f95476769b712",
+                        "014312b4000489bed5bbee0411134ea978489330d9d1d99b3c87c166fa56b030",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "ab47865be4c685cb325786744390d17a36c2cdc910c2cc5b3046b72ec29bba6c",
+                        "e0487b0eeac20e62b53e367611c38a79b2f0e89bbd7c6479aa6b3eb4ab99313e",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "dd2ae81a0cb116f6b0ca40756d99d0b13ff8a90bae404d2b7d840f7fb19db7d6",
+                        "73eb90f051f4d81e19873642a1f80ca7da18f5d868e681ef8c327a59ac4a9906",
+                        "CN=PIV Card mtg1:95BCA3CF",
+                    ),
+                ],
+            ),
+        ],
+    );
+}
+
+/// One pinned certificate: its SPKI digest, its DER digest, and its subject
+type Pinned = (&'static str, &'static str, &'static str);
+
+/// Assert that `algorithm` still derives exactly `vectors`: for each subkey id, the pins for
+/// the root and the four slots
+fn assert_current_scheme_frozen(algorithm: Algorithm, vectors: [(Option<&str>, [Pinned; 5]); 2]) {
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
-    /// One pinned certificate: its SPKI digest, its DER digest, and its subject
-    type Pinned = (&'static str, &'static str, &'static str);
-
-    // (subkey id, pins for root + the four slots)
-    let vectors: [(Option<&str>, [Pinned; 5]); 2] = [
-        (
-            None,
-            [
-                (
-                    "29f2903dd6c66cf4d24379731c2a331f15a409bc6d75e2d1122f914325067348",
-                    "c72d69ec7affc23e571359b1a0f1b894a8a22aaae781e303fd4519ac2383dddf",
-                    "CN=Alice PIV Root CA",
-                ),
-                (
-                    "d1e324401141f093a1b62f9a5469050efcfd2e2956dff07d844abb5116c1d4b4",
-                    "7434548b2d0e622089d47aed254ea21c29f5de68ebfa0587bdf3bca1fd297080",
-                    "CN=Alice",
-                ),
-                (
-                    "8d292e4d4152eecabd99a1edb78afa39a07ededa36f7475a18c32470d1008c1b",
-                    "874543318163f147a0f38bae3333b76045aa2a34b9efd072b5716b907319b2d8",
-                    "CN=Alice",
-                ),
-                (
-                    "a72c8f7234379d00a0c4d89f86842e793897a7692eff8dce35a2f7a78f0546bd",
-                    "6d18078fc308260061ffac3af44ae3cea60b4569eb4c39c13036ee14c2f3ec3e",
-                    "CN=Alice",
-                ),
-                (
-                    "6a4f64ca4c793e2159a6affb5d1daefe784afa1b53fc1d5f56d92494a6792c64",
-                    "c4e3ed49020f30473ae88a10bda5e3ecf31c28f54d1ae7087e12e2d13fabf97f",
-                    "CN=PIV Card mtg1:5D168619",
-                ),
-            ],
-        ),
-        (
-            Some("laptop"),
-            [
-                (
-                    "29f2903dd6c66cf4d24379731c2a331f15a409bc6d75e2d1122f914325067348",
-                    "c72d69ec7affc23e571359b1a0f1b894a8a22aaae781e303fd4519ac2383dddf",
-                    "CN=Alice PIV Root CA",
-                ),
-                (
-                    "308465216675d88be9fe1ef4ef2a8d6a128624cb4976a1c0b5638b6a9b56a744",
-                    "1eddcce57815cac20154e7398fcecf7d049e8b56248608b6e94fea6d01a985d7",
-                    "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                ),
-                (
-                    "b9a316566612e583026cf57f28e4d35019f3c12c207d1bbb6d52445088b7c9b1",
-                    "9a212a3933989294d22c58debedf90897b2043ca65325000d273435989241034",
-                    "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                ),
-                (
-                    "671d6dd40dab1de51bcb0e6f5332e3f2c8a0db115ac50883ca13c255d96a9ca5",
-                    "2388069e0ec45360227d042d80ad316b6c02a15aa1b5b8ab063ad7e4392cab79",
-                    "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                ),
-                (
-                    "0adbee257256d7a1ff52851e2b790b90b0e3610389e402be6902b1c2838f7f41",
-                    "d71b8415d12df2568372ca271041124a67bad7b425a382d06a36ce9b7f937276",
-                    "CN=PIV Card mtg1:95BCA3CF",
-                ),
-            ],
-        ),
-    ];
-
     for (id, expected) in vectors {
         let chain = SeededSmartcard::new(&SEED_A, id.map(|v| v.to_string()), "Alice".into())
+            .with_algorithm(algorithm)
             .add_email("alice@example.com")
             .unwrap()
             .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
@@ -245,6 +431,113 @@ fn certify_is_deterministic_without_date() {
 
     assert_eq!(digest(&a.root), digest(&b.root));
     assert_eq!(digest(&a.leaves[0].1), digest(&b.leaves[0].1));
+}
+
+/// `--algorithm curve25519` switches the whole chain: Ed25519 authorities signing Ed25519 slot
+/// keys, with X25519 in the key management slot, and every signature verifies.
+#[test]
+fn curve25519_chain_is_ed25519_and_x25519_throughout() {
+    let chain = alice()
+        .with_algorithm(Algorithm::Curve25519)
+        .with_intermediate(true)
+        .certify(CertificateKind::Chain)
+        .unwrap();
+
+    assert_eq!(algorithms(&chain.root), (ID_ED25519.into(), ID_ED25519.into()));
+    let issuer = chain.issuer();
+    assert_eq!(algorithms(issuer), (ID_ED25519.into(), ID_ED25519.into()));
+    assert!(verifies_under(&chain.root, &chain.root), "root is not self-signed");
+    assert!(verifies_under(issuer, &chain.root), "issuing CA is not signed by the root");
+
+    for (slot, cert) in &chain.leaves {
+        let expected = match slot {
+            SlotId::KeyManagement => ID_X25519,
+            _ => ID_ED25519,
+        };
+        assert_eq!(
+            algorithms(cert),
+            (expected.into(), ID_ED25519.into()),
+            "{slot:?} slot has the wrong algorithms"
+        );
+        assert!(verifies_under(cert, issuer), "{slot:?} slot is not signed by the issuer");
+    }
+}
+
+/// The default chain stays P-256 end to end, so the algorithm flag changes nothing unasked.
+#[test]
+fn default_chain_is_p256_throughout() {
+    let chain = alice().certify(CertificateKind::Chain).unwrap();
+
+    assert_eq!(algorithms(&chain.root), (ID_EC_PUBLIC_KEY.into(), ECDSA_WITH_SHA256.into()));
+    for (slot, cert) in &chain.leaves {
+        assert_eq!(
+            algorithms(cert),
+            (ID_EC_PUBLIC_KEY.into(), ECDSA_WITH_SHA256.into()),
+            "{slot:?} slot has the wrong algorithms"
+        );
+    }
+}
+
+/// `--algorithm p384` switches the whole chain to ECDSA P-384 with SHA-384 signatures, the
+/// key management slot included, and every signature verifies.
+#[test]
+fn p384_chain_is_ecdsa_p384_throughout() {
+    let chain = alice()
+        .with_algorithm(Algorithm::P384)
+        .with_intermediate(true)
+        .certify(CertificateKind::Chain)
+        .unwrap();
+
+    let issuer = chain.issuer();
+    assert!(verifies_under(&chain.root, &chain.root), "root is not self-signed");
+    assert!(verifies_under(issuer, &chain.root), "issuing CA is not signed by the root");
+
+    for cert in chain.iter() {
+        assert_eq!(algorithms(cert), (ID_EC_PUBLIC_KEY.into(), ECDSA_WITH_SHA384.into()));
+        let parameters = cert
+            .tbs_certificate()
+            .subject_public_key_info()
+            .algorithm
+            .parameters
+            .as_ref()
+            .unwrap()
+            .decode_as::<x509_cert::der::asn1::ObjectIdentifier>()
+            .unwrap();
+        assert_eq!(parameters.to_string(), SECP384R1);
+    }
+    for (slot, cert) in &chain.leaves {
+        assert!(verifies_under(cert, issuer), "{slot:?} slot is not signed by the issuer");
+    }
+}
+
+/// The algorithms derive under different labels, so no key appears in two chains.
+#[test]
+fn curves_share_no_keys() {
+    let spkis = |algorithm| {
+        let chain = alice()
+            .with_algorithm(algorithm)
+            .certify(CertificateKind::Chain)
+            .unwrap();
+        chain
+            .iter()
+            .map(|cert| {
+                cert.tbs_certificate()
+                    .subject_public_key_info()
+                    .subject_public_key
+                    .raw_bytes()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let a = spkis(Algorithm::P256);
+    let b = spkis(Algorithm::Curve25519);
+    let c = spkis(Algorithm::P384);
+    for key in &a {
+        // Compared on the raw key bits: the algorithm identifiers differ anyway
+        assert!(!b.contains(key), "a key appears under both algorithms");
+        assert!(!c.contains(key), "a key appears on P-256 and P-384");
+    }
 }
 
 #[test]

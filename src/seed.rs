@@ -6,7 +6,9 @@
 //! [`Zeroizing`] so every copy wipes itself. The tree and its rationale are documented in
 //! the derivation chapter, <https://gliology.github.io/mind-the-gap/derivation.html>.
 
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::{Argon2, Params, Version};
+
+use anyhow::{Result, bail};
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD_NO_PAD;
@@ -41,7 +43,7 @@ pub fn argon2id_256(input: &[u8], salt: Option<&[u8]>) -> Zeroizing<Seed256> {
 
     // Use latest hybrid variant
     let mut hash = Zeroizing::new([0u8; 32]);
-    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+    Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params)
         .hash_password_into(input, salt, hash.as_mut())
         .expect("Parameters are valid");
     hash
@@ -106,6 +108,26 @@ pub fn label(prefix: &str, name: &str) -> Vec<u8> {
     format!("{prefix}:{name}").into_bytes()
 }
 
+/// Compose the label for key material bound to one algorithm: `key:<name>:<segment>`
+///
+/// The algorithm is a segment of its own rather than part of the name so that one name can
+/// never hand the same bytes to two algorithms: `key:signature:p256` and
+/// `key:signature:ed25519` are different keys, and a card switched from one algorithm to the
+/// other shares no secret with its former self.
+pub fn algorithm_label(name: &str, segment: &str) -> Vec<u8> {
+    debug_assert!(
+        !segment.is_empty()
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+        "derivation labels are lowercase and hyphenated: {segment:?}",
+    );
+    let mut label = label(PREFIX_KEY, name);
+    label.push(b':');
+    label.extend_from_slice(segment.as_bytes());
+    label
+}
+
 /// Compose the label for the subtree scoped to a user-supplied subkey id
 ///
 /// Deliberately not [`label`]: the id is arbitrary text a user chose, so it is neither checked
@@ -155,6 +177,11 @@ pub trait Seed256Derive {
         self.derive(Some(&label(PREFIX_KEY, name)))
     }
 
+    /// Derive 256 bits of key material for one algorithm, see [`algorithm_label`]
+    fn algorithm_key(&self, name: &str, segment: &str) -> Zeroizing<Seed256> {
+        self.derive(Some(&algorithm_label(name, segment)))
+    }
+
     /// Derive identifier material, truncated to the width the format allows
     ///
     /// Separate from [`Seed256Derive::key`] so that an identifier, which is published, can
@@ -174,4 +201,101 @@ impl Seed256Derive for Seed256 {
     fn derive(&self, path: Option<&[u8]>) -> Zeroizing<Seed256> {
         argon2id_256(self, path)
     }
+}
+
+/// The algorithm a backend derives its asymmetric keys with
+///
+/// Scheme vocabulary rather than a backend detail: the algorithm is a segment of every key
+/// label (see [`algorithm_label`]), so both backends have to spell it the same way. The
+/// segments are the RFC names, `x25519` rather than OpenPGP's `cv25519`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Algorithm {
+    /// NIST P-256: ECDSA signatures, ECDH key agreement
+    P256,
+    /// NIST P-384: ECDSA signatures, ECDH key agreement (PIV only)
+    P384,
+    /// Curve25519: Ed25519 signatures, X25519 key agreement
+    Curve25519,
+}
+
+impl Algorithm {
+    /// Label segment of a signing key in this algorithm
+    pub fn signing_segment(self) -> &'static str {
+        match self {
+            Algorithm::P256 => "p256",
+            Algorithm::P384 => "p384",
+            Algorithm::Curve25519 => "ed25519",
+        }
+    }
+
+    /// Label segment of a key agreement key in this algorithm
+    pub fn agreement_segment(self) -> &'static str {
+        match self {
+            Algorithm::P256 => "p256",
+            Algorithm::P384 => "p384",
+            Algorithm::Curve25519 => "x25519",
+        }
+    }
+}
+
+/// Maximum number of re-derivations while searching for a valid P-256 or P-384 scalar.
+///
+/// A rejection happens with probability of roughly 2^-32 per draw on P-256 and 2^-190 on
+/// P-384, so in practice the first candidate is always accepted; the bound merely keeps the
+/// functions total.
+const MAX_SCALAR_TRIES: usize = 8;
+
+/// Derive a *valid* P-256 secret scalar, re-deriving deterministically on rejection.
+///
+/// A uniform 256-bit string is only a valid NIST P-256 private key when it lies in
+/// `[1, n-1]`; `SecretKey::from_bytes` performs exactly that range and zero check. Ed25519
+/// and X25519 need nothing of the kind, any 32 bytes are a key, which is why this lives
+/// here for P-256 alone.
+pub fn derive_p256_scalar(parent: &Seed256, path: Option<&[u8]>) -> Result<Zeroizing<Seed256>> {
+    let mut candidate = parent.derive(path);
+
+    for _ in 0..MAX_SCALAR_TRIES {
+        // `into()` hands p256 a transient `FieldBytes` copy that is beyond our wiping
+        if p256::SecretKey::from_bytes(&(*candidate).into()).is_ok() {
+            return Ok(candidate);
+        }
+
+        log::warn!("Derived scalar outside the P-256 group order, re-deriving");
+        candidate = candidate.key("p256-retry");
+    }
+
+    bail!("Failed to derive a valid P-256 scalar")
+}
+
+/// Width of a P-384 secret scalar in bytes
+pub const P384_SCALAR_BYTES: usize = 48;
+
+/// Derive a *valid* P-384 secret scalar, re-deriving deterministically on rejection.
+///
+/// One argon2id output is 256 bits and a P-384 scalar needs 384, so the candidate is the
+/// first output `a`, followed by the first 16 bytes of a second output derived from `a`
+/// under the fixed label `key:p384-extend`. `a` is a 256-bit secret in its own right, so the
+/// extension adds width rather than entropy; what matters is that both halves are a
+/// deterministic function of the seed and the label. A candidate outside `[1, n-1]` is
+/// rejected like on P-256 and `a` moves on under `key:p384-retry`. The construction is
+/// part of the `mtg1` scheme, see the derivation chapter.
+pub fn derive_p384_scalar(parent: &Seed256, path: Option<&[u8]>) -> Result<Zeroizing<Vec<u8>>> {
+    let mut first = parent.derive(path);
+
+    for _ in 0..MAX_SCALAR_TRIES {
+        let second = first.key("p384-extend");
+
+        let mut candidate = Zeroizing::new(Vec::with_capacity(P384_SCALAR_BYTES));
+        candidate.extend_from_slice(&first[..]);
+        candidate.extend_from_slice(&second[..P384_SCALAR_BYTES - first.len()]);
+
+        if p384::SecretKey::from_slice(&candidate).is_ok() {
+            return Ok(candidate);
+        }
+
+        log::warn!("Derived scalar outside the P-384 group order, re-deriving");
+        first = first.key("p384-retry");
+    }
+
+    bail!("Failed to derive a valid P-384 scalar")
 }

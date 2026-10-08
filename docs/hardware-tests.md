@@ -66,7 +66,15 @@ suite performs: reset by pin exhaustion, the derived AES-256 management key with
 touch requirement, the user pin, four imported P-256 keys with their pin and touch
 policies read back through metadata, the byte-for-byte certificate comparison, and the
 certificate authorities in msroots -- the check asserts that none of the advisory
-comparisons warn. Touch prompts go through trussed's user-presence request (the same
+comparisons warn. The check runs once per curve: `virtual-piv` provisions the P-256
+chain, `virtual-piv-curve25519` the Ed25519 and X25519 one. Each then runs the
+card-level half of the destructive PIV suite (`tests/piv_hardware.rs`, built as the
+`piv-suite` binary) against the same card: its own provisioning, the policy and
+certificate read-back, msroots and the card identifiers, and then the card signing in
+9A, 9C and 9E under their pin policies and agreeing in 9D, each result compared with
+the same computation off the card. That is what `piv check` cannot prove on its own,
+since it only reads public keys back. The OpenPGP check likewise provisions both curves:
+opcard imports P-256 on every slot. Touch prompts go through trussed's user-presence request (the same
 mechanism opcard uses for UIF), which the virtual platform grants automatically; a real
 device blinks and waits for the button. The check runs against our fork until the
 branch is upstreamed; the flake input pin says exactly which revision the claims hold
