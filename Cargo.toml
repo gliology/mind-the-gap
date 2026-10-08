@@ -108,8 +108,9 @@ openpgp-card = "0.7"
 card-backend-pcsc = "0.5"
 secrecy = "0.10"
 
-# Yubikey PIV module
-yubikey = { version = "0.9.0-pre.0",  features = [ "untested" ]}
+# Yubikey PIV module. 0.9.0-rc.0 is the first release whose transmit loops GET RESPONSE on
+# 61XX, which ISO 7816-compliant cards (Trussed among them) answer to a SELECT without Le.
+yubikey = "0.9.0-rc.0"
 # Features declared explicitly: `builder` gates CertificateBuilder/BuilderProfile *and* the
 # TryFrom<SubjectPublicKeyInfoRef> impls for Subject/AuthorityKeyIdentifier, `hazmat` gates
 # Time::INFINITY. They currently also arrive via yubikey's own dependency, but relying on

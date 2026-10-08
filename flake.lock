@@ -71,16 +71,16 @@
     "piv-authenticator": {
       "flake": false,
       "locked": {
-        "lastModified": 1790728706,
-        "narHash": "sha256-k4E308XEX5oM78kySupBp+wY2aRhM5zmHLbn8KYuGRM=",
+        "lastModified": 1791474828,
+        "narHash": "sha256-ruBUvDmaH9ySdknTZXqrcrarRaklARGdA2gNn2WMmQ4=",
         "owner": "FlorianFranzen",
         "repo": "piv-authenticator",
-        "rev": "0b1263634397d475017ba4cabaa2d48886944786",
+        "rev": "4039f514bf1fe82662c48558598b93fe41644263",
         "type": "github"
       },
       "original": {
         "owner": "FlorianFranzen",
-        "ref": "ecc-import",
+        "ref": "mtg-integration",
         "repo": "piv-authenticator",
         "type": "github"
       }

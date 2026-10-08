@@ -24,7 +24,7 @@
     # virtual-piv check. Pinned to our fork until the ECC import, GET METADATA and
     # Yubico client compatibility work is upstreamed to trussed-dev
     piv-authenticator = {
-      url = "github:FlorianFranzen/piv-authenticator/ecc-import";
+      url = "github:FlorianFranzen/piv-authenticator/mtg-integration";
       flake = false;
     };
   };
