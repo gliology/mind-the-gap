@@ -34,9 +34,9 @@ whatever card is plugged in.
 See [the PIV hardware checklist](./piv-hardware-tests.md) for what they assert and for
 the manual checklist covering what cannot be automated.
 
-## The virtual card check
+## The virtual OpenPGP check
 
-`nix flake check` provisions a **virtual OpenPGP card** on every run: the `virtual-card`
+`nix flake check` provisions a **virtual OpenPGP card** on every run: the `virtual-pgp`
 check boots a VM, presents Nitrokey's [opcard](https://github.com/Nitrokey/opcard-rs) --
 the Nitrokey 3's OpenPGP card implementation -- as a PC/SC reader through vsmartcard's
 `vpcd`, and drives the real binary through `pgp upload`, `pgp check` and `pgp config`
@@ -56,7 +56,7 @@ vendor extensions above.
 ## The virtual PIV check
 
 Since the fork of trussed's
-[piv-authenticator](https://github.com/FlorianFranzen/piv-authenticator/tree/ecc-import)
+[piv-authenticator](https://github.com/FlorianFranzen/piv-authenticator/tree/mind-the-gap)
 grew the missing Yubico surface -- ECC import into every slot, a real `GET METADATA`,
 partial-AID selection, retry-counter semantics -- the same construction works for PIV:
 the `virtual-piv` check presents the app (the Nitrokey 3's PIV implementation) behind
@@ -76,9 +76,27 @@ the same computation off the card. That is what `piv check` cannot prove on its 
 since it only reads public keys back. The OpenPGP check likewise provisions both curves:
 opcard imports P-256 on every slot. Touch prompts go through trussed's user-presence request (the same
 mechanism opcard uses for UIF), which the virtual platform grants automatically; a real
-device blinks and waits for the button. The check runs against our fork until the
-branch is upstreamed; the flake input pin says exactly which revision the claims hold
-for.
+device blinks and waits for the button. The check runs against the fork's `mind-the-gap`
+branch until the PRs are merged: trussed-dev's main plus every pending PR, each as one
+commit, rebuilt by a generator rather than by hand. `nix flake update piv-authenticator`
+follows it, and the flake input pin says exactly which revision the claims hold for.
+
+## The simulated Nitrokey 3 check
+
+The `usbip-nk3` check goes one layer further down. It builds Nitrokey's own firmware as
+its [USB/IP runner](https://github.com/Nitrokey/nitrokey-3-firmware/blob/main/docs/usbip.md),
+a complete Nitrokey 3 as a host process, and attaches it to the VM's kernel through
+`vhci-hcd`. pcscd then finds a USB key by hotplug and talks to it through libccid, so the
+check covers what the `vpcd` checks skip: the USB descriptors, CCID framing, the
+firmware's APDU dispatcher choosing between its applications, and the backend wiring of
+the real app set. It provisions PIV on P-256, runs the card-level half of the PIV suite,
+and provisions OpenPGP on the same key. The firmware's PIV app is replaced by the
+piv-authenticator input, so the PIV code is the same as in `virtual-piv`; OpenPGP is the
+opcard release the firmware ships. The firmware is upstream's main, which gives PIV its
+software pin backend without the SE050 chip (Nitrokey/nitrokey-3-firmware#723). The USB/IP
+device emulation underneath comes from the `mind-the-gap` branch of its fork, upstream plus
+Sawchord/usbip-device#10: without it a reply could answer the wrong request, which made the
+kernel drop the key mid-enumeration.
 
 ## What is not emulated, and why
 

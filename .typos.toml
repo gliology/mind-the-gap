@@ -1,6 +1,6 @@
 # Words that look like typos but are not:
 #   fpr      - GnuPG colon-format record type for a fingerprint
-#   iif/oif  - nftables input-/output-interface match keywords (live-system.nix)
+#   iif/oif  - nftables input-/output-interface match keywords (nix/live/system.nix)
 #   SME/TME  - AMD Secure Memory Encryption, Intel Total Memory Encryption
 [default.extend-words]
 fpr = "fpr"

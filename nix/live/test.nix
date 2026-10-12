@@ -6,16 +6,22 @@
 
   nodes.machine = { self, pkgs, ... }: {
     # Install additional shells to check completions
-    environment.systemPackages = with pkgs; [ fish zsh ];
+    environment.systemPackages = with pkgs; [
+      fish
+      zsh
+    ];
 
     # Link additional completion files
-    environment.pathsToLink = [ "/share/fish" "/share/zsh" ];
+    environment.pathsToLink = [
+      "/share/fish"
+      "/share/zsh"
+    ];
 
     # Provide mind-the-gap derivation via overlay
     nixpkgs.overlays = [ self.overlays.default ];
 
     # Import the same live system configuration to ensure consistency
-    imports = [ ./live-system.nix ];
+    imports = [ ./system.nix ];
   };
 
   testScript = ''

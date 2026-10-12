@@ -7,7 +7,11 @@
 # from the shipped one only by carrying the test driver's backdoor console.
 #
 # Modeled on nixpkgs' own nixos/tests/boot.nix.
-{ pkgs, nixos-lib, iso }:
+{
+  pkgs,
+  nixos-lib,
+  iso,
+}:
 
 let
   lib = pkgs.lib;
@@ -18,7 +22,9 @@ let
 
   makeBootTest =
     name:
-    { uefi ? false }:
+    {
+      uefi ? false,
+    }:
     let
       flags = [
         "-m"

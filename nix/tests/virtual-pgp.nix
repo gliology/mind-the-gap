@@ -9,7 +9,7 @@
 { pkgs, opcard-vpicc, ... }:
 
 {
-  name = "mind-the-virtual-card";
+  name = "mind-the-virtual-pgp";
 
   nodes.machine = { self, pkgs, ... }: {
     # Provide mind-the-gap derivation via overlay

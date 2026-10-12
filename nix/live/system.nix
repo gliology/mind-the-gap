@@ -1,4 +1,10 @@
-{ pkgs, lib, modulesPath, config, ... }:
+{
+  pkgs,
+  lib,
+  modulesPath,
+  config,
+  ...
+}:
 
 let
   # The pre-login reminder, shared between the serial gettys and the kmscon shells:
@@ -6,7 +12,7 @@ let
   # burned sticks stays tellable apart. The VT and kmscon both speak its truecolor
   # escapes.
   banner = ''
-    ${builtins.readFile ./assets/motd.ansi}
+    ${builtins.readFile ../../assets/motd.ansi}
      mind-the-gap ${pkgs.mind-the-gap.version} · image ${config.system.nixos.label}
 
      mind-the-gap opens an interactive session; `forget` clears screen, scrollback and
@@ -26,21 +32,27 @@ let
     printf '[Volume Info]\nName=${volumeName}\n' > $out
   '';
   volumeIcns = pkgs.runCommand "volume.icns" { nativeBuildInputs = [ pkgs.libicns ]; } ''
-    png2icns $out ${./assets/logo-512.png} ${./assets/icon-48.png} \
-      ${./assets/icon-32.png} ${./assets/icon-16.png}
+    png2icns $out ${../../assets/logo-512.png} ${../../assets/icon-48.png} \
+      ${../../assets/icon-32.png} ${../../assets/icon-16.png}
   '';
 
   # One splash per bootloader, the mark centred on a dark canvas at the loader's native
   # resolution (syslinux is fixed at 800x600 by its MENU RESOLUTION). The mark carries
   # the sign's fixed palette, so it renders straight from the committed SVG.
-  splash = width: height: logoSize:
-    pkgs.runCommand "mtg-splash-${toString width}x${toString height}.png" {
-      nativeBuildInputs = [ pkgs.resvg pkgs.imagemagick ];
-    } ''
-      resvg -w ${toString logoSize} -h ${toString logoSize} ${./assets/logo.svg} logo.png
-      magick -size ${toString width}x${toString height} xc:"#181818" \
-        logo.png -gravity center -composite PNG32:$out
-    '';
+  splash =
+    width: height: logoSize:
+    pkgs.runCommand "mtg-splash-${toString width}x${toString height}.png"
+      {
+        nativeBuildInputs = [
+          pkgs.resvg
+          pkgs.imagemagick
+        ];
+      }
+      ''
+        resvg -w ${toString logoSize} -h ${toString logoSize} ${../../assets/logo.svg} logo.png
+        magick -size ${toString width}x${toString height} xc:"#181818" \
+          logo.png -gravity center -composite PNG32:$out
+      '';
 in
 {
   imports = [
@@ -81,10 +93,22 @@ in
 
     # The volume icon and name shown by file managers, see the helpers above
     contents = [
-      { source = autorunInf; target = "/autorun.inf"; }
-      { source = ./assets/favicon.ico; target = "/volume.ico"; }
-      { source = volumeIcns; target = "/.VolumeIcon.icns"; }
-      { source = xdgVolumeInfo; target = "/.xdg-volume-info"; }
+      {
+        source = autorunInf;
+        target = "/autorun.inf";
+      }
+      {
+        source = ../../assets/favicon.ico;
+        target = "/volume.ico";
+      }
+      {
+        source = volumeIcns;
+        target = "/.VolumeIcon.icns";
+      }
+      {
+        source = xdgVolumeInfo;
+        target = "/.xdg-volume-info";
+      }
     ];
   };
 
@@ -155,7 +179,11 @@ in
     "slab_nomerge"
     "debugfs=off"
     "oops=panic"
-  ] ++ lib.optionals pkgs.stdenv.hostPlatform.isx86_64 [ "vsyscall=none" "mem_encrypt=on" ];
+  ]
+  ++ lib.optionals pkgs.stdenv.hostPlatform.isx86_64 [
+    "vsyscall=none"
+    "mem_encrypt=on"
+  ];
 
   # Power off is the only way out of a session. Suspend keeps the seed phrase in RAM
   # behind a dark screen, and a closed laptop lid would do exactly that by default while
@@ -176,13 +204,23 @@ in
   # mind-the-gap locks its memory when the limit allows it (see src/main.rs). The image
   # has no swap, so a locked page costs nothing and the limit can go entirely: the PAM
   # entry covers the console logins, the manager default everything systemd spawns.
-  security.pam.loginLimits = [ { domain = "*"; item = "memlock"; type = "-"; value = "unlimited"; } ];
+  security.pam.loginLimits = [
+    {
+      domain = "*";
+      item = "memlock";
+      type = "-";
+      value = "unlimited";
+    }
+  ];
   systemd.settings.Manager.DefaultLimitMEMLOCK = "infinity";
 
   # Support common file systems for the transfer media. Kept deliberately short: every
   # filesystem here is kernel code parsing whatever USB stick gets plugged in, and vfat is
   # what freshly formatted sticks actually carry.
-  boot.supportedFilesystems = [ "btrfs" "vfat" ];
+  boot.supportedFilesystems = [
+    "btrfs"
+    "vfat"
+  ];
 
   # Make sure iso is distinguishable
   networking.hostName = "mind-the-gap";
@@ -259,7 +297,10 @@ in
   hardware.gpgSmartcards.enable = true;
   hardware.nitrokey.enable = true;
 
-  services.udev.packages = [ pkgs.yubikey-personalization pkgs.solo2-cli ];
+  services.udev.packages = [
+    pkgs.yubikey-personalization
+    pkgs.solo2-cli
+  ];
 
   # The point of a live system is amnesia, and pstore is firmware-backed persistence:
   # kernel crash records written to EFI variables survive power-off and carry dmesg,
@@ -290,7 +331,10 @@ in
   ];
 
   # Link common completion files
-  environment.pathsToLink = [ "/share/bash" "/share/man" ];
+  environment.pathsToLink = [
+    "/share/bash"
+    "/share/man"
+  ];
 
   programs = {
     # Provide some sensible aliases. `forget` must run in the interactive shell itself:
@@ -324,7 +368,10 @@ in
   # secrets this image handles live in the operator's head and on the cards, never on disk.
   users.users.alice = {
     isNormalUser = true;
-    extraGroups = [ "wheel" "video" ];
+    extraGroups = [
+      "wheel"
+      "video"
+    ];
     # Allow to login without password
     initialHashedPassword = "";
   };
@@ -344,7 +391,12 @@ in
   # Ctrl+Alt+Plus/Minus when a dense code needs more rows than the screen has.
   services.kmscon = {
     enable = true;
-    fonts = [ { name = "DejaVu Sans Mono"; package = pkgs.dejavu_fonts; } ];
+    fonts = [
+      {
+        name = "DejaVu Sans Mono";
+        package = pkgs.dejavu_fonts;
+      }
+    ];
     # Small enough that a certificate-sized QR fits on one 1080p screen
     extraConfig = "font-size=12";
   };
@@ -353,8 +405,8 @@ in
   # kmscon runs no getty, so interactive shells print it themselves once per login.
   services.getty.helpLine = banner;
   environment.loginShellInit = ''
-    cat <<'BANNER'
-${banner}BANNER
+        cat <<'BANNER'
+    ${banner}BANNER
   '';
 
   # Mark nixos variant

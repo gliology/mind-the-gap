@@ -2,7 +2,7 @@
 #
 # The card is the trussed piv-authenticator -- the Nitrokey 3's PIV implementation --
 # running as a host process against vsmartcard's vpcd, exactly like the OpenPGP twin in
-# virtual-card-test.nix. Unlike that twin this path leans on Yubico vendor extensions
+# virtual-pgp.nix. Unlike that twin this path leans on Yubico vendor extensions
 # (device reset, ECC key import with pin and touch policies, AES-256 management key,
 # GET METADATA read-back, msroots), so it also proves the app's Yubico client
 # compatibility. Touch prompts go through trussed's user-presence request, which the
@@ -13,7 +13,13 @@
 # Ed25519 (0xE0) and X25519 (0xE1) import. After the command line round trip the
 # card-level half of the destructive hardware suite runs against the same card, which is
 # what proves the keys *work* -- `piv check` only reads them back.
-{ pkgs, piv-vpicc, piv-suite, algorithm ? "p256", ... }:
+{
+  pkgs,
+  piv-vpicc,
+  piv-suite,
+  algorithm ? "p256",
+  ...
+}:
 
 {
   name = "mind-the-virtual-piv-${algorithm}";
@@ -22,7 +28,10 @@
     # Provide mind-the-gap derivation via overlay
     nixpkgs.overlays = [ self.overlays.default ];
 
-    environment.systemPackages = [ pkgs.mind-the-gap piv-suite ];
+    environment.systemPackages = [
+      pkgs.mind-the-gap
+      piv-suite
+    ];
 
     # pcscd with vpcd as its only reader: a TCP listener on localhost that virtual cards
     # connect to, presented to clients as an ordinary PC/SC reader

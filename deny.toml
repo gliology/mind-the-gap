@@ -49,8 +49,7 @@ unknown-git = "deny"
 # Use official crate registry
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
-# yubikey.rs support for non-YubiKey PIV cards and the management key algorithm lookup,
-# until both are released
+# yubikey.rs's pending PRs (the fork's mind-the-gap branch), until they are released
 allow-git = [ "https://github.com/FlorianFranzen/yubikey.rs" ]
 
 [sources.allow-org]

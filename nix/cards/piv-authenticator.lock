@@ -1310,6 +1310,7 @@ dependencies = [
  "apdu-app",
  "asn1",
  "cbor-smol",
+ "crypto-bigint 0.5.5",
  "delog",
  "des 0.9.0",
  "dev-vpicc",

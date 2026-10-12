@@ -36,6 +36,22 @@
         "type": "github"
       }
     },
+    "nitrokey-3-firmware": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791896753,
+        "narHash": "sha256-MFPgznlcndP0IJa3x3O9gGX5NTth+9mf7KzkZtIG8jk=",
+        "owner": "Nitrokey",
+        "repo": "nitrokey-3-firmware",
+        "rev": "4160df2916efa7b5bcc4be9ea25a0445e22b57ba",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Nitrokey",
+        "repo": "nitrokey-3-firmware",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1790218706,
@@ -71,16 +87,16 @@
     "piv-authenticator": {
       "flake": false,
       "locked": {
-        "lastModified": 1791678311,
-        "narHash": "sha256-A0bOKb5POi45tAmamwS/1v3N80XXCON0lRpDigczhbE=",
+        "lastModified": 1791960507,
+        "narHash": "sha256-gb9KWnGQtzYnM15z70jVjpEDeT8PNW9mS9sXwl64ZZg=",
         "owner": "FlorianFranzen",
         "repo": "piv-authenticator",
-        "rev": "0945f9f7fddd6abb4b63b9f6bd47e7953042d876",
+        "rev": "7800b93e6a87f22d83a2cfcee7fbadccbabb767a",
         "type": "github"
       },
       "original": {
         "owner": "FlorianFranzen",
-        "ref": "mtg-integration",
+        "ref": "mind-the-gap",
         "repo": "piv-authenticator",
         "type": "github"
       }
@@ -89,9 +105,11 @@
       "inputs": {
         "crane": "crane",
         "fenix": "fenix",
+        "nitrokey-3-firmware": "nitrokey-3-firmware",
         "nixpkgs": "nixpkgs",
         "opcard": "opcard",
-        "piv-authenticator": "piv-authenticator"
+        "piv-authenticator": "piv-authenticator",
+        "usbip-device": "usbip-device"
       }
     },
     "rust-analyzer-src": {
@@ -108,6 +126,23 @@
         "owner": "rust-lang",
         "ref": "nightly",
         "repo": "rust-analyzer",
+        "type": "github"
+      }
+    },
+    "usbip-device": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791959720,
+        "narHash": "sha256-HSocUsL85qSYRBpcOty8t1nQt90vn0cZ9THBZNbpmgI=",
+        "owner": "FlorianFranzen",
+        "repo": "usbip-device",
+        "rev": "dcda71e2cb2f40ba871ed5e40244ebc61f697c99",
+        "type": "github"
+      },
+      "original": {
+        "owner": "FlorianFranzen",
+        "ref": "mind-the-gap",
+        "repo": "usbip-device",
         "type": "github"
       }
     }

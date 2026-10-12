@@ -165,9 +165,9 @@ tempfile = "3"
 p256 = { version = "0.14", features = [ "ecdh" ] }
 
 [patch.crates-io]
-# Until yubikey.rs releases support for Yubico-compatible cards that are not YubiKeys
-# (iqlusioninc/yubikey.rs#680: a Nitrokey 3 reports 6.6.6, which 0.9.0-rc.0 refuses to
-# open) and the lookup of the installed management key algorithm (#681), which such
-# cards need to authenticate with their default key. Pinned by revision, see the sequoia
-# note above.
-yubikey = { git = "https://github.com/FlorianFranzen/yubikey.rs", rev = "18a73c483d38a816cff3bd94f98bc22ab1424414" }
+# Until yubikey.rs releases its pending PRs: Yubico-compatible cards that are not
+# YubiKeys (#680, a Nitrokey 3 reports 6.6.6), the installed management key algorithm
+# (#681), Ed25519 certificates (#683) and RSA-4096 import. A revision of the fork's
+# mind-the-gap branch, upstream main plus those PRs from the generator in
+# ~/Gli.al/upstreaming/stacks; pinned by revision, see the sequoia note above.
+yubikey = { git = "https://github.com/FlorianFranzen/yubikey.rs", rev = "143135395bc29b6cfe4f478ad29258b555af732a" }

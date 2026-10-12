@@ -1,26 +1,23 @@
 # Open items
 
-- Add Gnuk as a second virtual-card target: package its emulation build
+- Add Gnuk as a second virtual-pgp target: package its emulation build
   (`--target=GNU_LINUX`, USB/IP) and attach it via `vhci-hcd` inside the test VM, covering
   the USB CCID transport that the opcard check bypasses (see "What is not emulated" in
   [docs/hardware-tests.md](docs/hardware-tests.md))
-- Nitrokey 3 PIV: the protocol work is done on our piv-authenticator fork
-  (github:FlorianFranzen/piv-authenticator, branch `ecc-import` -- ECC import, GET
-  METADATA, uuid serial, pin/touch policies, msroots, SET PIN RETRIES, Yubico client
-  compatibility) and the `virtual-piv` check provisions it end to end, warning-free, on
-  every `nix flake check`. Remaining: upstream the branch to trussed-dev as PRs (issues
-  #15/#16/#31/#32 track the wants), verify on real Nitrokey 3 hardware once a firmware
-  carries the fixes, and report the yubikey.rs slot-table bug upstream (its `Key::list`
-  reads the key history object as a certificate; `piv status` now lists slots itself
-  and is immune)
+- Nitrokey 3 PIV: the protocol work is open upstream as trussed-dev/piv-authenticator
+  PRs (#46 to #58, with GET METADATA, the policies, SET PIN RETRIES, digest padding and
+  the RSA layout waiting on #56), and the `virtual-piv` checks provision the fork's
+  `mind-the-gap` branch (main plus every PR) end to end, warning-free, on every `nix flake
+  check`. Remaining: the merges, verification on real Nitrokey 3 hardware once a firmware
+  carries the fixes, and the yubikey.rs slot-table bug (its `Key::list` reads the key
+  history object as a certificate; `piv status` lists slots itself and is immune)
 - piv-authenticator empty-slot reads cost ~127 ms each on real NK3 hardware (upstream
   issue #40): a written-containers bitmap in the persistent state (maintained in
   `ContainerStorage::save`/reset, checked in GET DATA and the key history object)
   would answer NotFound without touching external flash; propose upstream
 - Curve25519 PIV end use: the card-level suite runs on both curves in CI, but the
   PKCS#11 steps (TLS, S/MIME, SSH, NSS) stay with the P-256 run until OpenSC's PIV driver
-  drives Ed25519 and X25519 slots; the Curve25519 hardware entry also awaits a real token
-  (YubiKey 5.7+, or the Solo 2 build on the EVK)
+  drives Ed25519 and X25519 slots
 - canokey-qemu (a QEMU USB device implementing PIV and OpenPGP) remains the
   transport-covering alternative to the vpcd checks
 - Solo 2: VALIDATED ON EVK HARDWARE (2026-09-30, rev 0A LPCXpresso55S69): `piv upload`

@@ -50,8 +50,8 @@ decisions, not suggestions; when one must bend, say so explicitly rather than qu
 - Every dependency carries a comment saying why it exists. Default features are
   disabled wherever the defaults pull unused trees.
 - Forks and git dependencies are pinned by revision, never by tag, and allowlisted in
-  `deny.toml`. `cargo deny`, `cargo machete` and `typos` run as flake checks and stay
-  green.
+  `deny.toml`. `cargo deny`, `cargo machete`, `typos` and `nixfmt` run as flake
+  checks and stay green; `nix fmt` formats the Nix code.
 
 ## Verification bar
 

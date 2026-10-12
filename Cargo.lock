@@ -2614,7 +2614,7 @@ dependencies = [
 [[package]]
 name = "yubikey"
 version = "0.9.0-rc.0"
-source = "git+https://github.com/FlorianFranzen/yubikey.rs?rev=18a73c483d38a816cff3bd94f98bc22ab1424414#18a73c483d38a816cff3bd94f98bc22ab1424414"
+source = "git+https://github.com/FlorianFranzen/yubikey.rs?rev=143135395bc29b6cfe4f478ad29258b555af732a#143135395bc29b6cfe4f478ad29258b555af732a"
 dependencies = [
  "aes",
  "base16ct",

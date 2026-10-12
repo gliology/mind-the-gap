@@ -14,25 +14,53 @@
     crane.url = "github:ipetkov/crane";
 
     # Nitrokey's OpenPGP card implementation, run as the virtual card in the
-    # virtual-card check; not a flake, we build its vpicc example with crane
+    # virtual-pgp check; not a flake, we build its vpicc example with crane
     opcard = {
       url = "github:Nitrokey/opcard-rs";
       flake = false;
     };
 
     # The trussed PIV implementation (Nitrokey 3), run as the virtual card in the
-    # virtual-piv check. Pinned to our fork until the ECC import, GET METADATA and
-    # Yubico client compatibility work is upstreamed to trussed-dev
+    # virtual-piv checks and inside the simulated Nitrokey 3. The fork's mind-the-gap
+    # branch is trussed-dev's main plus every pending PR, rebuilt by the generator in
+    # ~/Gli.al/upstreaming/stacks; `nix flake update piv-authenticator` follows it
     piv-authenticator = {
-      url = "github:FlorianFranzen/piv-authenticator/mtg-integration";
+      url = "github:FlorianFranzen/piv-authenticator/mind-the-gap";
+      flake = false;
+    };
+
+    # Nitrokey's firmware, built as its USB/IP runner for the usbip-nk3 check: a whole
+    # Nitrokey 3 as a host process, attached as a USB device; not a flake either
+    nitrokey-3-firmware = {
+      url = "github:Nitrokey/nitrokey-3-firmware";
+      flake = false;
+    };
+
+    # The USB/IP device emulation the runner is built on: Sawchord/usbip-device's master
+    # plus the transfer handling the kernel needs (#10), from the same generator
+    usbip-device = {
+      url = "github:FlorianFranzen/usbip-device/mind-the-gap";
       flake = false;
     };
   };
 
-  outputs = { self, nixpkgs, fenix, crane, opcard, piv-authenticator }:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      fenix,
+      crane,
+      opcard,
+      piv-authenticator,
+      nitrokey-3-firmware,
+      usbip-device,
+    }:
     let
       # List of all supported system architectures
-      allSystems = [ "x86_64-linux" "aarch64-linux" ];
+      allSystems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
 
       # Helper to generate attrset entry for each system
       forEachSystem = nixpkgs.lib.genAttrs allSystems;
@@ -40,467 +68,82 @@
       # Helper to generate nameable attrset entry for each system
       forEachSystem' = f: builtins.listToAttrs (map f allSystems);
 
-      # The toolchain declared in rust-toolchain.toml, one derivation carrying cargo,
-      # rustc, rustfmt, clippy, rust-analyzer and rust-src
-      mkToolchain = system: fenix.packages.${system}.fromToolchainFile {
-        file = ./rust-toolchain.toml;
-        # Hash of the release manifest, identical for every system; it changes only when
-        # the channel in rust-toolchain.toml does. To refresh: set to
-        # nixpkgs.lib.fakeSha256, build, and copy the hash nix reports it "got".
-        sha256 = "sha256-SBKjxhC6zHTu0SyJwxLlQHItzMzYZ71VCWQC2hOzpRY=";
-      };
-
-      # Everything cargo: the package plus the fmt, clippy and test checks, all sharing
-      # one compilation of the dependency graph
-      mkRust = system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-          craneLib = (crane.mkLib pkgs).overrideToolchain (mkToolchain system);
-
-          libPath = pkgs.lib.makeLibraryPath (with pkgs; [ gmp nettle pcsclite ]);
-
-          # Keeps Cargo.{toml,lock} and every *.rs and *.toml -- build.rs, tests/ and
-          # rustfmt.toml all survive, while docs and nix files are no input to cargo
-          src = craneLib.cleanCargoSource ./.;
-
-          commonArgs = {
-            inherit src;
-            strictDeps = true;
-
-            nativeBuildInputs = with pkgs; [ pkg-config rustPlatform.bindgenHook ];
-            buildInputs = with pkgs; [ gmp nettle pcsclite ];
-          };
-
-          # Dependencies compiled once, reused by the package build, clippy and the tests
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-        in
-        {
-          # The developer reference, published next to the book under /rustdoc. Private
-          # items on purpose: the interesting functions of the builders are private, and
-          # this is documentation for people changing the crate, not consuming it
-          doc = craneLib.cargoDoc (commonArgs // {
-            inherit cargoArtifacts;
-            cargoDocExtraArgs = "--no-deps --document-private-items";
-
-            # A broken intra-doc link is a build failure, matching the book's link check
-            RUSTDOCFLAGS = "-D warnings";
-          });
-
-          package = craneLib.buildPackage (commonArgs // {
-            inherit cargoArtifacts;
-
-            # Tests run exactly once, in the test check below, where the external tools
-            # they gate on are actually present
-            doCheck = false;
-
-            nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ];
-
-            # mind-the-build executes during postInstall and loads these at runtime
-            LD_LIBRARY_PATH = libPath;
-
-            postInstall = ''
-              # Man pages and completion support are generated by additional binary
-              $out/bin/mind-the-build $out
-              rm $out/bin/mind-the-build
-
-              # Ensure needed dependencies can be located
-              wrapProgram "$out/bin/mind-the-gap" --prefix LD_LIBRARY_PATH : "${libPath}"
-            '';
-          });
-
-          checks = {
-            fmt = craneLib.cargoFmt { inherit src; };
-
-            # cargo-deny's offline checks: licenses, bans and source provenance, per
-            # deny.toml (cleanCargoSource keeps every *.toml, so the config is in src).
-            # The advisories check needs the RustSec database from the network, which the
-            # sandbox rightly refuses -- CI runs that part in a separate workflow step.
-            deny = craneLib.cargoDeny { inherit src; };
-
-            # The same tools as the test check, so `--all-targets` actually lints the
-            # gated tests instead of build.rs compiling them out
-            clippy = craneLib.cargoClippy (commonArgs // {
-              inherit cargoArtifacts;
-              cargoClippyExtraArgs = "--all-targets -- --deny warnings";
-
-              nativeBuildInputs = commonArgs.nativeBuildInputs
-                ++ (with pkgs; [ sequoia-sq gnupg openssl nss.tools ]);
-            });
-
-            # The tools live in nativeBuildInputs, not checkInputs: build.rs probes PATH
-            # to decide which tests exist at all, and it runs while the tests compile. A
-            # tool missing at that moment silently ignores its tests, which is the exact
-            # failure mode build.rs was written to surface.
-            test = craneLib.cargoTest (commonArgs // {
-              inherit cargoArtifacts;
-
-              nativeBuildInputs = commonArgs.nativeBuildInputs
-                ++ (with pkgs; [ sequoia-sq gnupg openssl nss.tools ]);
-
-              # Expose shared libraries so the test binaries can load them at runtime
-              LD_LIBRARY_PATH = libPath;
-
-              # GnuPG can not be run without access to its home dir
-              GNUPGHOME = "/tmp";
-            });
-
-            # The destructive on-card suites are compiled out of every ordinary run by the
-            # feature interlock, so nothing above type-checks them and they would rot
-            # silently. Compile them -- `--no-run`, so no card is ever touched -- to keep
-            # them honest.
-            hardware-tests = craneLib.cargoTest (commonArgs // {
-              inherit cargoArtifacts;
-
-              pname = "mind-the-gap-hardware-tests";
-              cargoExtraArgs = "--features destructive-hardware-tests";
-              cargoTestExtraArgs = "--no-run";
-
-              nativeBuildInputs = commonArgs.nativeBuildInputs
-                ++ (with pkgs; [ sequoia-sq gnupg openssl ]);
-            });
-          };
-
-          # The destructive PIV suite as a binary the virtual PIV check can run: the
-          # card-level entry points prove on-card signing and key agreement, which `piv
-          # check` cannot (it compares public keys). The check above compiles the same
-          # suite and discards it; this keeps the test executable, with the libraries the
-          # card stack loads at runtime on its path.
-          pivSuite = craneLib.buildPackage (commonArgs // {
-            inherit cargoArtifacts;
-
-            pname = "mind-the-gap-piv-suite";
-            doCheck = false;
-            cargoBuildCommand =
-              "cargo test --profile release --no-run --features destructive-hardware-tests --test piv_hardware";
-
-            nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ];
-
-            # The harness names the binary with a hash; it is the one executable file
-            # among the metadata next to it
-            installPhaseCommand = ''
-              mkdir -p $out/bin
-              cp "$(find target/release/deps -maxdepth 1 -type f -executable -name 'piv_hardware-*')" \
-                $out/bin/piv-suite
-              wrapProgram "$out/bin/piv-suite" --prefix LD_LIBRARY_PATH : "${libPath}"
-            '';
-          });
-        };
-
-      rust = forEachSystem mkRust;
-
-      # Nitrokey's opcard as a host binary: the vpicc example connects to vpcd and
-      # presents a complete OpenPGP card implementation as a PC/SC reader
-      mkOpcardVpicc = system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-          craneLib = (crane.mkLib pkgs).overrideToolchain (mkToolchain system);
-        in
-        craneLib.buildPackage {
-          pname = "opcard-vpicc";
-          version = "0";
-          src = opcard;
-
-          # Upstream does not track a Cargo.lock, so the dependency tree is pinned here:
-          # opcard.lock was generated from the locked input revision and vendored from it.
-          # Regenerate with `cargo generate-lockfile` in the input source when bumping.
-          cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = ./opcard.lock; };
-          postPatch = ''
-            cp ${./opcard.lock} Cargo.lock
-          '';
-
-          # The example's dependency tree reaches the pcsc crate, whose build script
-          # probes for the pcsclite headers
-          nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ];
-          buildInputs = with pkgs; [ pcsclite nettle gmp ];
-
-          # Examples are not installed by the default flow, and the crate's own tests
-          # want a card to talk to -- this build *is* the card
-          doCheck = false;
-          cargoBuildCommand = "cargo build --release --example vpicc";
-          installPhaseCommand = ''
-            mkdir -p $out/bin
-            cp target/release/examples/vpicc $out/bin/opcard-vpicc
-          '';
-        };
-
-      # The trussed PIV app as a host binary, same construction as opcard: its vpicc
-      # example connects to vpcd and presents the card as a PC/SC reader
-      mkPivVpicc = system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-          craneLib = (crane.mkLib pkgs).overrideToolchain (mkToolchain system);
-        in
-        craneLib.buildPackage {
-          pname = "piv-vpicc";
-          version = "0";
-          src = piv-authenticator;
-
-          # Upstream does not track a Cargo.lock, so the dependency tree is pinned here:
-          # piv-authenticator.lock was generated from the locked input revision.
-          # Regenerate with `cargo generate-lockfile` in the input source when bumping.
-          cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = ./piv-authenticator.lock; };
-          postPatch = ''
-            cp ${./piv-authenticator.lock} Cargo.lock
-          '';
-
-          # littlefs2-sys generates its bindings at build time
-          nativeBuildInputs = [ pkgs.rustPlatform.bindgenHook ];
-
-          # The crate's own tests want a card to talk to -- this build *is* the card
-          doCheck = false;
-          cargoBuildCommand = "cargo build --release --example vpicc";
-          installPhaseCommand = ''
-            mkdir -p $out/bin
-            cp target/release/examples/vpicc $out/bin/piv-vpicc
-          '';
-        };
-
-      # The live iso with the nixos test backdoor baked in, used by the boot checks only;
-      # The virtual PIV check for one algorithm, see virtual-piv-test.nix
-      mkVirtualPivTest = system: algorithm:
+      # Everything built for one system, assembled from the files under nix/
+      perSystem = forEachSystem (
+        system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
           nixos-lib = import (pkgs.path + "/nixos/lib") { };
-        in
-        (nixos-lib.runTest {
-          hostPkgs = pkgs;
-          node.specialArgs = { inherit self; };
-          imports = [
-            (import ./virtual-piv-test.nix {
-              inherit pkgs algorithm;
-              piv-vpicc = mkPivVpicc system;
-              piv-suite = rust.${system}.pivSuite;
-            })
-          ];
-        }).config.result;
-
-      # packages.iso remains the clean image
-      mkInstrumentedIso = system:
-        (nixpkgs.lib.nixosSystem {
-          inherit system;
-          modules = [
-            { nixpkgs.overlays = [ self.overlays.default ]; }
-            (import ./live-system.nix)
-            (nixpkgs.legacyPackages.${system}.path
-              + "/nixos/modules/testing/test-instrumentation.nix")
-          ];
-        }).config.system.build.isoImage;
-    in
-    {
-      # Checks: cargo fmt, clippy and tests, the documentation book and the two checks
-      # that guard its sources, the live system environment, and the iso boot path --
-      # bios and uefi on x86, uefi on aarch64, which has no bios to test
-      checks = forEachSystem (system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-          nixos-lib = import (pkgs.path + "/nixos/lib") { };
-        in
-        rust.${system}.checks // {
-          # Spell-check the source and prose. `fpr` (a GnuPG record type) is allowlisted in
-          # .typos.toml; everything else that trips this is a real typo.
-          typos = pkgs.runCommand "check-typos" { nativeBuildInputs = [ pkgs.typos ]; } ''
-            cd ${./.}
-            typos
-            touch $out
-          '';
-
-          # Unused-dependency check. Textual, so no build and no network -- the one rename
-          # false positive (tiny-bip39 imported as `bip39`) is ignored in Cargo.toml.
-          machete = pkgs.runCommand "check-machete" {
-            nativeBuildInputs = [ pkgs.cargo-machete ];
-          } ''
-            cd ${./.}
-            cargo-machete
-            touch $out
-          '';
-
-          # Rendering the book is its own check: mdbook fails on a malformed SUMMARY.md
-          # or a broken template, and the rendered site lands in the cache for the pages
-          # workflow to pull
-          book = self.packages.${system}.book;
-
-          # Rustdoc has its own failure modes -- a broken intra-doc link, a public item
-          # the missing_docs lint catches -- that neither clippy nor the book check sees
-          rustdoc = self.packages.${system}.rustdoc;
-
-          # What mdbook will not tell us: whether docs/ and docs/SUMMARY.md describe the
-          # same set of chapters. It is silent in both directions -- a file the summary
-          # omits is never rendered and drops out of the sidebar, and an entry with no
-          # file behind it makes mdbook create an empty stub and publish that -- so
-          # compare the two sets outright.
-          docs-summary = pkgs.runCommand "check-docs-summary" { docs = ./docs; } ''
-            if diff -u \
-              --label 'listed in docs/SUMMARY.md' <(
-                grep -o '](\([^)]*\.md\))' $docs/SUMMARY.md \
-                  | sed 's|^](||; s|)$||; s|^\./||' | sort -u
-              ) \
-              --label 'present in docs/' <(
-                cd $docs && find . -name '*.md' -printf '%P\n' \
-                  | grep -vx 'SUMMARY.md' | sort
-              )
-            then
-              touch $out
-            else
-              echo "error: docs/SUMMARY.md and docs/ describe different chapters" >&2
-              echo "  a '-' line is a summary entry with no file behind it" >&2
-              echo "  a '+' line is a chapter the summary leaves out" >&2
-              exit 1
-            fi
-          '';
-
-          # Relative links need no network to verify, which is the half of link checking
-          # that a sandbox can do honestly: a link to a chapter that is not there renders
-          # as a 404 and mdbook reports nothing. Web links are left to rot on purpose --
-          # there is no network here, and an unreachable third party site is no reason to
-          # fail a build. Inline `](target)` links only, which is every link the book
-          # uses; a fragment is stripped before the lookup, so this proves the file is
-          # there and says nothing about the anchor inside it.
-          docs-links = pkgs.runCommand "check-docs-links" { docs = ./docs; } ''
-            cd $docs
-
-            fail=0
-            while IFS=$'\t' read -r page target; do
-              case $target in
-                # Same-page anchor, web link, or mail address
-                "" | '#'* | *://* | mailto:*) continue ;;
-              esac
-
-              # Resolve against the page doing the linking, the way a reader's browser
-              # would; -m normalises `..` without needing the path to exist yet
-              rel=$(realpath -m --relative-to=. "$(dirname "$page")/''${target%%#*}")
-
-              case $rel in
-                ../*)
-                  echo "error: $page links to $target, which is outside docs/" >&2
-                  echo "  the site only carries docs/, so that link 404s once rendered" >&2
-                  fail=1
-                  continue
-                  ;;
-              esac
-
-              if [ ! -e "$rel" ]; then
-                echo "error: $page links to $target, which does not exist" >&2
-                fail=1
-              fi
-            done < <(
-              find . -name '*.md' -print0 \
-                | xargs -0 grep -o '](\([^)]*\))' /dev/null \
-                | sed 's|:](|\t|; s|)$||'
-            )
-
-            [ $fail -eq 0 ] || exit 1
-            touch $out
-          '';
-
-          # nixos-test to validate live system environment
-          live-system = (nixos-lib.runTest {
-            hostPkgs = pkgs;
-
-            # Make self available in the node config
-            node.specialArgs = { inherit self; };
-
-            # Add nixos test module
-            imports = [ ./nixos-test.nix ];
-          }).config.result;
-
-          # Provision a virtual OpenPGP card (Nitrokey's opcard behind vpcd) end to end:
-          # upload, check and config through the real binary, with no hardware involved
-          virtual-card = (nixos-lib.runTest {
-            hostPkgs = pkgs;
-            node.specialArgs = { inherit self; };
-            imports = [
-              (import ./virtual-card-test.nix {
-                inherit pkgs;
-                opcard-vpicc = mkOpcardVpicc system;
-              })
-            ];
-          }).config.result;
-
-          # The same for PIV, once per algorithm: provision the trussed piv-authenticator
-          # behind vpcd end to end -- reset, pin and management key handling, key import
-          # with metadata read-back, the certificate chain -- then run the card-level
-          # half of the destructive suite against it, so the card is seen signing and
-          # agreeing with the keys it took
-          virtual-piv = mkVirtualPivTest system "p256";
-          virtual-piv-curve25519 = mkVirtualPivTest system "curve25519";
-        } // (
-          let
-            bootChecks = import ./boot-test.nix {
-              inherit pkgs nixos-lib;
-              iso = mkInstrumentedIso system;
-            };
-          in
-          if system == "x86_64-linux" then
-            bootChecks
-          else
-            # aarch64 machines boot over UEFI only -- there is no BIOS firmware to test.
-            # The check runs without kvm too (the driver falls back to TCG emulation),
-            # which is what the github arm runners require.
-            { inherit (bootChecks) boot-uefi; }
-        ));
-
-      # Shell used for development
-      devShells = forEachSystem (system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
+          toolchain = import ./nix/toolchain.nix { inherit fenix system; };
+          craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
+          rust = import ./nix/rust.nix { inherit pkgs craneLib; };
         in
         {
-          default = pkgs.mkShell {
-            nativeBuildInputs =
-              # Tools the integration tests shell out to. Without them the affected tests
-              # report as ignored rather than silently passing, see build.rs.
-              (with pkgs; [ sequoia-sq gnupg openssl ])
-                # Tools for the PIV hardware checklist and its automated end-use steps,
-                # see docs/piv-hardware-tests.md
-                ++ (with pkgs; [ opensc yubikey-manager nss.tools openssh pkcs11-provider ])
-                # Documentation site, `mdbook serve --open` from the repository root
-                ++ (with pkgs; [ mdbook ])
-                ++ (with pkgs; [ cargo-deny cargo-machete typos pkg-config rustPlatform.bindgenHook ])
-                # The rust-toolchain.toml toolchain; rust-analyzer locates rust-src
-                # through its own sysroot, so no RUST_SRC_PATH is needed
-                ++ [ (mkToolchain system) ];
-
-            buildInputs = with pkgs; [ gmp nettle pcsclite ];
-
-            # Module paths for the PKCS#11 steps of the hardware suite and the manual
-            # checklist: the OpenSC module that talks to the card, and OpenSSL's pkcs11
-            # provider that lets `openssl s_client`/`cms` use keys living on it
-            PKCS11_MODULE = "${pkgs.opensc}/lib/opensc-pkcs11.so";
-            OPENSSL_PKCS11_PROVIDER = "${pkgs.pkcs11-provider}/lib/ossl-modules/pkcs11.so";
-
-            # Expose shared libraries so `cargo test` can load them at runtime
-            shellHook = with pkgs; ''
-              export LD_LIBRARY_PATH=${lib.makeLibraryPath [ gmp nettle pcsclite ]}:$LD_LIBRARY_PATH
-            '';
+          inherit pkgs toolchain rust;
+          docs = import ./nix/docs.nix {
+            inherit pkgs;
+            rustdoc = rust.doc;
           };
-
-          # Everything assets/export.py needs to regenerate the mark: shaping and
-          # outline tracing (harfbuzz + fontTools), rasterising (resvg), compression
-          # (oxipng) and the ico assembly (imagemagick). The word font is commercial
-          # and not packaged: point MTG_FONT at it when running the exporter.
-          assets = pkgs.mkShell {
-            nativeBuildInputs = with pkgs; [
-              (python3.withPackages (p: [ p.fonttools p.uharfbuzz ]))
-              resvg
-              oxipng
-              imagemagick
-            ];
+          live = import ./nix/live {
+            inherit
+              nixpkgs
+              self
+              system
+              pkgs
+              nixos-lib
+              ;
+          };
+          cards = import ./nix/cards {
+            inherit
+              pkgs
+              craneLib
+              opcard
+              piv-authenticator
+              nitrokey-3-firmware
+              usbip-device
+              ;
           };
         }
+      );
+    in
+    {
+      # Checks: cargo fmt, clippy and tests, the source and documentation checks, the
+      # live system environment, the iso boot path -- bios and uefi on x86, uefi on
+      # aarch64, which has no bios to test -- and the cards provisioned end to end
+      checks = forEachSystem (
+        system:
+        let
+          inherit (perSystem.${system})
+            pkgs
+            rust
+            docs
+            live
+            cards
+            ;
+        in
+        rust.checks
+        // import ./nix/lint.nix { inherit pkgs; }
+        // docs.checks
+        // live.checks
+        // import ./nix/tests {
+          inherit pkgs self cards;
+          piv-suite = rust.pivSuite;
+        }
+      );
+
+      # Shells used for development
+      # `nix fmt`: nixfmt over the whole tree, through the treefmt wrapper nixpkgs ships
+      # for exactly this, so it needs no file arguments
+      formatter = forEachSystem (system: perSystem.${system}.pkgs.nixfmt-tree);
+
+      devShells = forEachSystem (
+        system: import ./nix/shells.nix { inherit (perSystem.${system}) pkgs toolchain; }
       );
 
       # Bootable iso with live system to run on air-gapped device
       nixosConfigurations = forEachSystem' (system: {
         name = "live-${system}";
-        value = nixpkgs.lib.nixosSystem {
-          inherit system;
-          modules = [
-            # Add mind-the-gap through a nixpkgs overlay
-            { nixpkgs.overlays = [ self.overlays.default ]; }
-            # Add live system config module
-            (import ./live-system.nix)
-          ];
-        };
+        value = perSystem.${system}.live.configuration;
       });
 
       # Simple overlay to provide command line derivation
@@ -509,54 +152,29 @@
       };
 
       # Buildable outputs are:
-      packages = forEachSystem (system: {
-        # - Provide command line interface as default package
-        default = self.packages.${system}.mind-the-gap;
+      packages = forEachSystem (
+        system:
+        let
+          inherit (perSystem.${system}) rust docs;
+        in
+        {
+          # - Provide command line interface as default package
+          default = self.packages.${system}.mind-the-gap;
 
-        # - Provide live iso image as derivation
-        iso = self.nixosConfigurations."live-${system}".config.system.build.isoImage;
+          # - Provide live iso image as derivation
+          iso = self.nixosConfigurations."live-${system}".config.system.build.isoImage;
 
-        # - Render the documentation site from docs/, which is the book source
-        book =
-          let
-            pkgs = nixpkgs.legacyPackages.${system};
-          in
-          pkgs.stdenvNoCC.mkDerivation {
-            name = "mind-the-gap-book";
+          # - Render the documentation site from docs/, and bundle what the pages
+          #   workflow publishes: the book at the root, the developer reference under
+          #   /rustdoc
+          inherit (docs) book site;
 
-            # Only the book's own inputs, so a change to rust sources or the nix files
-            # leaves this derivation -- and the site the pages workflow pulls from the
-            # binary cache -- untouched
-            src = pkgs.lib.fileset.toSource {
-              root = ./.;
-              # theme/ carries only the favicon overrides; without it here the book
-              # would silently build with mdBook's stock icons
-              fileset = pkgs.lib.fileset.unions [ ./book.toml ./docs ./theme ];
-            };
+          # - Expose the developer reference built by crane
+          rustdoc = rust.doc;
 
-            nativeBuildInputs = [ pkgs.mdbook ];
-
-            buildPhase = "mdbook build --dest-dir $TMPDIR/book";
-            installPhase = "cp -r $TMPDIR/book $out";
-          };
-
-        # - Expose the developer reference built by crane
-        rustdoc = rust.${system}.doc;
-
-        # - Bundle what the pages workflow publishes: the book at the root of the site,
-        #   the developer reference under /rustdoc
-        site =
-          let
-            pkgs = nixpkgs.legacyPackages.${system};
-          in
-          pkgs.runCommand "mind-the-gap-site" { } ''
-            cp -r ${self.packages.${system}.book} $out
-            chmod -R +w $out
-            cp -r ${self.packages.${system}.rustdoc}/share/doc $out/rustdoc
-          '';
-
-        # - Build the command line interface with crane
-        mind-the-gap = rust.${system}.package;
-      });
+          # - Build the command line interface with crane
+          mind-the-gap = rust.package;
+        }
+      );
     };
 }
