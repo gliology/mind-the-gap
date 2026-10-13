@@ -81,6 +81,13 @@ branch until the PRs are merged: trussed-dev's main plus every pending PR, each 
 commit, rebuilt by a generator rather than by hand. `nix flake update piv-authenticator`
 follows it, and the flake input pin says exactly which revision the claims hold for.
 
+One more variant provisions the [build server profile](piv-build-server.md) on the same
+card: P-384 throughout, pin once and touch never on 9A, 9C and 9D, and management access
+without a touch. `virtual-piv-builder` reads the result back through yubikit, slot policies
+and management key metadata included. The virtual card is only ever the app as it is: other
+firmware is tested on the real thing, and a YubiKey 4 on firmware 4.3.7 has gone through the
+same provisioning and check, see [the build server chapter](piv-build-server.md#yubikey-4).
+
 ## The simulated Nitrokey 3 check
 
 The `usbip-nk3` check goes one layer further down. It builds Nitrokey's own firmware as

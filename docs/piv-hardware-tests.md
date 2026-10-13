@@ -206,8 +206,9 @@ mind-the-gap piv -d 2026-01-01 -v 10y upload -i <6-8 digit pin> -o uploaded.pem
 `upload` prompts for confirmation on stdin. Pass `-y` / `--yes` to skip the prompt when
 scripting; without a terminal and without `--yes` it now aborts rather than hanging.
 
-Expect **one** touch prompt during upload, when the management key is authenticated
-(`[Please touch device to authenticate management access!]`).
+Expect **no** touch prompt during upload: the derived management key is installed without
+the touch requirement, and the requirement is only switched on at the very end, while the
+session is still authenticated. The first touch comes with `check`.
 
 - [x] `cmp chain.pem uploaded.pem` -- upload and certify produce the same chain
 - [x] `mind-the-gap piv check` reports all four slots matching (this also needs a touch,

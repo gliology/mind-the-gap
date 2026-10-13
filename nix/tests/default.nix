@@ -27,6 +27,15 @@ let
         inherit (cards) piv-vpicc;
       }
     );
+
+  virtualPivBuilder =
+    algorithm:
+    vmTest (
+      import ./virtual-piv-builder.nix {
+        inherit pkgs algorithm;
+        inherit (cards) piv-vpicc;
+      }
+    );
 in
 {
   # Provision a virtual OpenPGP card (Nitrokey's opcard behind vpcd) end to end:
@@ -45,6 +54,11 @@ in
   # agreeing with the keys it took
   virtual-piv = virtualPiv "p256";
   virtual-piv-curve25519 = virtualPiv "curve25519";
+
+  # The build server profile (docs/piv-build-server.md) on the same card: P-384, pin once,
+  # touch never, management access without a touch, with the policies read back through
+  # yubikit. YubiKey 4 behaviour is covered on a real YubiKey 4, see docs/hardware-tests.md.
+  virtual-piv-builder = virtualPivBuilder "p384";
 
   # A whole simulated Nitrokey 3 attached over USB/IP: PIV and OpenPGP provisioned
   # through the kernel's USB stack, libccid and the firmware's own dispatcher

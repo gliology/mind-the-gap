@@ -7,6 +7,7 @@
 - [Key derivation](./derivation.md)
 - [Several cards from one seed](./multiple-cards.md)
 - [PIV certificate chain](./piv-certificates.md)
+- [PIV cards for build servers](./piv-build-server.md)
 
 # Testing
 

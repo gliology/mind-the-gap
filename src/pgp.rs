@@ -51,7 +51,9 @@ use openpgp_card::ocard::algorithm::Curve as CardCurve;
 use openpgp_card::ocard::crypto::{CardUploadableKey, EccKey, EccType, PrivateKeyMaterial};
 use openpgp_card::{Card, Error as CardError};
 
-use openpgp_card::ocard::data::{Fingerprint as CardFingerprint, KeyGenerationTime, TouchPolicy};
+use openpgp_card::ocard::data::{
+    Fingerprint as CardFingerprint, KeyGenerationTime, TouchPolicy, UserInteractionFlag,
+};
 use openpgp_card::state::Open;
 
 // Some use type shorthands
@@ -739,7 +741,7 @@ impl SeededSmartcard {
 
         for (role, policy) in &settings.touch {
             log::info!("Setting {:?} key touch policy: {:?}", role, policy);
-            admin.set_touch_policy(role.key_type(), (*policy).into())?;
+            set_touch_policy(&mut admin, role.key_type(), (*policy).into())?;
         }
 
         if !settings.lang.is_empty() {
@@ -1272,7 +1274,7 @@ impl SeededSmartcard {
             // Nitrokey 3's opcard rejects it with "incorrect parameters" -- must not lose
             // its freshly imported keys over a nicety. `pgp configure --touch` can set
             // whatever the card actually supports afterwards.
-            if let Err(err) = admin.set_touch_policy(kt, TouchPolicy::Cached) {
+            if let Err(err) = set_touch_policy(&mut admin, kt, TouchPolicy::Cached) {
                 log::warn!(
                     "Card refused the cached touch policy for the {kt:?} key ({err}); \
                      set a supported one with `pgp configure --touch`"
@@ -1355,6 +1357,32 @@ impl SeededSmartcard {
     }
 }
 
+/// Set the touch policy of one key, on cards that predate OpenPGP card 3 as well
+///
+/// `openpgp-card` looks the user interaction flags up in the application related data,
+/// where only version 3 cards list them. A YubiKey 4 speaks version 2.1 and still has the
+/// flags, at the same data objects, so when the lookup comes back empty they are written
+/// directly, with the button as the card's interaction feature.
+fn set_touch_policy(
+    admin: &mut Card<openpgp_card::state::Admin<'_, '_>>,
+    kt: KeyType,
+    policy: TouchPolicy,
+) -> std::result::Result<(), CardError> {
+    match admin.set_touch_policy(kt, policy) {
+        Err(CardError::UnsupportedFeature(_)) => {
+            let mut uif = UserInteractionFlag::try_from(vec![0x00, 0x20])?;
+            uif.set_touch_policy(policy);
+            let card = admin.as_transaction().card();
+            match kt {
+                KeyType::Signing => card.set_uif_pso_cds(&uif),
+                KeyType::Decryption => card.set_uif_pso_dec(&uif),
+                KeyType::Authentication => card.set_uif_pso_aut(&uif),
+                KeyType::Attestation => card.set_uif_attestation(&uif),
+            }
+        }
+        result => result,
+    }
+}
 /// Raw ECC key material for uploading to an OpenPGP card.
 /// Implements both `CardUploadableKey` and `EccKey`.
 struct RawEccKey {

@@ -84,6 +84,7 @@ When stepping away from a live-image machine mid-session, run `forget`: it clear
 | Token | OpenPGP | PIV |
 |---|---|---|
 | YubiKey 5 | works, in production, on both curves; the hardware suite passed on firmware 5.4.3 | works, in production, on P-256; the full [hardware checklist](piv-hardware-tests.md) passed on firmware 5.4.3. Ed25519 and X25519 PIV keys need firmware 5.7 or later, which has not been tested here |
+| YubiKey 4 | untested | works on P-384 with the [build server profile](piv-build-server.md#yubikey-4): a card on firmware 4.3.7 took the derived 3DES management key, passed `check` with every slot key proven by a signature challenge (the card has no GET METADATA), and then served unattended as a build server identity through OpenSC, signing SSH logins, git commits and Nix store paths. P-256 is expected to work the same way but has not been tried on the card. Its firmware differences are covered on that real card only (see [hardware tests](hardware-tests.md)) |
 | Nitrokey 3 | works, in production, on both curves — the same card code runs in CI as the [virtual card](hardware-tests.md) | works on both curves against [our patched card code](https://github.com/FlorianFranzen/piv-authenticator/tree/mtg-integration) in CI (the [virtual PIV checks](hardware-tests.md)); the shipped firmware (1.9.1 at the time of writing) lacks the ECC import, GET METADATA, RID selection and Curve25519 support that the patch set adds, all submitted to [trussed-dev/piv-authenticator](https://github.com/trussed-dev/piv-authenticator/pulls) |
 | Solo 2 | untested | works on both curves with the same patched card code, on an LPCXpresso55S69 running the Solo 2 firmware: the P-256 checklist and the Curve25519 card test passed over real CCID; a production Solo 2 is untested |
 | Gnuk | untested — planned as the second virtual-pgp target | no PIV applet |
@@ -92,7 +93,8 @@ When stepping away from a live-image machine mid-session, run `forget`: it clear
 test run. Anything marked untested may well work — the backends speak standard OpenPGP
 card and PIV protocols — but has not been verified against the device.
 
-Both backends take `--algorithm`: OpenPGP derives on Curve25519 by default and on NIST P-256 on
-request, PIV the other way round. Every token above takes both curves for OpenPGP; for PIV,
-Ed25519 and X25519 keys need YubiKey firmware 5.7 or later, or the patched trussed PIV app
-as it runs in CI and on the dev kit. See the [derivation chapter](derivation.md#the-algorithm-segment).
+Both backends take `--algorithm`: OpenPGP derives on Curve25519 by default and on NIST P-256
+on request, PIV the other way round, and PIV alone also takes NIST P-384. Every token above
+takes both curves for OpenPGP; for PIV, Ed25519 and X25519 keys need YubiKey firmware 5.7 or
+later, or the patched trussed PIV app as it runs in CI and on the dev kit. See the
+[derivation chapter](derivation.md#the-algorithm-segment).

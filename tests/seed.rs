@@ -98,3 +98,33 @@ fn p384_scalar_is_the_documented_construction() {
         derive_p384_scalar(&SEED, Some(&algorithm_label("authentication", "p384"))).unwrap();
     assert_ne!(*scalar, *other);
 }
+
+/// The weak key screen catches the FIPS 74 weak and semi-weak keys whatever their parity
+/// bits, and triple DES keys that collapse to single DES.
+#[test]
+fn weak_tdes_keys_are_recognised() {
+    use mind_the_gap::seed::{derive_tdes_key, is_weak_tdes_key};
+
+    let strong: [u8; 24] = core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11));
+    assert!(!is_weak_tdes_key(&strong));
+
+    // An all-zero middle key is the weak key 0101..01 with its parity bits cleared
+    let mut weak = strong;
+    weak[8..16].copy_from_slice(&[0u8; 8]);
+    assert!(is_weak_tdes_key(&weak));
+
+    // A semi-weak third key
+    let mut semi = strong;
+    semi[16..].copy_from_slice(&[0xE0, 0xFE, 0xE0, 0xFE, 0xF1, 0xFE, 0xF1, 0xFE]);
+    assert!(is_weak_tdes_key(&semi));
+
+    // K1 == K3, up to parity
+    let mut collapsed = strong;
+    collapsed[16..].copy_from_slice(&strong[..8]);
+    collapsed[16] ^= 1;
+    assert!(is_weak_tdes_key(&collapsed));
+
+    let key = derive_tdes_key(&SEED, Some(&algorithm_label("management", "tdes"))).unwrap();
+    assert!(!is_weak_tdes_key(&key));
+    assert_eq!(&key[..], &SEED.derive(Some(b"key:management:tdes"))[..24]);
+}

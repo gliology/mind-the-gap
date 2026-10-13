@@ -18,15 +18,16 @@ use crate::seed::{self, Algorithm, Seed256, Seed256Derive};
 use anyhow::{Result, anyhow, bail};
 
 use yubikey::certificate::CertInfo;
-use yubikey::piv::{self, AlgorithmId, RetiredSlotId, SlotId};
+use yubikey::piv::{self, AlgorithmId, ManagementSlotId, RetiredSlotId, SlotId};
 use yubikey::reader::Context;
 use yubikey::{
     CardId, CccId, Certificate as CardCertificate, ChuId, Error as CardError, MgmAlgorithmId,
-    MgmKey, MsRoots, PinPolicy, Serial, TouchPolicy, YubiKey,
+    MgmKey, MsRoots, PinPolicy, Serial, TouchPolicy, Version, YubiKey,
 };
 
 use cms::content_info::ContentInfo;
 
+use p256::ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{DerSignature, SigningKey};
 
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
@@ -92,6 +93,15 @@ const NAME_ISSUING_CA: &str = "issuing-ca";
 
 /// Derivation name for the card management key in slot 9B
 const NAME_MANAGEMENT: &str = "management";
+
+/// Algorithm segment of the triple DES management key, `key:management:tdes`
+///
+/// The AES-256 key predates the segment and keeps its bare `key:management` label, frozen
+/// with the rest of `mtg1`; the 3DES key is a later, additive label.
+const SEGMENT_TDES: &str = "tdes";
+
+/// First firmware with AES management keys; YubiKey 4 and YubiKey 5 before 5.4 take 3DES only
+const FIRST_AES_MANAGEMENT: Version = Version { major: 5, minor: 4, patch: 0 };
 
 /// Derivation name for the key management key, live in slot 9D and archived in a retired slot
 const NAME_KEY_MANAGEMENT: &str = "key-management";
@@ -343,6 +353,28 @@ impl From<SharedSlot> for SlotId {
             SharedSlot::KeyManagement => SlotId::KeyManagement,
         }
     }
+}
+
+/// Algorithm of the derived management key `upload` installs in slot 9B
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ManagementKeyArg {
+    /// AES-256 when the card reports firmware 5.4 or later, triple DES before
+    #[default]
+    Auto,
+    /// AES-256: YubiKey 5.4 and later, Nitrokey 3, the trussed PIV app
+    Aes256,
+    /// Triple DES: the only management key a YubiKey 4, or a YubiKey 5 before 5.4, takes
+    Tdes,
+}
+
+/// Whether management access to a provisioned card demands a touch
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ManagementTouchArg {
+    /// Require a touch for every management authentication
+    #[default]
+    Always,
+    /// Never require a touch, e.g. on a server card provisioned air-gapped
+    Never,
 }
 
 /// Command line mirror of [`yubikey::TouchPolicy`], which is a foreign type
@@ -824,6 +856,12 @@ pub struct SeededSmartcard {
 
     /// Whether to write the certificate authorities to the card's `msroots` object
     msroots: bool,
+
+    /// Algorithm of the management key `upload` installs
+    management_algorithm: ManagementKeyArg,
+
+    /// Whether `upload` leaves management access demanding a touch
+    management_touch: bool,
 }
 
 impl SeededSmartcard {
@@ -856,6 +894,8 @@ impl SeededSmartcard {
             pin_policy: None,
             touch_policy: None,
             msroots: true,
+            management_algorithm: ManagementKeyArg::Auto,
+            management_touch: true,
         }
     }
 
@@ -1009,6 +1049,21 @@ impl SeededSmartcard {
         self
     }
 
+    /// Pick the algorithm of the management key `upload` installs
+    ///
+    /// `check` ignores this and derives for whatever algorithm the card reports, so it needs
+    /// no flag to verify either kind.
+    pub fn with_management_key(mut self, algorithm: ManagementKeyArg) -> Self {
+        self.management_algorithm = algorithm;
+        self
+    }
+
+    /// Choose whether management access keeps demanding a touch after `upload`
+    pub fn with_management_touch(mut self, touch: ManagementTouchArg) -> Self {
+        self.management_touch = touch == ManagementTouchArg::Always;
+        self
+    }
+
     /// Enable or disable writing the authorities to the card's `msroots` object
     pub fn with_msroots(mut self, msroots: bool) -> Self {
         self.msroots = msroots;
@@ -1041,18 +1096,53 @@ impl SeededSmartcard {
     /// Check that an available PIV card matches the derived chain
     ///
     /// Every slot is inspected before anything is reported. A card provisioned from the wrong
-    /// seed, or with the wrong `--date` / `--card-id` / DN flags, disagrees in *all* of them,
+    /// seed, or with the wrong `--date`, `--subkey` or DN flags, disagrees in *all* of them,
     /// and failing on the first would hide how far the divergence actually goes.
+    ///
+    /// Slot keys are compared through `GET METADATA`. A card without it (YubiKey before
+    /// 5.3) proves each key by signing a random challenge instead, which needs `--pin` for
+    /// every slot whose pin policy is not `never`; its slot policies cannot be read at all.
     pub fn check(&self, target: Option<String>) -> Result<()> {
         let chain = self.generate_chain()?;
         let mut token = open_token(target)?;
 
-        // Card has to be under our management key. The prompt goes to stderr: stdout may be
-        // carrying PEM or a report, and a buried prompt is a missed touch and a failed run.
-        log::info!("Verifying smart card management key");
-        eprintln!("[Please touch device to authenticate management access!]");
-        token.authenticate(&self.management_key()?)?;
-        eprintln!();
+        // Card has to be under our management key, in whatever algorithm it holds one: the
+        // derivation for each is fixed, so the card's answer decides which to compare with
+        let algorithm = MgmAlgorithmId::current(&mut token)?;
+        let requested = self.management_algorithm(&token);
+        if self.management_algorithm != ManagementKeyArg::Auto && algorithm != requested {
+            log::warn!(
+                "The card holds a {algorithm:?} management key, not the requested {requested:?}"
+            );
+        }
+
+        // The management key's touch policy, where the card can report it. Advisory like the
+        // slot policies below.
+        let expected_touch = if self.management_touch {
+            TouchPolicy::Always
+        } else {
+            TouchPolicy::Never
+        };
+        if let Ok(metadata) =
+            piv::metadata(&mut token, SlotId::Management(ManagementSlotId::Management))
+            && let Some((_, touch)) = metadata.policy
+            && touch != expected_touch
+        {
+            log::warn!(
+                "Policy mismatch in management key: card touch={touch:?}, expected={expected_touch:?}"
+            );
+        }
+
+        // The prompt goes to stderr: stdout may be carrying PEM or a report, and a buried
+        // prompt is a missed touch and a failed run
+        log::info!("Verifying smart card {algorithm:?} management key");
+        if self.management_touch {
+            eprintln!("[Please touch device to authenticate management access!]");
+        }
+        token.authenticate(&self.management_key(algorithm)?)?;
+        if self.management_touch {
+            eprintln!();
+        }
 
         // The supplied user pin, if any, has to open the card. A wrong pin consumes one of
         // the card's retries, but that is inherent to verifying it at all.
@@ -1066,8 +1156,28 @@ impl SeededSmartcard {
         // bug here, not a disagreement with the card.
         let mut mismatches: Vec<String> = Vec::new();
 
+        // A card without GET METADATA warns about what it cannot show once, not per slot
+        let mut policies_warned = false;
+        let mut pin_warned = false;
+
         for (slot, expected) in &chain.leaves {
             match piv::metadata(&mut token, *slot) {
+                Err(CardError::NotSupported) => {
+                    if !policies_warned {
+                        log::warn!(
+                            "Card has no GET METADATA: slot pin and touch policies are not \
+                             verifiable on this card, slot keys are proven by signing"
+                        );
+                        policies_warned = true;
+                    }
+
+                    let spki = expected.tbs_certificate().subject_public_key_info();
+                    if let Some(problem) =
+                        self.challenge_slot(&mut token, *slot, spki, &mut pin_warned)?
+                    {
+                        mismatches.push(problem);
+                    }
+                }
                 Err(err) => mismatches.push(format!("{slot:?} slot: metadata unreadable: {err}")),
                 Ok(metadata) => {
                     // Key material has to match what we would derive
@@ -1147,6 +1257,95 @@ impl SeededSmartcard {
         crate::common::report_mismatches("chain", mismatches)
     }
 
+    /// Prove that `slot` holds the key behind `spki` on a card that cannot report it
+    ///
+    /// The card signs a fresh random digest, as wide as the curve's field, and the signature
+    /// has to verify under the derived public key. Only the holder of the derived private
+    /// key can produce one, so this proves the key as firmly as reading it back would. It
+    /// returns the mismatch to report, or `None` when the key verified or could not be
+    /// challenged, which is warned about rather than failed: that is a limit of the card,
+    /// not a disagreement with the seed.
+    fn challenge_slot(
+        &self,
+        token: &mut YubiKey,
+        slot: SlotId,
+        spki: &SubjectPublicKeyInfoOwned,
+        pin_warned: &mut bool,
+    ) -> Result<Option<String>> {
+        let algorithm = slot_role(slot).card_algorithm(self.algorithm);
+        let width = match algorithm {
+            AlgorithmId::EccP256 => 32,
+            AlgorithmId::EccP384 => 48,
+            // Cards without GET METADATA predate Ed25519 and X25519 by several firmware
+            // generations, so this is a card answering inconsistently
+            other => {
+                log::warn!(
+                    "{slot:?} slot: cannot verify a {other:?} key on a card without GET \
+                     METADATA, skipping it"
+                );
+                return Ok(None);
+            }
+        };
+
+        // Signing is subject to the slot's pin policy. Verified again right before the
+        // signature, which is what a pin-always slot demands; a pin-once slot does not mind.
+        let (pin_policy, touch_policy) = self.policies_for(slot);
+        if pin_policy != PinPolicy::Never {
+            match &self.pin {
+                Some(pin) => token.verify_pin(pin.as_bytes())?,
+                None => {
+                    if !*pin_warned {
+                        log::warn!(
+                            "Slot keys cannot be verified on this card without --pin: it has \
+                             no GET METADATA, and signing the challenge needs the pin"
+                        );
+                        *pin_warned = true;
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+
+        let mut digest = vec![0u8; width];
+        getrandom::fill(&mut digest)
+            .map_err(|err| anyhow!("No OS entropy for the signature challenge: {err}"))?;
+
+        if touch_policy != TouchPolicy::Never {
+            eprintln!("[Please touch device to prove the {slot:?} key!]");
+        }
+        let signature = match piv::sign_data(token, &digest, algorithm, slot) {
+            Ok(signature) => signature,
+            Err(err) => {
+                return Ok(Some(format!("{slot:?} slot: signature challenge failed: {err}")));
+            }
+        };
+
+        let point = spki.subject_public_key.raw_bytes();
+        let verified = match algorithm {
+            AlgorithmId::EccP256 => {
+                let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(point)
+                    .map_err(|err| anyhow!("Derived P-256 key is malformed: {err}"))?;
+                DerSignature::from_bytes(&signature)
+                    .is_ok_and(|signature| key.verify_prehash(&digest, &signature).is_ok())
+            }
+            _ => {
+                let key = p384::ecdsa::VerifyingKey::from_sec1_bytes(point)
+                    .map_err(|err| anyhow!("Derived P-384 key is malformed: {err}"))?;
+                p384::ecdsa::DerSignature::from_bytes(&signature)
+                    .is_ok_and(|signature| key.verify_prehash(&digest, &signature).is_ok())
+            }
+        };
+
+        if !verified {
+            return Ok(Some(format!(
+                "{slot:?} slot: public key is not the derived one (signature challenge)"
+            )));
+        }
+
+        log::info!("{slot:?} slot key proven by a signature challenge");
+        Ok(None)
+    }
+
     /// Generate keys and certificates and upload them to a card
     pub fn upload(&self, target: Option<String>) -> Result<CertChain> {
         // Build the whole chain before touching the card, so that a derivation or encoding
@@ -1155,7 +1354,7 @@ impl SeededSmartcard {
 
         let mut token = open_token(target)?;
 
-        self.reset_and_lock(&mut token)?;
+        let algorithm = self.reset_and_lock(&mut token)?;
         self.upload_card_identifiers(&mut token)?;
         self.upload_subcerts(&chain, &mut token)?;
 
@@ -1169,9 +1368,17 @@ impl SeededSmartcard {
         // Everything is on the card, so future management access can now demand a touch. Done
         // last on purpose: setting the flag needs no touch itself (we are still authenticated),
         // and leaving it until the end means a card is never wiped for a button that was not
-        // pressed in time.
-        log::info!("Requiring touch for future management access");
-        self.management_key()?.set_manual(&mut token, true)?;
+        // pressed in time. A card that opts out keeps the key installed without the flag by
+        // `reset_and_lock`: a build server's card is provisioned on an air-gapped machine, and
+        // the derived management key never reaches the server it then lives in, so the touch
+        // would guard nothing there while costing every unattended re-check a button press.
+        if self.management_touch {
+            log::info!("Requiring touch for future management access");
+            self.management_key(algorithm)?
+                .set_manual(&mut token, true)?;
+        } else {
+            log::info!("Management access stays touch-free (--management-key-touch never)");
+        }
 
         // Dropping the session works by selecting the Yubico management applet, which only
         // exists on YubiKeys -- on other PIV implementations the authentication simply ends
@@ -1238,12 +1445,43 @@ impl SeededSmartcard {
         (self.pin_policy.unwrap_or(*pin), self.touch_policy.unwrap_or(*touch))
     }
 
-    /// Management key derived from the subkey generation seed
-    fn management_key(&self) -> Result<MgmKey> {
+    /// Management key derived from the subkey generation seed, in `algorithm`
+    ///
+    /// Each algorithm derives under its own label, so the two keys share no bytes: the
+    /// 3DES key is not a truncation of the AES-256 one.
+    fn management_key(&self, algorithm: MgmAlgorithmId) -> Result<MgmKey> {
         // Moved in by value so our copy is wiped when `from_bytes` drops it; the `MgmKey`
         // itself keeps an unwiped internal cipher-key copy, so callers keep it short-lived
-        let mgmt_seed = self.subseed.key(NAME_MANAGEMENT);
-        Ok(MgmKey::from_bytes(mgmt_seed, Some(MgmAlgorithmId::Aes256))?)
+        Ok(match algorithm {
+            MgmAlgorithmId::Aes256 => {
+                MgmKey::from_bytes(self.subseed.key(NAME_MANAGEMENT), Some(algorithm))?
+            }
+            MgmAlgorithmId::ThreeDes => {
+                let label = seed::algorithm_label(NAME_MANAGEMENT, SEGMENT_TDES);
+                MgmKey::from_bytes(
+                    seed::derive_tdes_key(&self.subseed, Some(&label))?,
+                    Some(algorithm),
+                )?
+            }
+            other => bail!(
+                "The card's management key is {other:?}, which this tool never installs: \
+                 it was not provisioned by mind-the-gap"
+            ),
+        })
+    }
+
+    /// Algorithm of the management key `upload` installs on `token`
+    fn management_algorithm(&self, token: &YubiKey) -> MgmAlgorithmId {
+        match self.management_algorithm {
+            ManagementKeyArg::Aes256 => MgmAlgorithmId::Aes256,
+            ManagementKeyArg::Tdes => MgmAlgorithmId::ThreeDes,
+            // The reported version is what decides: a Nitrokey 3 or the trussed PIV app
+            // reports 6.6.6 and takes AES, a YubiKey 4 reports 4.x and takes 3DES only
+            ManagementKeyArg::Auto if token.version() >= FIRST_AES_MANAGEMENT => {
+                MgmAlgorithmId::Aes256
+            }
+            ManagementKeyArg::Auto => MgmAlgorithmId::ThreeDes,
+        }
     }
 
     /// Write the CHUID and CCC data objects
@@ -1368,7 +1606,9 @@ impl SeededSmartcard {
     }
 
     /// Wipe the card and install the derived management key and user pin
-    fn reset_and_lock(&self, token: &mut YubiKey) -> Result<()> {
+    ///
+    /// Returns the algorithm of the installed management key, for `upload` to finish with.
+    fn reset_and_lock(&self, token: &mut YubiKey) -> Result<MgmAlgorithmId> {
         // Lock pin (by repeated tries) ...
         //
         // Both loops are bounded: the retry counters are a u8 on the wire, so no card can
@@ -1434,7 +1674,9 @@ impl SeededSmartcard {
         // nothing provisioned in exchange -- and the prompt only lasts as long as the token's
         // touch timeout. `require_touch` is switched on at the end of `upload` instead, where
         // the same failure costs nothing and can simply be repeated.
-        let mgmt_key = self.management_key()?;
+        let algorithm = self.management_algorithm(token);
+        log::info!("Installing the derived {algorithm:?} management key");
+        let mgmt_key = self.management_key(algorithm)?;
         mgmt_key.set_manual(token, false)?;
         token.authenticate(&mgmt_key)?;
 
@@ -1450,7 +1692,7 @@ impl SeededSmartcard {
         // Disable puk
         token.block_puk()?;
 
-        Ok(())
+        Ok(algorithm)
     }
 
     /// Import the slot keys and store their certificates
@@ -1465,12 +1707,24 @@ impl SeededSmartcard {
 
             key.import(token, *slot, touch_policy, pin_policy)?;
 
-            // Invariant: the card has to hold the key we certified
-            let on_card = piv::metadata(token, *slot)?
-                .public
-                .ok_or_else(|| anyhow!("Failed to retrieve public key"))?;
-            if on_card.to_der()? != cert.tbs_certificate().subject_public_key_info().to_der()? {
-                bail!("Imported key for {:?} does not match the certified key", slot);
+            // Invariant: the card has to hold the key we certified. A card without GET
+            // METADATA (YubiKey before 5.3) cannot say which key it holds; `check` proves it
+            // by a signature challenge instead, which needs the pin and possibly a touch per
+            // slot, too much to impose on every upload.
+            match piv::metadata(token, *slot) {
+                Ok(metadata) => {
+                    let on_card = metadata
+                        .public
+                        .ok_or_else(|| anyhow!("Failed to retrieve public key"))?;
+                    let want = cert.tbs_certificate().subject_public_key_info().to_der()?;
+                    if on_card.to_der()? != want {
+                        bail!("Imported key for {:?} does not match the certified key", slot);
+                    }
+                }
+                Err(CardError::NotSupported) => {
+                    log::info!("Card has no GET METADATA; the imported key is verified by `check`")
+                }
+                Err(err) => return Err(err.into()),
             }
 
             log::info!("Uploading {:?} certificate", slot);
@@ -1661,5 +1915,109 @@ impl BuilderProfile for PivLeaf {
         // Deliberately no basic constraints: x509-cert always marks them critical and the
         // NIST PIV end-entity profile omits the extension entirely.
         Ok(extensions)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn card() -> SeededSmartcard {
+        SeededSmartcard::new(&[3u8; 32], Some("builder".into()), "Builder".into())
+    }
+
+    /// Without overrides every slot keeps the policy SP 800-73 asks for, retired slots that of
+    /// the key management slot whose keys they archive.
+    #[test]
+    fn policies_default_per_slot() {
+        let card = card();
+        let retired = SlotId::Retired(RetiredSlotId::try_from(0x82).unwrap());
+
+        assert_eq!(
+            card.policies_for(SlotId::Authentication),
+            (PinPolicy::Once, TouchPolicy::Cached)
+        );
+        assert_eq!(card.policies_for(SlotId::Signature), (PinPolicy::Always, TouchPolicy::Always));
+        assert_eq!(
+            card.policies_for(SlotId::KeyManagement),
+            (PinPolicy::Once, TouchPolicy::Cached)
+        );
+        assert_eq!(
+            card.policies_for(SlotId::CardAuthentication),
+            (PinPolicy::Never, TouchPolicy::Never)
+        );
+        assert_eq!(card.policies_for(retired), (PinPolicy::Once, TouchPolicy::Cached));
+    }
+
+    /// The build server profile: the overrides reach 9A, 9C, 9D and the retired slots, while
+    /// 9E stays pin- and touch-free as the spec requires.
+    #[test]
+    fn policy_overrides_skip_card_authentication() {
+        let card = card()
+            .with_pin_policy(PinPolicy::Once)
+            .with_touch_policy(TouchPolicy::Never);
+        let retired = SlotId::Retired(RetiredSlotId::try_from(0x83).unwrap());
+
+        for slot in [
+            SlotId::Authentication,
+            SlotId::Signature,
+            SlotId::KeyManagement,
+            retired,
+        ] {
+            assert_eq!(
+                card.policies_for(slot),
+                (PinPolicy::Once, TouchPolicy::Never),
+                "{slot:?} slot ignored the override"
+            );
+        }
+        assert_eq!(
+            card.policies_for(SlotId::CardAuthentication),
+            (PinPolicy::Never, TouchPolicy::Never)
+        );
+    }
+
+    /// The 3DES management key: 24 bytes, reproducible, not weak, and sharing nothing with
+    /// the AES-256 key of the same card.
+    #[test]
+    fn tdes_management_key_is_independent_of_aes() {
+        let tdes = card().management_key(MgmAlgorithmId::ThreeDes).unwrap();
+        let again = card().management_key(MgmAlgorithmId::ThreeDes).unwrap();
+        let aes = card().management_key(MgmAlgorithmId::Aes256).unwrap();
+
+        assert_eq!(tdes.algorithm_id(), MgmAlgorithmId::ThreeDes);
+        assert_eq!(aes.algorithm_id(), MgmAlgorithmId::Aes256);
+        assert_eq!(tdes.as_ref().len(), 24);
+        assert_eq!(aes.as_ref().len(), 32);
+        assert_eq!(tdes.as_ref(), again.as_ref());
+        assert!(!seed::is_weak_tdes_key(tdes.as_ref().try_into().unwrap()));
+
+        // Not a truncation of the AES key, nor overlapping it anywhere
+        assert_ne!(tdes.as_ref(), &aes.as_ref()[..24]);
+        for window in tdes.as_ref().windows(8) {
+            assert!(!aes.as_ref().windows(8).any(|other| other == window));
+        }
+
+        // The documented label, and the AES key's unchanged one
+        let label = seed::algorithm_label(NAME_MANAGEMENT, SEGMENT_TDES);
+        assert_eq!(label, b"key:management:tdes");
+        let subseed = card().subseed;
+        assert_eq!(aes.as_ref(), &subseed.key(NAME_MANAGEMENT)[..]);
+        assert_eq!(tdes.as_ref(), &subseed.derive(Some(&label))[..24]);
+
+        // A different card gets a different key
+        let other = SeededSmartcard::new(&[3u8; 32], Some("other".into()), "Builder".into())
+            .management_key(MgmAlgorithmId::ThreeDes)
+            .unwrap();
+        assert_ne!(tdes.as_ref(), other.as_ref());
+    }
+
+    /// Algorithms this tool never installs are refused with a reason, not guessed at.
+    #[test]
+    fn foreign_management_key_algorithms_are_refused() {
+        let err = match card().management_key(MgmAlgorithmId::Aes192) {
+            Ok(_) => panic!("an AES-192 management key was derived"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("never installs"), "{err}");
     }
 }

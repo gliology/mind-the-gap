@@ -238,11 +238,12 @@ impl Algorithm {
     }
 }
 
-/// Maximum number of re-derivations while searching for a valid P-256 or P-384 scalar.
+/// Maximum number of re-derivations while searching for a valid P-256 or P-384 scalar, or
+/// for a triple DES key that is not weak.
 ///
-/// A rejection happens with probability of roughly 2^-32 per draw on P-256 and 2^-190 on
-/// P-384, so in practice the first candidate is always accepted; the bound merely keeps the
-/// functions total.
+/// A rejection happens with probability of roughly 2^-32 per draw on P-256, 2^-190 on P-384
+/// and 2^-50 for triple DES, so in practice the first candidate is always accepted; the
+/// bound merely keeps the functions total.
 const MAX_SCALAR_TRIES: usize = 8;
 
 /// Derive a *valid* P-256 secret scalar, re-deriving deterministically on rejection.
@@ -298,4 +299,77 @@ pub fn derive_p384_scalar(parent: &Seed256, path: Option<&[u8]>) -> Result<Zeroi
     }
 
     bail!("Failed to derive a valid P-384 scalar")
+}
+
+/// Width of a triple DES key in bytes: three DES keys of eight bytes each
+pub const TDES_KEY_BYTES: usize = 24;
+
+/// The four weak and twelve semi-weak DES keys (FIPS 74, section 3.6), in odd parity
+const DES_WEAK_KEYS: [[u8; 8]; 16] = [
+    [0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01],
+    [0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE],
+    [0xE0, 0xE0, 0xE0, 0xE0, 0xF1, 0xF1, 0xF1, 0xF1],
+    [0x1F, 0x1F, 0x1F, 0x1F, 0x0E, 0x0E, 0x0E, 0x0E],
+    [0x01, 0x1F, 0x01, 0x1F, 0x01, 0x0E, 0x01, 0x0E],
+    [0x1F, 0x01, 0x1F, 0x01, 0x0E, 0x01, 0x0E, 0x01],
+    [0x01, 0xE0, 0x01, 0xE0, 0x01, 0xF1, 0x01, 0xF1],
+    [0xE0, 0x01, 0xE0, 0x01, 0xF1, 0x01, 0xF1, 0x01],
+    [0x01, 0xFE, 0x01, 0xFE, 0x01, 0xFE, 0x01, 0xFE],
+    [0xFE, 0x01, 0xFE, 0x01, 0xFE, 0x01, 0xFE, 0x01],
+    [0x1F, 0xE0, 0x1F, 0xE0, 0x0E, 0xF1, 0x0E, 0xF1],
+    [0xE0, 0x1F, 0xE0, 0x1F, 0xF1, 0x0E, 0xF1, 0x0E],
+    [0x1F, 0xFE, 0x1F, 0xFE, 0x0E, 0xFE, 0x0E, 0xFE],
+    [0xFE, 0x1F, 0xFE, 0x1F, 0xFE, 0x0E, 0xFE, 0x0E],
+    [0xE0, 0xFE, 0xE0, 0xFE, 0xF1, 0xFE, 0xF1, 0xFE],
+    [0xFE, 0xE0, 0xFE, 0xE0, 0xFE, 0xF1, 0xFE, 0xF1],
+];
+
+/// Whether a triple DES key is weak: one of its three DES keys is weak or semi-weak, or two
+/// of them coincide, which collapses the cipher to single DES
+///
+/// DES ignores the low bit of every byte (it is a parity bit), so the comparison does too.
+/// Neither `yubikey` nor the cards are relied on for this: the crate's parser accepts any 24
+/// bytes, and what a card refuses varies by firmware.
+pub fn is_weak_tdes_key(key: &[u8; TDES_KEY_BYTES]) -> bool {
+    let strip = |chunk: &[u8]| -> [u8; 8] {
+        let mut out = [0u8; 8];
+        for (out, byte) in out.iter_mut().zip(chunk) {
+            *out = byte & 0xfe;
+        }
+        out
+    };
+
+    let parts = [strip(&key[..8]), strip(&key[8..16]), strip(&key[16..])];
+    let weak = parts
+        .iter()
+        .any(|part| DES_WEAK_KEYS.iter().any(|weak| strip(weak) == *part));
+
+    weak || parts[0] == parts[1] || parts[1] == parts[2] || parts[0] == parts[2]
+}
+
+/// Derive a triple DES key that is not weak, re-deriving deterministically on rejection.
+///
+/// The key is the first 24 bytes of the labelled argon2id output; should those be weak (see
+/// [`is_weak_tdes_key`]), the output moves on under `key:tdes-retry` and the next 24 bytes
+/// are tried. A rejection has a probability of about 2^-50, so the bound only keeps the
+/// function total.
+pub fn derive_tdes_key(
+    parent: &Seed256,
+    path: Option<&[u8]>,
+) -> Result<Zeroizing<[u8; TDES_KEY_BYTES]>> {
+    let mut candidate = parent.derive(path);
+
+    for _ in 0..MAX_SCALAR_TRIES {
+        let mut key = Zeroizing::new([0u8; TDES_KEY_BYTES]);
+        key.copy_from_slice(&candidate[..TDES_KEY_BYTES]);
+
+        if !is_weak_tdes_key(&key) {
+            return Ok(key);
+        }
+
+        log::warn!("Derived a weak triple DES key, re-deriving");
+        candidate = candidate.key("tdes-retry");
+    }
+
+    bail!("Failed to derive a triple DES key that is not weak")
 }

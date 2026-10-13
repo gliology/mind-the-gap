@@ -196,6 +196,14 @@ enum Backend {
         #[arg(long, value_enum, global = true, env = "MIND_THE_ALGORITHM")]
         algorithm: Option<Algorithm>,
 
+        /// Algorithm of the management key upload installs (auto picks by firmware)
+        #[arg(long, value_enum, global = true, env = "MIND_THE_PIV_MANAGEMENT_KEY")]
+        management_key: Option<piv::ManagementKeyArg>,
+
+        /// Whether management access demands a touch after upload (always by default)
+        #[arg(long, value_enum, global = true, env = "MIND_THE_PIV_MANAGEMENT_KEY_TOUCH")]
+        management_key_touch: Option<piv::ManagementTouchArg>,
+
         #[command(subcommand)]
         command: PIVCommand,
     },
@@ -718,6 +726,8 @@ struct Stickies {
     pin_policy: Option<piv::PinPolicyArg>,
     touch_policy: Option<piv::TouchPolicyArg>,
     algorithm: Option<Algorithm>,
+    management_key: Option<piv::ManagementKeyArg>,
+    management_key_touch: Option<piv::ManagementTouchArg>,
 }
 
 /// Per-command overrides of the session's non-secret identity fields
@@ -866,6 +876,8 @@ fn dispatch(backend: Backend, identity: Identity) -> Result<()> {
             touch_policy,
             no_msroots,
             algorithm,
+            management_key,
+            management_key_touch,
             command,
         } => run_piv(
             identity,
@@ -882,6 +894,8 @@ fn dispatch(backend: Backend, identity: Identity) -> Result<()> {
                 touch_policy,
                 no_msroots,
                 algorithm,
+                management_key,
+                management_key_touch,
             },
             command,
         ),
@@ -932,7 +946,8 @@ enum ReplCommand {
     #[command(group = ArgGroup::new("fields").required(true).multiple(true)
         .args(["subkey", "name", "emails", "date", "validity", "shared_pgp",
                "shared_piv", "legacy", "intermediate", "no_msroots", "org", "unit",
-               "country", "pin_policy", "touch_policy", "algorithm"]))]
+               "country", "pin_policy", "touch_policy", "algorithm", "management_key",
+               "management_key_touch"]))]
     Set {
         /// New session subkey id
         #[arg(short = 'k', long)]
@@ -997,6 +1012,14 @@ enum ReplCommand {
         /// Default algorithm for both backends
         #[arg(long, value_enum)]
         algorithm: Option<Algorithm>,
+
+        /// Default management key algorithm for PIV uploads
+        #[arg(long, value_enum)]
+        management_key: Option<piv::ManagementKeyArg>,
+
+        /// Default management key touch requirement for PIV uploads
+        #[arg(long, value_enum)]
+        management_key_touch: Option<piv::ManagementTouchArg>,
     },
 
     /// Reopen the one-time password question; the derived identifiers change with it
@@ -1149,6 +1172,8 @@ fn merge_defaults(backend: &mut Backend, d: &Stickies) {
             touch_policy,
             no_msroots,
             algorithm,
+            management_key,
+            management_key_touch,
             ..
         } => {
             *date = date.or(d.date);
@@ -1170,6 +1195,8 @@ fn merge_defaults(backend: &mut Backend, d: &Stickies) {
             *pin_policy = pin_policy.or(d.pin_policy);
             *touch_policy = touch_policy.or(d.touch_policy);
             *algorithm = algorithm.or(d.algorithm);
+            *management_key = management_key.or(d.management_key);
+            *management_key_touch = management_key_touch.or(d.management_key_touch);
         }
         Backend::Generate => {}
     }
@@ -1321,6 +1348,12 @@ fn handle_line(session: &mut Session, line: &str) -> Result<Flow> {
             if let Some(algorithm) = d.algorithm {
                 stored.push(format!("algorithm={algorithm:?}"));
             }
+            if let Some(algorithm) = d.management_key {
+                stored.push(format!("management-key={algorithm:?}"));
+            }
+            if let Some(touch) = d.management_key_touch {
+                stored.push(format!("management-key-touch={touch:?}"));
+            }
             show("defaults", (!stored.is_empty()).then(|| stored.join(", ")).as_deref());
             Ok(())
         }
@@ -1341,6 +1374,8 @@ fn handle_line(session: &mut Session, line: &str) -> Result<Flow> {
             pin_policy,
             touch_policy,
             algorithm,
+            management_key,
+            management_key_touch,
         } => {
             if let Some(subkey) = subkey {
                 session.subkey = Some(subkey);
@@ -1369,6 +1404,8 @@ fn handle_line(session: &mut Session, line: &str) -> Result<Flow> {
             d.pin_policy = pin_policy.or(d.pin_policy);
             d.touch_policy = touch_policy.or(d.touch_policy);
             d.algorithm = algorithm.or(d.algorithm);
+            d.management_key = management_key.or(d.management_key);
+            d.management_key_touch = management_key_touch.or(d.management_key_touch);
             Ok(())
         }
         ReplCommand::Password => ask_password_again(session),
@@ -1443,6 +1480,8 @@ struct PIVOptions {
     touch_policy: Option<piv::TouchPolicyArg>,
     no_msroots: bool,
     algorithm: Option<Algorithm>,
+    management_key: Option<piv::ManagementKeyArg>,
+    management_key_touch: Option<piv::ManagementTouchArg>,
 }
 
 /// Run one PGP subcommand, assembling the certificate builder on demand
@@ -1720,6 +1759,8 @@ fn run_piv(identity: Identity, options: PIVOptions, command: PIVCommand) -> Resu
         touch_policy,
         no_msroots,
         algorithm,
+        management_key,
+        management_key_touch,
     } = options;
 
     // Built lazily, so a command that needs no builder -- status today, anything later --
@@ -1785,6 +1826,15 @@ fn run_piv(identity: Identity, options: PIVOptions, command: PIVCommand) -> Resu
         if no_msroots {
             log::info!("Not storing certificate authorities in msroots");
             builder = builder.with_msroots(false);
+        }
+
+        if let Some(algorithm) = management_key {
+            log::info!("Setting management key algorithm: {:?}", algorithm);
+            builder = builder.with_management_key(algorithm);
+        }
+        if let Some(touch) = management_key_touch {
+            log::info!("Setting management key touch: {:?}", touch);
+            builder = builder.with_management_touch(touch);
         }
 
         // Applied here rather than per command so that certify, check and upload all

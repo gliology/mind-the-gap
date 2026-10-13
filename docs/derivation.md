@@ -25,7 +25,7 @@ The salt is always set to at least `MINDTHEGAP256HDKD` and optionally followed b
         ├── root CA key
         ├── (optional subkey id)/
         │   ├── issuing CA key
-        │   ├── mgmnt key
+        │   ├── mgmnt key             (AES-256, or 3DES)
         │   ├── card identifier
         │   ├── authentication key    (slot 9A)
         │   ├── signature key         (slot 9C)
@@ -49,7 +49,7 @@ label of the form `<prefix>:<name>`, where names are lowercase and hyphenated:
 | `app` | application subtree | intermediate seed |
 | `sub` | subtree scoped to the subkey id | intermediate seed |
 | `key` | key material | 256 bits |
-| `key:<name>:<segment>` | key material bound to one algorithm | 256 bits (384 on P-384, see below) |
+| `key:<name>:<segment>` | key material bound to one algorithm | 256 bits (384 on P-384, 192 for 3DES, see below) |
 | `id` | identifier material | truncated to what the format takes |
 | `pin` | something a person types | ASCII |
 
@@ -63,8 +63,9 @@ Every asymmetric key carries the algorithm it is derived for as a third label se
 a second colon: `key:signature:ed25519`, `key:key-management:p256`. The segment names what the
 bytes become, with the RFC names rather than OpenPGP's: `p256` for ECDSA and ECDH on NIST
 P-256, `p384` for the same on NIST P-384, `ed25519` for Ed25519 signing keys and `x25519` for
-X25519 key agreement keys. A key with no such choice, such as the PIV management key (AES),
-has no segment.
+X25519 key agreement keys. The AES-256 PIV management key predates the segment and keeps its
+bare `key:management` label; its 3DES sibling, added later, carries the algorithm as its
+segment (`key:management:tdes`), see [below](#the-piv-management-key).
 
 `--algorithm` picks the algorithm for a whole backend at once, authorities and primary
 included, and the defaults are what each backend has always produced: OpenPGP derives
@@ -82,8 +83,9 @@ Card support decides which algorithm a deployment can use: every YubiKey 5 takes
 for OpenPGP and P-256 and P-384 for PIV (as does a YubiKey 4), and firmware 5.7 adds Ed25519
 and X25519 PIV keys; Nitrokey's opcard takes both for OpenPGP, and the trussed PIV app takes
 all three as it runs in CI. P-384 exists for PIV consumers that insist on it, such as a
-binary cache signing key; the OpenPGP backend refuses it. The `--legacy` OpenPGP scheme
-predates the segment and only ever derived Curve25519 keys, so it refuses `--algorithm`.
+binary cache signing key (see [the build server profile](piv-build-server.md)); the OpenPGP
+backend refuses it. The `--legacy` OpenPGP scheme predates the segment and only ever derived
+Curve25519 keys, so it refuses `--algorithm`.
 
 **The subkey id is public.** It ends up in the labels and, once recorded in a certificate,
 in the certificate too, so treat it as a name rather than a secret. Use it to say *which card*
@@ -147,6 +149,29 @@ moves on to `argon2id(A, "key:p384-retry")` before the extension is taken again.
 with 192 one bits, so a rejection is a 2^-190 event that only keeps the definition total.
 `B` adds width, not entropy: the key is as strong as the 256-bit `A`, which is already
 beyond what P-384 itself offers (192 bits).
+
+## The PIV management key
+
+The management key in slot 9B authenticates every administrative operation on a PIV card.
+It derives from the subkey seed, so each card id gets its own, in one of two algorithms:
+
+| algorithm | label | key |
+|---|---|---|
+| AES-256 | `key:management` | the whole 32-byte output |
+| 3DES | `key:management:tdes` | the first 24 bytes of the output |
+
+AES-256 is what the tool has always installed, and its label is frozen as it was. 3DES is
+the only management key a YubiKey 4, or a YubiKey 5 before firmware 5.4, accepts, and it is
+an independent derivation rather than a truncation of the AES key, so the two never share
+bytes. A 3DES key is rejected when one of its three DES keys is one of the four weak or
+twelve semi-weak DES keys, or when two of them coincide (either collapses the cipher towards
+single DES), parity bits ignored in both comparisons; the output then moves on to
+`argon2id(output, "key:tdes-retry")` and its first 24 bytes are tried again. The odds of
+that are about 2^-50.
+
+`piv upload --management-key auto` (the default) installs AES-256 when the card reports
+firmware 5.4 or later and 3DES otherwise; `aes256` and `tdes` force one. `piv check` needs
+no flag: it asks the card which algorithm it holds and derives that key.
 
 ## The forked `sequoia-openpgp`
 
