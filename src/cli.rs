@@ -1484,6 +1484,22 @@ struct PIVOptions {
     management_key_touch: Option<piv::ManagementTouchArg>,
 }
 
+/// Warn when `algorithm` asks for more strength than the phrase can give it
+///
+/// A key is never stronger than the secret it comes from: RSA-4096 from a 12 word phrase
+/// costs the larger key's price for the phrase's 128 bits. Only a warning, since the keys
+/// are still sound and a password may well make up the difference.
+fn warn_if_phrase_is_weaker(seed: &MnemonicSeed, algorithm: Algorithm) {
+    let (entropy, strength) = (seed.entropy_bits(), algorithm.strength_bits());
+    if entropy < strength {
+        log::warn!(
+            "{} keys aim at about {strength} bits of strength, but the phrase carries {entropy} \
+             bits of entropy (a password adds what it adds, which cannot be measured here)",
+            algorithm.name()
+        );
+    }
+}
+
 /// Run one PGP subcommand, assembling the certificate builder on demand
 fn run_pgp(identity: Identity, options: PGPOptions, command: PGPCommand) -> Result<()> {
     let Identity { seed, subkey, name, emails } = identity;
@@ -1523,6 +1539,7 @@ fn run_pgp(identity: Identity, options: PGPOptions, command: PGPCommand) -> Resu
         // Applied before anything else derives: the algorithm is part of every key's label
         if let Some(algorithm) = algorithm {
             log::info!("Deriving {algorithm:?} keys");
+            warn_if_phrase_is_weaker(seed, algorithm);
             builder = builder.with_algorithm(algorithm)?;
         }
 
@@ -1777,6 +1794,7 @@ fn run_piv(identity: Identity, options: PIVOptions, command: PIVCommand) -> Resu
 
         if let Some(algorithm) = algorithm {
             log::info!("Deriving {algorithm:?} keys");
+            warn_if_phrase_is_weaker(seed, algorithm);
             builder = builder.with_algorithm(algorithm);
         }
 

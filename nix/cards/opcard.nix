@@ -34,7 +34,8 @@ craneLib.buildPackage {
   # Examples are not installed by the default flow, and the crate's own tests
   # want a card to talk to -- this build *is* the card
   doCheck = false;
-  cargoBuildCommand = "cargo build --release --example vpicc";
+  # rsa4096 brings the 2048 and 3072 bit imports with it
+  cargoBuildCommand = "cargo build --release --example vpicc --features rsa4096";
   installPhaseCommand = ''
     mkdir -p $out/bin
     cp target/release/examples/vpicc $out/bin/opcard-vpicc

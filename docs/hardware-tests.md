@@ -66,15 +66,22 @@ suite performs: reset by pin exhaustion, the derived AES-256 management key with
 touch requirement, the user pin, four imported P-256 keys with their pin and touch
 policies read back through metadata, the byte-for-byte certificate comparison, and the
 certificate authorities in msroots -- the check asserts that none of the advisory
-comparisons warn. The check runs once per curve: `virtual-piv` provisions the P-256
-chain, `virtual-piv-curve25519` the Ed25519 and X25519 one. Each then runs the
+comparisons warn. The check runs once per algorithm: `virtual-piv` provisions the P-256
+chain, `virtual-piv-curve25519` the Ed25519 and X25519 one, and `virtual-piv-rsa2048` an
+RSA-2048 chain imported in the Yubico layout. Each then runs the
 card-level half of the destructive PIV suite (`tests/piv_hardware.rs`, built as the
 `piv-suite` binary) against the same card: its own provisioning, the policy and
 certificate read-back, msroots and the card identifiers, and then the card signing in
-9A, 9C and 9E under their pin policies and agreeing in 9D, each result compared with
-the same computation off the card. That is what `piv check` cannot prove on its own,
-since it only reads public keys back. The OpenPGP check likewise provisions both curves:
-opcard imports P-256 on every slot. Touch prompts go through trussed's user-presence request (the same
+9A, 9C and 9E under their pin policies and agreeing (or, for RSA, decrypting) in 9D,
+each result compared with the same computation off the card. That is what `piv check`
+cannot prove on its own, since it only reads public keys back. The OpenPGP check likewise
+provisions both curves and RSA at 2048 and 4096 bits: opcard imports P-256 and RSA on every
+slot, and the 4096-bit import is the one too large for a single short APDU. It then runs
+the OpenPGP hardware suite (`tests/pgp_hardware.rs`, built as `pgp-suite`) against the same
+card on every algorithm, which is where each key is seen at work: the card signs,
+authenticates and decrypts or agrees, each result checked against the certificate off the
+card, and gpg signs and decrypts through it end to end. That is the test that found the
+X25519 decryption key landing on cards byte-reversed. Touch prompts go through trussed's user-presence request (the same
 mechanism opcard uses for UIF), which the virtual platform grants automatically; a real
 device blinks and waits for the button. The check runs against the fork's `mind-the-gap`
 branch until the PRs are merged: trussed-dev's main plus every pending PR, each as one

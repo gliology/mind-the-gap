@@ -66,15 +66,23 @@ fn algorithm_label_has_the_segment_on_its_own() {
 }
 
 /// Key agreement keys get their own segment name on Curve25519, signing keys theirs; P-256
-/// serves both roles under one name.
+/// and each RSA size serve both roles under one name.
 #[test]
-fn curve_segments_name_the_algorithm() {
+fn segments_name_the_algorithm() {
     assert_eq!(Algorithm::P256.signing_segment(), "p256");
     assert_eq!(Algorithm::P256.agreement_segment(), "p256");
     assert_eq!(Algorithm::P384.signing_segment(), "p384");
     assert_eq!(Algorithm::P384.agreement_segment(), "p384");
     assert_eq!(Algorithm::Curve25519.signing_segment(), "ed25519");
     assert_eq!(Algorithm::Curve25519.agreement_segment(), "x25519");
+    for (algorithm, segment) in [
+        (Algorithm::Rsa2048, "rsa2048"),
+        (Algorithm::Rsa3072, "rsa3072"),
+        (Algorithm::Rsa4096, "rsa4096"),
+    ] {
+        assert_eq!(algorithm.signing_segment(), segment);
+        assert_eq!(algorithm.agreement_segment(), segment);
+    }
 }
 
 /// A P-384 scalar is 48 bytes, reproducible, and laid out exactly as the derivation chapter

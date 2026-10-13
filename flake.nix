@@ -128,6 +128,7 @@
         // import ./nix/tests {
           inherit pkgs self cards;
           piv-suite = rust.pivSuite;
+          pgp-suite = rust.pgpSuite;
         }
       );
 

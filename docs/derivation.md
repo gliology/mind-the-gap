@@ -62,30 +62,74 @@ match: `key:authentication:p256` and `id:authentication` are different bytes, as
 Every asymmetric key carries the algorithm it is derived for as a third label segment, behind
 a second colon: `key:signature:ed25519`, `key:key-management:p256`. The segment names what the
 bytes become, with the RFC names rather than OpenPGP's: `p256` for ECDSA and ECDH on NIST
-P-256, `p384` for the same on NIST P-384, `ed25519` for Ed25519 signing keys and `x25519` for
-X25519 key agreement keys. The AES-256 PIV management key predates the segment and keeps its
-bare `key:management` label; its 3DES sibling, added later, carries the algorithm as its
-segment (`key:management:tdes`), see [below](#the-piv-management-key).
+P-256, `p384` for the same on NIST P-384, `ed25519` for Ed25519 signing keys, `x25519` for
+X25519 key agreement keys, and `rsa2048`, `rsa3072` or `rsa4096` for RSA keys, which sign
+and decrypt under the same name. The AES-256 PIV management key predates the segment and
+keeps its bare `key:management` label; its 3DES sibling, added later, carries the algorithm
+as its segment (`key:management:tdes`), see [below](#the-piv-management-key).
 
 `--algorithm` picks the algorithm for a whole backend at once, authorities and primary
 included, and the defaults are what each backend has always produced: OpenPGP derives
 Curve25519 keys, PIV P-256 ones. Switching a card to another algorithm derives under
 different labels, so the chains share no key material, and none can be computed from another.
 
-| backend | key | `--algorithm curve25519` (OpenPGP default) | `--algorithm p256` (PIV default) | `--algorithm p384` (PIV only) |
-|---|---|---|---|---|
-| OpenPGP | primary, signing, authentication | EdDSA on Ed25519 | ECDSA on P-256 | refused |
-| OpenPGP | decryption | ECDH on Curve25519 | ECDH on P-256 (SHA-256, AES-128 KDF) | refused |
-| PIV | root CA, issuing CA, 9A, 9C, 9E | Ed25519 | ECDSA P-256 | ECDSA P-384, SHA-384 signatures |
-| PIV | 9D and retired generations | X25519 | ECDH P-256 | ECDH P-384 |
+| backend | key | `curve25519` (OpenPGP default) | `p256` (PIV default) | `p384` (PIV only) | `rsa2048`, `rsa3072`, `rsa4096` |
+|---|---|---|---|---|---|
+| OpenPGP | primary, signing, authentication | EdDSA on Ed25519 | ECDSA on P-256 | refused | RSA, PKCS#1 v1.5 signatures |
+| OpenPGP | decryption | ECDH on Curve25519 | ECDH on P-256 (SHA-256, AES-128 KDF) | refused | RSA encryption |
+| PIV | root CA, issuing CA, 9A, 9C, 9E | Ed25519 | ECDSA P-256 | ECDSA P-384, SHA-384 signatures | RSA, `sha256WithRSAEncryption` |
+| PIV | 9D and retired generations | X25519 | ECDH P-256 | ECDH P-384 | RSA key transport |
 
-Card support decides which algorithm a deployment can use: every YubiKey 5 takes both curves
-for OpenPGP and P-256 and P-384 for PIV (as does a YubiKey 4), and firmware 5.7 adds Ed25519
-and X25519 PIV keys; Nitrokey's opcard takes both for OpenPGP, and the trussed PIV app takes
-all three as it runs in CI. P-384 exists for PIV consumers that insist on it, such as a
+Card support decides which algorithm a deployment can use. Every YubiKey 5 takes both curves
+and RSA up to 4096 bits for OpenPGP, and P-256, P-384 and RSA-2048 for PIV; firmware 5.7 adds
+Ed25519, X25519, RSA-3072 and RSA-4096 PIV keys. A YubiKey 4 takes P-256, P-384 and RSA-2048
+for PIV and only RSA for OpenPGP. Nitrokey's opcard takes both curves and all three RSA sizes
+for OpenPGP, and the trussed PIV app takes all three curves as it runs in CI, and RSA once it
+accepts the Yubico import layout. P-384 exists for PIV consumers that insist on it, such as a
 binary cache signing key (see [the build server profile](piv-build-server.md)); the OpenPGP
 backend refuses it. The `--legacy` OpenPGP scheme predates the segment and only ever derived
 Curve25519 keys, so it refuses `--algorithm`.
+
+## RSA keys from the seed
+
+An elliptic curve key is 32 bytes, so the 256 bits a label derives *are* the key. An RSA key
+is two primes of half the modulus size each, so the derived bytes are stretched instead, by a
+procedure that is as frozen as the labels: the same seed gives the same primes forever.
+
+1. The derived 32 bytes go into SHAKE256, behind the ASCII context `MINDTHEGAPRSA` and the
+   modulus size as a big-endian 16-bit number. Its output is read front to back as one
+   stream.
+2. Each candidate is the next modulus-size/16 bytes of the stream, read big-endian, with its
+   two top bits and its lowest bit set. The top bits make every product of two candidates
+   exactly the modulus size; the low bit makes the candidate odd.
+3. `p` is the first candidate that is prime and for which `p - 1` is not a multiple of the
+   public exponent 65537.
+4. `q` is the first later candidate with the same properties that also differs from `p` by
+   more than 2<sup>size/2 - 100</sup>.
+
+These are the checks of FIPS 186-5 appendix A.1.3, the generation of probable primes,
+which also allows keeping the seed a key was generated from, provided it is protected like
+the key itself. The procedure has no other moving part: whether a number is prime is a
+property of the number, not of the test that finds out, so any correct implementation of the
+four steps arrives at the same key, and the golden vectors in the test suite were computed
+by one written independently of this crate. The public exponent is always 65537, the only
+one Yubico's tools import.
+
+A key is never stronger than the secret it comes from. The modulus sizes are rated as NIST
+SP 800-56B rates them, the curves as SP 800-57 part 1 does:
+
+| algorithm | security strength |
+|---|---|
+| `p256`, `curve25519` | 128 bits |
+| `p384` | 192 bits |
+| `rsa2048` | 112 bits |
+| `rsa3072` | 128 bits |
+| `rsa4096` | 152 bits |
+
+A 24 word phrase carries 256 bits of entropy and covers all of them. A 12 word phrase carries
+128, so `p384` or `rsa4096` from it gets the larger key's costs without its strength, and
+mind-the-gap warns about that. It warns rather than refuses, since the key is sound either
+way and a password may well make up the difference, which mind-the-gap cannot measure.
 
 **The subkey id is public.** It ends up in the labels and, once recorded in a certificate,
 in the certificate too, so treat it as a name rather than a secret. Use it to say *which card*

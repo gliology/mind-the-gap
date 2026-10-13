@@ -6,7 +6,12 @@
 # the automated half of what the destructive suites do to a real YubiKey: upload, check
 # and configure, driven through the real binary. What it cannot cover is exactly what the
 # manual checklist exists for: real readers, touch prompts and vendor extensions.
-{ pkgs, opcard-vpicc, ... }:
+{
+  pkgs,
+  opcard-vpicc,
+  pgp-suite,
+  ...
+}:
 
 {
   name = "mind-the-virtual-pgp";
@@ -15,7 +20,10 @@
     # Provide mind-the-gap derivation via overlay
     nixpkgs.overlays = [ self.overlays.default ];
 
-    environment.systemPackages = [ pkgs.mind-the-gap ];
+    environment.systemPackages = [
+      pkgs.mind-the-gap
+      pgp-suite
+    ];
 
     # pcscd with vpcd as its only reader: a TCP listener on localhost that virtual cards
     # connect to, presented to clients as an ordinary PC/SC reader
@@ -92,5 +100,26 @@
     )
     machine.succeed(f"mind-the-gap {identity} pgp check --algorithm p256 {card}")
     machine.fail(f"mind-the-gap {identity} pgp check {card}")
+
+    # And RSA, at the smallest and the largest size: the 4096-bit import is the one that
+    # needs extended length or chained APDUs to reach the card
+    for algorithm in ["rsa2048", "rsa4096"]:
+        machine.succeed(
+            f"mind-the-gap {identity} pgp upload --yes --algorithm {algorithm} {card} "
+            f"-o /tmp/{algorithm}.asc"
+        )
+        machine.succeed(f"mind-the-gap {identity} pgp check --algorithm {algorithm} {card}")
+        machine.fail(f"mind-the-gap {identity} pgp check --algorithm p256 {card}")
+
+    # Then the OpenPGP half of the destructive suite against the same card, once per
+    # algorithm: provisioning, the card read back independently, every key signing,
+    # authenticating or decrypting with the result checked off the card, and gpg
+    # signing and decrypting through it end to end
+    machine.succeed(
+        "MTG_HARDWARE_TEST_CARD=0000:00000000 pgp-suite --test-threads 1 --exact "
+        "provision_and_verify_card provision_and_verify_p256_card provision_and_verify_rsa_cards "
+        "--nocapture > /tmp/suite.log 2>&1 || { cat /tmp/suite.log; exit 1; }"
+    )
+    machine.succeed("grep -q 'test result: ok. 3 passed' /tmp/suite.log")
   '';
 }

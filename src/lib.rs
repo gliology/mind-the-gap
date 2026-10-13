@@ -12,6 +12,7 @@
 
 // Import base library
 pub mod mnemonic;
+pub mod rsa;
 pub mod seed;
 // Import frontends
 pub mod cli;

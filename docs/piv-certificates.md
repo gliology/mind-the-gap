@@ -18,8 +18,11 @@ With `--algorithm curve25519` the whole chain moves to Curve25519: the authoriti
 9C and 9E hold Ed25519 keys and every certificate is signed with `id-Ed25519`, while slot 9D
 holds an X25519 key (RFC 8410). Either way slot 9D uses `keyAgreement` rather than
 `keyEncipherment`, because these are key agreement keys and RFC 8813 forbids the latter on
-EC keys. The algorithm is part of every key's derivation label, so the chains share nothing;
-see the [derivation chapter](derivation.md#the-algorithm-segment).
+EC keys. With `--algorithm rsa2048`, `rsa3072` or `rsa4096` every key is an RSA key of that
+size and every certificate is signed with `sha256WithRSAEncryption`, PKCS#1 v1.5 being as
+deterministic as the other two; there slot 9D transports keys rather than agreeing on them
+and takes `keyEncipherment` instead. The algorithm is part of every key's derivation label,
+so the chains share nothing; see the [derivation chapter](derivation.md#the-algorithm-segment).
 
 Slots 9A, 9C and 9D are bound to the cardholder; slot 9E is bound to the card and carries no
 email address, as required by FIPS 201-3 section 4.2.3. Its subject uses a card identifier

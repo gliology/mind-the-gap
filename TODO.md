@@ -50,3 +50,10 @@
   in `tests/piv_hardware.rs::nss_recognises_card`). Needs a minimal reproduction against a
   virtual PIV token, then a Mozilla NSS bug; restore the commented decrypt assertion once
   fixed. (The OpenSSL counterpart is already filed as openssl/openssl#24698.)
+- RSA PIV keys beyond 2048 bits: yubikey.rs cannot import RSA-4096 (its key buffer is 1024
+  bytes for five 256-byte parameters; fix prepared on the `rsa4096-import` branch, with
+  which the RSA-4096 card-level run passed on firmware 5.7.4), so that run stays ignored
+  until the pinned yubikey revision carries the fix. The
+  trussed PIV app takes RSA only once it accepts the Yubico import layout (prepared on
+  `feat/rsa-yubico-layout`); until then `virtual-piv-rsa2048` runs against a local
+  integration build

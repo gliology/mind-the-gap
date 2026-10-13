@@ -9,10 +9,11 @@
 # virtual platform grants automatically -- what stays uncovered is real readers and a
 # human finger.
 #
-# `algorithm` picks the chain the card is provisioned with: P-256, or Curve25519 for the
-# Ed25519 (0xE0) and X25519 (0xE1) import. After the command line round trip the
-# card-level half of the destructive hardware suite runs against the same card, which is
-# what proves the keys *work* -- `piv check` only reads them back.
+# `algorithm` picks the chain the card is provisioned with: P-256, Curve25519 for the
+# Ed25519 (0xE0) and X25519 (0xE1) import, or RSA-2048 through the Yubico import layout.
+# After the command line round trip the card-level half of the destructive hardware suite
+# runs against the same card, which is what proves the keys *work* -- `piv check` only
+# reads them back.
 {
   pkgs,
   piv-vpicc,

@@ -33,6 +33,38 @@ let
 
   # Dependencies compiled once, reused by the package build, clippy and the tests
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+  # A destructive hardware suite as a test executable, for the virtual card checks to
+  # run against their card: `cargo test` compiles such a suite and discards it, this
+  # keeps it, with the libraries the card stack loads at runtime on its path
+  mkSuite =
+    {
+      name,
+      test,
+      tools ? [ ],
+    }:
+    craneLib.buildPackage (
+      commonArgs
+      // {
+        inherit cargoArtifacts;
+
+        pname = "mind-the-gap-${name}-suite";
+        doCheck = false;
+        cargoBuildCommand = "cargo test --profile release --no-run --features destructive-hardware-tests --test ${test}";
+
+        nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ] ++ tools;
+
+        # The harness names the binary with a hash; it is the one executable file
+        # among the metadata next to it
+        installPhaseCommand = ''
+          mkdir -p $out/bin
+          cp "$(find target/release/deps -maxdepth 1 -type f -executable -name '${test}-*')" \
+            $out/bin/${name}-suite
+          wrapProgram "$out/bin/${name}-suite" --prefix LD_LIBRARY_PATH : "${libPath}" \
+            --prefix PATH : "${pkgs.lib.makeBinPath tools}"
+        '';
+      }
+    );
 in
 {
   # The developer reference, published next to the book under /rustdoc. Private
@@ -152,30 +184,19 @@ in
     );
   };
 
-  # The destructive PIV suite as a binary the virtual PIV check can run: the
-  # card-level entry points prove on-card signing and key agreement, which `piv
-  # check` cannot (it compares public keys). The check above compiles the same
-  # suite and discards it; this keeps the test executable, with the libraries the
-  # card stack loads at runtime on its path.
-  pivSuite = craneLib.buildPackage (
-    commonArgs
-    // {
-      inherit cargoArtifacts;
+  # The destructive PIV suite for the virtual PIV check: the card-level entry points
+  # prove on-card signing and key agreement, which `piv check` cannot (it compares
+  # public keys)
+  pivSuite = mkSuite {
+    name = "piv";
+    test = "piv_hardware";
+  };
 
-      pname = "mind-the-gap-piv-suite";
-      doCheck = false;
-      cargoBuildCommand = "cargo test --profile release --no-run --features destructive-hardware-tests --test piv_hardware";
-
-      nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ];
-
-      # The harness names the binary with a hash; it is the one executable file
-      # among the metadata next to it
-      installPhaseCommand = ''
-        mkdir -p $out/bin
-        cp "$(find target/release/deps -maxdepth 1 -type f -executable -name 'piv_hardware-*')" \
-          $out/bin/piv-suite
-        wrapProgram "$out/bin/piv-suite" --prefix LD_LIBRARY_PATH : "${libPath}"
-      '';
-    }
-  );
+  # The OpenPGP suite the same way, for the virtual OpenPGP check. gpg is in the build
+  # so that build.rs enables the gpg steps, and on the wrapper's path so they can run
+  pgpSuite = mkSuite {
+    name = "pgp";
+    test = "pgp_hardware";
+    tools = [ pkgs.gnupg ];
+  };
 }

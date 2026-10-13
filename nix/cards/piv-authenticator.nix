@@ -24,7 +24,9 @@ craneLib.buildPackage {
 
   # The crate's own tests want a card to talk to -- this build *is* the card
   doCheck = false;
-  cargoBuildCommand = "cargo build --release --example vpicc";
+  # The software RSA backend is always linked into the virtual card, the app only
+  # dispatches to it with `rsa`
+  cargoBuildCommand = "cargo build --release --example vpicc --features rsa";
   installPhaseCommand = ''
     mkdir -p $out/bin
     cp target/release/examples/vpicc $out/bin/piv-vpicc

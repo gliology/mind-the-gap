@@ -231,7 +231,7 @@ exit
 /// `--algorithm` is accepted by both backends, from the line and from the environment, and
 /// it changes the derived output.
 #[test]
-fn curve_selects_the_key_algorithms() {
+fn algorithm_selects_the_keys() {
     let dir = tempfile::tempdir().unwrap();
 
     let piv = |args: &[&str], env: Option<&str>, name: &str| {
@@ -261,8 +261,11 @@ fn curve_selects_the_key_algorithms() {
     let ed25519 = piv(&["--algorithm", "curve25519"], None, "ed25519.pem");
     let from_env = piv(&[], Some("curve25519"), "env.pem");
 
+    let rsa = piv(&["--algorithm", "rsa2048"], None, "rsa.pem");
+
     assert_eq!(default, p256, "PIV does not default to P-256");
     assert_ne!(p256, ed25519, "--algorithm curve25519 changed nothing");
+    assert_ne!(p256, rsa, "--algorithm rsa2048 changed nothing");
     assert_eq!(ed25519, from_env, "MIND_THE_ALGORITHM is not honoured");
 
     let pgp = |args: &[&str], name: &str| {
@@ -280,8 +283,11 @@ fn curve_selects_the_key_algorithms() {
     let curve25519 = pgp(&["--algorithm", "curve25519"], "pgp-25519.asc");
     let p256 = pgp(&["--algorithm", "p256"], "pgp-p256.asc");
 
+    let rsa = pgp(&["--algorithm", "rsa2048"], "pgp-rsa.asc");
+
     assert_eq!(default, curve25519, "PGP does not default to Curve25519");
     assert_ne!(default, p256, "--algorithm p256 changed nothing");
+    assert_ne!(default, rsa, "--algorithm rsa2048 changed nothing");
 
     // The legacy scheme predates the algorithm segment and refuses the other algorithm
     let out = identity(&mut bin())
@@ -295,7 +301,7 @@ fn curve_selects_the_key_algorithms() {
 
 /// `set --algorithm` is a session default for both backends, and a line's own value wins.
 #[test]
-fn set_curve_sticks_in_session() {
+fn set_algorithm_sticks_in_session() {
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a.pem");
     let b = dir.path().join("b.pem");
@@ -389,6 +395,35 @@ fn factory_pin_warns() {
             stderr.contains("factory user pin"),
             "{backend} upload does not warn about the factory pin:\n{stderr}",
         );
+    }
+}
+
+/// Asking for more strength than the phrase carries warns, and only then: RSA-4096 rates
+/// about 152 bits, which a 24 word phrase covers and a 12 word one does not.
+#[test]
+fn weak_phrase_warns_for_strong_algorithms() {
+    const SHORT_PHRASE: &str = "abandon abandon abandon abandon abandon abandon \
+                                abandon abandon abandon abandon abandon about";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("root.pem");
+
+    let run = |phrase: &str, algorithm: &str| {
+        let out = bin()
+            .args(["-s", phrase, "-n", "Alice", "piv", "--algorithm", algorithm])
+            .args(["certify", "--kind", "root", "-o", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "piv certify failed: {:?}", out);
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+
+    let weak = run(SHORT_PHRASE, "rsa4096");
+    assert!(weak.contains("rsa4096 keys aim at about 152 bits"), "no warning:\n{weak}");
+    assert!(weak.contains("128 bits of entropy"), "the warning lacks the entropy:\n{weak}");
+
+    for (phrase, algorithm) in [(TEST_PHRASE, "rsa4096"), (SHORT_PHRASE, "rsa3072")] {
+        let quiet = run(phrase, algorithm);
+        assert!(!quiet.contains("aim at about"), "{algorithm} warned needlessly:\n{quiet}");
     }
 }
 

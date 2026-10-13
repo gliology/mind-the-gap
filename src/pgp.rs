@@ -1,8 +1,8 @@
 //! The OpenPGP backend: certificates from seeds, and uploads to OpenPGP cards.
 //!
 //! [`SeededSmartcard`] re-derives a key set -- a primary plus signing, decryption and
-//! authentication subkeys, Ed25519 and X25519 by default or NIST P-256 with
-//! [`Algorithm::P256`] -- from its seeds, and either exports it as a certificate or imports
+//! authentication subkeys, Ed25519 and X25519 by default, NIST P-256 with
+//! [`Algorithm::P256`], or RSA -- from its seeds, and either exports it as a certificate or imports
 //! it into a card through `openpgp-card`. Determinism is the point:
 //! creation times default to fixed values and the patched `sequoia-openpgp` drops its
 //! per-signature salt, so the same seed reproduces the same bytes -- see the derivation
@@ -48,13 +48,17 @@ use card_backend_pcsc::PcscBackend;
 
 use openpgp_card::ocard::KeyType;
 use openpgp_card::ocard::algorithm::Curve as CardCurve;
-use openpgp_card::ocard::crypto::{CardUploadableKey, EccKey, EccType, PrivateKeyMaterial};
+use openpgp_card::ocard::crypto::{CardUploadableKey, EccKey, EccType, PrivateKeyMaterial, RSAKey};
 use openpgp_card::{Card, Error as CardError};
 
 use openpgp_card::ocard::data::{
     Fingerprint as CardFingerprint, KeyGenerationTime, TouchPolicy, UserInteractionFlag,
 };
 use openpgp_card::state::Open;
+
+use crypto_bigint::BoxedUint;
+use rsa::RsaPrivateKey;
+use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 
 // Some use type shorthands
 type SecretPrimaryKey = Key<key::SecretParts, key::PrimaryRole>;
@@ -542,7 +546,8 @@ impl SeededSmartcard {
     ///
     /// What comes out is exactly what the card imports: a valid P-256 scalar, an Ed25519
     /// seed, or a clamped X25519 scalar (Curve25519 paper, section 3: clear bits 0, 1, 2 of
-    /// the first byte, clear bit 7 and set bit 6 of the last).
+    /// the first byte, clear bit 7 and set bit 6 of the last). For RSA it is the seed the
+    /// primes are searched from, see [`crate::rsa::derive_key`].
     fn derive_secret(
         &self,
         parent: &Seed256,
@@ -560,6 +565,9 @@ impl SeededSmartcard {
                     bytes[31] |= 0b0100_0000;
                 }
                 Ok(bytes)
+            }
+            Algorithm::Rsa2048 | Algorithm::Rsa3072 | Algorithm::Rsa4096 => {
+                Ok(parent.derive(label))
             }
         }
     }
@@ -607,7 +615,29 @@ impl SeededSmartcard {
                     )
                 }
             }
+            (Algorithm::Rsa2048 | Algorithm::Rsa3072 | Algorithm::Rsa4096, _) => {
+                // One RSA key serves every role: the flags on its binding decide what for
+                let key = self.rsa_key(bytes)?;
+                let [p, q] = key.primes() else {
+                    bail!("An RSA key without two primes")
+                };
+                Key4::import_secret_rsa(
+                    &Zeroizing::new(key.d().to_be_bytes()),
+                    &Zeroizing::new(p.to_be_bytes()),
+                    &Zeroizing::new(q.to_be_bytes()),
+                    time,
+                )
+            }
         }
+    }
+
+    /// The RSA key a raw secret stands for, in the configured size
+    fn rsa_key(&self, bytes: &Seed256) -> Result<RsaPrivateKey> {
+        let bits = self
+            .algorithm
+            .rsa_bits()
+            .ok_or_else(|| anyhow!("Not an RSA algorithm"))?;
+        crate::rsa::derive_key(bytes, bits)
     }
 
     /// The primary key, re-derived from its raw secret
@@ -1227,47 +1257,54 @@ impl SeededSmartcard {
                 .map_err(|e| anyhow!("Key creation time error: {}", e))?
                 .as_secs() as u32;
 
-            // Extract public key bytes from cert MPI (0x40-prefixed for 25519 keys, the
-            // uncompressed 0x04 point for P-256, which is what the card wants for both)
-            let pub_bytes = match subkey.key().mpis() {
-                mpi::PublicKey::EdDSA { q, .. } => q.value().to_vec(),
-                mpi::PublicKey::ECDSA { q, .. } => q.value().to_vec(),
-                mpi::PublicKey::ECDH { q, .. } => q.value().to_vec(),
-                _ => bail!("{:?} key has unexpected algorithm in cert", kt),
-            };
-
             // Re-derive the raw private key bytes, exactly as they went into the certificate
             let agreement = role.is_encryption();
             let seed =
                 self.derive_secret(self.seed_for(role), Some(&self.label_for(role)), agreement)?;
-
-            let (oid, ecc_type) = match (self.algorithm, agreement) {
-                (Algorithm::Curve25519, true) => (CardCurve::Curve25519.oid(), EccType::ECDH),
-                (Algorithm::Curve25519, false) => (CardCurve::Ed25519.oid(), EccType::EdDSA),
-                (Algorithm::P256, true) => (CardCurve::NistP256r1.oid(), EccType::ECDH),
-                (Algorithm::P256, false) => (CardCurve::NistP256r1.oid(), EccType::ECDSA),
-                (Algorithm::P384, _) => bail!(P384_REFUSED),
-            };
-
-            // OpenPGP cards take the X25519 scalar big-endian, the way GnuPG stores it,
-            // where RFC 7748 and everything derived here is little-endian: sent as is,
-            // the card would hold a different key than the certificate advertises
-            let mut private_bytes = Zeroizing::new(seed.to_vec());
-            if matches!(self.algorithm, Algorithm::Curve25519) && agreement {
-                private_bytes.reverse();
-            }
-
-            let key = RawEccKey {
-                oid,
-                private_bytes,
-                public_bytes: pub_bytes,
-                ecc_type,
-                fingerprint: CardFingerprint::from(fp_bytes),
-                timestamp: KeyGenerationTime::from(ts),
-            };
+            let fingerprint = CardFingerprint::from(fp_bytes);
+            let timestamp = KeyGenerationTime::from(ts);
 
             log::info!("Uploading {:?} key", kt);
-            admin.import_key(&key, kt)?;
+            if self.algorithm.rsa_bits().is_some() {
+                let key = RawRsaKey::new(&self.rsa_key(&seed)?, fingerprint, timestamp)?;
+                admin.import_key(&key, kt)?;
+            } else {
+                // Extract public key bytes from cert MPI (0x40-prefixed for 25519 keys, the
+                // uncompressed 0x04 point for P-256, which is what the card wants for both)
+                let pub_bytes = match subkey.key().mpis() {
+                    mpi::PublicKey::EdDSA { q, .. } => q.value().to_vec(),
+                    mpi::PublicKey::ECDSA { q, .. } => q.value().to_vec(),
+                    mpi::PublicKey::ECDH { q, .. } => q.value().to_vec(),
+                    _ => bail!("{:?} key has unexpected algorithm in cert", kt),
+                };
+
+                let (oid, ecc_type) = match (self.algorithm, agreement) {
+                    (Algorithm::Curve25519, true) => (CardCurve::Curve25519.oid(), EccType::ECDH),
+                    (Algorithm::Curve25519, false) => (CardCurve::Ed25519.oid(), EccType::EdDSA),
+                    (Algorithm::P256, true) => (CardCurve::NistP256r1.oid(), EccType::ECDH),
+                    (Algorithm::P256, false) => (CardCurve::NistP256r1.oid(), EccType::ECDSA),
+                    (Algorithm::P384, _) => bail!(P384_REFUSED),
+                    _ => unreachable!("RSA is handled above"),
+                };
+
+                // OpenPGP cards take the X25519 scalar big-endian, the way GnuPG stores it,
+                // where RFC 7748 and everything derived here is little-endian: sent as is,
+                // the card would hold a different key than the certificate advertises
+                let mut private_bytes = Zeroizing::new(seed.to_vec());
+                if matches!(self.algorithm, Algorithm::Curve25519) && agreement {
+                    private_bytes.reverse();
+                }
+
+                let key = RawEccKey {
+                    oid,
+                    private_bytes,
+                    public_bytes: pub_bytes,
+                    ecc_type,
+                    fingerprint,
+                    timestamp,
+                };
+                admin.import_key(&key, kt)?;
+            }
 
             // Prefer Cached (one touch valid for ~15s), but only advisorily: Cached is a
             // Yubico extension to the UIF data object, and a spec-conforming card -- the
@@ -1383,6 +1420,105 @@ fn set_touch_policy(
         result => result,
     }
 }
+
+/// RSA key material for uploading to an OpenPGP card, in every form the card's import
+/// format may ask for: `openpgp-card` picks the fields from the card's algorithm attributes.
+struct RawRsaKey {
+    material: Box<RsaParts>,
+    fingerprint: CardFingerprint,
+    timestamp: KeyGenerationTime,
+}
+
+/// The big-endian numbers of one RSA key, each in its own wiping allocation
+#[derive(Clone)]
+struct RsaParts {
+    e: Vec<u8>,
+    p: Zeroizing<Vec<u8>>,
+    q: Zeroizing<Vec<u8>>,
+    pq: Zeroizing<Vec<u8>>,
+    dp1: Zeroizing<Vec<u8>>,
+    dq1: Zeroizing<Vec<u8>>,
+    n: Vec<u8>,
+}
+
+impl RawRsaKey {
+    fn new(
+        key: &RsaPrivateKey,
+        fingerprint: CardFingerprint,
+        timestamp: KeyGenerationTime,
+    ) -> Result<Self> {
+        let mut key = key.clone();
+        key.precompute()?;
+        let [p, q] = key.primes() else {
+            bail!("An RSA key without two primes")
+        };
+        let secret = |value: Option<&BoxedUint>| -> Result<Zeroizing<Vec<u8>>> {
+            let value = value.ok_or_else(|| anyhow!("RSA CRT values missing"))?;
+            Ok(Zeroizing::new(value.to_be_bytes().into_vec()))
+        };
+
+        let material = Box::new(RsaParts {
+            e: crate::rsa::PUBLIC_EXPONENT
+                .to_be_bytes()
+                .into_iter()
+                .skip_while(|&b| b == 0)
+                .collect(),
+            p: secret(Some(p))?,
+            q: secret(Some(q))?,
+            // The card's PQ is 1/q mod p, which is the rsa crate's CRT coefficient as well
+            pq: secret(key.crt_coefficient().as_ref())?,
+            dp1: secret(key.dp())?,
+            dq1: secret(key.dq())?,
+            n: key.n().to_be_bytes().into_vec(),
+        });
+        Ok(RawRsaKey { material, fingerprint, timestamp })
+    }
+}
+
+impl CardUploadableKey for RawRsaKey {
+    fn private_key(&self) -> std::result::Result<PrivateKeyMaterial, openpgp_card::Error> {
+        Ok(PrivateKeyMaterial::R(self.material.clone()))
+    }
+
+    fn timestamp(&self) -> KeyGenerationTime {
+        self.timestamp
+    }
+
+    fn fingerprint(&self) -> std::result::Result<CardFingerprint, openpgp_card::Error> {
+        Ok(self.fingerprint.clone())
+    }
+}
+
+impl RSAKey for RsaParts {
+    fn e(&self) -> &[u8] {
+        &self.e
+    }
+
+    fn p(&self) -> &[u8] {
+        &self.p
+    }
+
+    fn q(&self) -> &[u8] {
+        &self.q
+    }
+
+    fn pq(&self) -> &[u8] {
+        &self.pq
+    }
+
+    fn dp1(&self) -> &[u8] {
+        &self.dp1
+    }
+
+    fn dq1(&self) -> &[u8] {
+        &self.dq1
+    }
+
+    fn n(&self) -> &[u8] {
+        &self.n
+    }
+}
+
 /// Raw ECC key material for uploading to an OpenPGP card.
 /// Implements both `CardUploadableKey` and `EccKey`.
 struct RawEccKey {

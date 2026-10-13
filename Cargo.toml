@@ -95,6 +95,17 @@ tiny-bip39 = { version = "2.0", default-features = false }
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 base64 = "0.22"
 
+# RSA keys from a derived seed (src/rsa.rs). The stream the primes are read from, its
+# primality test and the arithmetic are part of the frozen mtg1 procedure in the same way
+# argon2 is: SHAKE256 is a standard function whose output cannot change, primality is a
+# property of the number rather than of the test, and the rsa crate only assembles the key
+# from the two primes. Versions follow what yubikey already pulls in, so nothing is new in
+# the tree but sha3; default features stay off where they would add a std or rand layer.
+sha3 = { version = "0.10", default-features = false }
+crypto-primes = "0.7"
+crypto-bigint = { version = "0.7", default-features = false, features = ["alloc"] }
+rsa = "0.10.0-rc.18"
+
 # QR code output
 qrcode = { version = "0.14", default-features = false }
 
@@ -149,6 +160,15 @@ doctest = false
 [profile.release]
 overflow-checks = true
 
+# The RSA prime search runs thousands of big-number operations per key; unoptimized they
+# take tens of seconds per certificate chain in the test suite. Optimizing the arithmetic
+# crates alone keeps debug builds of this crate debuggable and changes no result.
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+
+[profile.dev.package.crypto-primes]
+opt-level = 3
+
 # cargo-machete scans source textually for each dependency's name; tiny-bip39's library is
 # imported as `bip39` (see src/mnemonic.rs), which the scan cannot see, so it is ignored here
 # rather than flagged on every run.
@@ -163,6 +183,8 @@ tempfile = "3"
 # build does not carry it -- Cargo unifies features per build, so test targets get it and
 # `cargo build` does not.
 p256 = { version = "0.14", features = [ "ecdh" ] }
+# The same for P-384 key management keys, from the same test
+p384 = { version = "0.14", features = [ "ecdh" ] }
 
 [patch.crates-io]
 # Until yubikey.rs releases its pending PRs: Yubico-compatible cards that are not

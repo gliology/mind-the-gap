@@ -54,6 +54,10 @@ const SECP384R1: &str = "1.3.132.0.34";
 const ID_ED25519: &str = "1.3.101.112";
 /// `id-X25519` (RFC 8410)
 const ID_X25519: &str = "1.3.101.110";
+/// `rsaEncryption`, the SPKI algorithm of every RSA key (RFC 8017)
+const RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
+/// `sha256WithRSAEncryption`, PKCS#1 v1.5 over SHA-256 (RFC 8017)
+const SHA256_WITH_RSA: &str = "1.2.840.113549.1.1.11";
 
 /// Verify that `issuer` really signed `cert`, in whichever algorithm the issuer uses
 fn verifies_under(cert: &Certificate, issuer: &Certificate) -> bool {
@@ -82,6 +86,15 @@ fn verifies_under(cert: &Certificate, issuer: &Certificate) -> bool {
                 .unwrap_or_else(|_| panic!("issuer SPKI is not an Ed25519 point: {spki:?}"));
             let signature =
                 ed25519_dalek::Signature::from_slice(cert.signature().raw_bytes()).unwrap();
+            key.verify(&tbs, &signature).is_ok()
+        }
+        RSA_ENCRYPTION => {
+            use rsa::pkcs8::DecodePublicKey;
+            use rsa::signature::Verifier as _;
+            let key = rsa::RsaPublicKey::from_public_key_der(&spki.to_der().unwrap()).unwrap();
+            let key = rsa::pkcs1v15::VerifyingKey::<rsa::sha2::Sha256>::new(key);
+            let signature =
+                rsa::pkcs1v15::Signature::try_from(cert.signature().raw_bytes()).unwrap();
             key.verify(&tbs, &signature).is_ok()
         }
         other => panic!("issuer SPKI is on an unexpected algorithm: {other}"),
@@ -356,6 +369,219 @@ fn current_scheme_is_frozen_on_p384() {
     );
 }
 
+/// The RSA-2048 half of the same promise: `--algorithm rsa2048` is part of `mtg1` and
+/// frozen with it; PKCS#1 v1.5 signatures are deterministic, so the DER pins.
+#[test]
+fn current_scheme_is_frozen_on_rsa2048() {
+    assert_current_scheme_frozen(
+        Algorithm::Rsa2048,
+        [
+            (
+                None,
+                [
+                    (
+                        "f8f92dc72cc7216fe612da655ec461bda33e6f33bddfbbcc668b40c29c867653",
+                        "e8437057bb53f127398f9a214d050d85cf3671fb7a4b3761e2168a770c13cf72",
+                        "CN=Alice PIV Root CA",
+                    ),
+                    (
+                        "fa82004283512aa88deca524bfb31294fc740ec805f04548c0a6945bc60fa83c",
+                        "e199da4d759d6bfb1f4fcad381fb6e31f30264ca977b82b2bdbebbd2920aee90",
+                        "CN=Alice",
+                    ),
+                    (
+                        "7b576a6b37ffd8a8db0035ce1d5032179f9d270118bfb5b49742cd74a5c77ed1",
+                        "eada816127afb7d6e42197ac70dd36283ce10190555cd1087d359290849e2079",
+                        "CN=Alice",
+                    ),
+                    (
+                        "8038d7304881dea2f3d9056a3d8ef04b75b32c591199644d2e938ea9fa310512",
+                        "864adc4bec8815d5e5559f7644884f591769aba7678bc76faa870b790e868a1a",
+                        "CN=Alice",
+                    ),
+                    (
+                        "8d62743df0f626d811d81577e34e2725a600c5bea97f6cb65445dca8a6ccdde2",
+                        "3c5c2bce6925d789de855f276395a9748618ea4e732029aa0d586ae679d37ac5",
+                        "CN=PIV Card mtg1:5D168619",
+                    ),
+                ],
+            ),
+            (
+                Some("laptop"),
+                [
+                    (
+                        "f8f92dc72cc7216fe612da655ec461bda33e6f33bddfbbcc668b40c29c867653",
+                        "e8437057bb53f127398f9a214d050d85cf3671fb7a4b3761e2168a770c13cf72",
+                        "CN=Alice PIV Root CA",
+                    ),
+                    (
+                        "ac20c26aba31ca03944fde6dc35821efa76ea55214657f42a90f376281fbd11b",
+                        "ffedba909488e7a785e4c48507ca5cfa75c82e3f15011f512f6f80f61203c297",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "169a6af8a2f731f13496aeac4a8b4fb28b8733fa027725ac6454d524d74bd4bd",
+                        "40ebc3db2ad9fed817a834993eeb7357115f95c4cab2cd1aaa5a2538f9c9cc5a",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "c5a56600e39c0c982cf86350c566e18866bb20477353b48357d380ca67da125d",
+                        "c55499eef3155d1641a4cbdc1acc161e61c9c0c3f1a42308bce3447ea9126557",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "830e144a0a672398841369d897b4fd52baeea8e0385343f98ec998b0bfbd562a",
+                        "7e327ddd3cdd8dadbd0c8a38e41ec1d6214954d4ea4fe28c2d4e169e601b12c8",
+                        "CN=PIV Card mtg1:95BCA3CF",
+                    ),
+                ],
+            ),
+        ],
+    );
+}
+
+/// The RSA-3072 half of the same promise: `--algorithm rsa3072` is part of `mtg1` and
+/// frozen with it; PKCS#1 v1.5 signatures are deterministic, so the DER pins.
+#[test]
+fn current_scheme_is_frozen_on_rsa3072() {
+    assert_current_scheme_frozen(
+        Algorithm::Rsa3072,
+        [
+            (
+                None,
+                [
+                    (
+                        "786bfbf1cfa1f0914ac65c021c37bbf445b7cde9e4a5f7b8bdd2cb695103ce84",
+                        "1cf3729b088afab970d2ad0438ec0ef49f443a299f33d6bb6bc9fcbd0c037d2c",
+                        "CN=Alice PIV Root CA",
+                    ),
+                    (
+                        "c1f0c998660faacf1ed69a931109319d7f3ed8c722e5574d2f06594fc23d0b8b",
+                        "40a9aed8ab1138da05b490bfb7e2257c9b4ed765f65b0fe6dbe658bcbc22ff2c",
+                        "CN=Alice",
+                    ),
+                    (
+                        "a082ca0830cad754c5568d4efc68fe56bc1226256e568f9135d9cca99ed69794",
+                        "49eb127f76606c06fb58cd3ba046c6d9ba1681b083eca826e1f9a2755f379998",
+                        "CN=Alice",
+                    ),
+                    (
+                        "b7254f486cbc64a923bf35c807512d8a82397502f1bdf62d08dc3f608004b00a",
+                        "51382f1f5432b3169968d330a51f960cebdcf407148ecb032f11b351c8e154eb",
+                        "CN=Alice",
+                    ),
+                    (
+                        "942df91e7773589a5984ccc4a9f4752757c7451ce0572da939cf3bb8e83aff28",
+                        "7214127db7c2e4d844188b10c3d69f62959b35b1180b9fdfc9eab892ad2f390d",
+                        "CN=PIV Card mtg1:5D168619",
+                    ),
+                ],
+            ),
+            (
+                Some("laptop"),
+                [
+                    (
+                        "786bfbf1cfa1f0914ac65c021c37bbf445b7cde9e4a5f7b8bdd2cb695103ce84",
+                        "1cf3729b088afab970d2ad0438ec0ef49f443a299f33d6bb6bc9fcbd0c037d2c",
+                        "CN=Alice PIV Root CA",
+                    ),
+                    (
+                        "52afa0e5a9ea7e9b38350d14b66b8a70308fd391c4f79e8de7e0f46628dcf547",
+                        "f7a73e449bf6668dbf8d7844b861bd7eea938f2f17f70ad548a6a96e81d49c02",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "a19ca5869280975fd143704e1e9df7fd088860e2f42d07d07d56af1754e4a313",
+                        "1fdd1355c4ad2c7f42ca8cca9e1b889f5e77fad72c54a9c804f474621d629a97",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "63e9944c269d5e57dedecca133378f1bc0207451d77cd3fc4578c5091ae8120a",
+                        "7f1361a3e4bfd83bf5c5ecfd3885281d2e4d48c84aef3b73156377171f9750a8",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "e1e51e6ab76fbc1d6f37fad3485e6875afd17f6c0a9792dcb045dc48a1a04349",
+                        "d709ba609d85c1266c191c9cdd8093239a650bb0d4c33d81140b7e3bd7df9e4c",
+                        "CN=PIV Card mtg1:95BCA3CF",
+                    ),
+                ],
+            ),
+        ],
+    );
+}
+
+/// The RSA-4096 half of the same promise: `--algorithm rsa4096` is part of `mtg1` and
+/// frozen with it; PKCS#1 v1.5 signatures are deterministic, so the DER pins.
+#[test]
+fn current_scheme_is_frozen_on_rsa4096() {
+    assert_current_scheme_frozen(
+        Algorithm::Rsa4096,
+        [
+            (
+                None,
+                [
+                    (
+                        "5ca3d47b84ae42da24b5c625342bc5298de67d439f325bd7acb3e2d3002a0d15",
+                        "bf5dac6b1bc47187d8a7b8566e5ada6803a099da67185ee589c938ce83f5f666",
+                        "CN=Alice PIV Root CA",
+                    ),
+                    (
+                        "36058b180932f23f9c8b6d6e1e47d2185720ace9006cf8d6c1cb93206a606dfa",
+                        "5cd5107ba2f7f893e484b6df64e1f76f63e64ddc2b9464f7578057a1d2f50f5d",
+                        "CN=Alice",
+                    ),
+                    (
+                        "f5618904fb6336661186dc52923c6dc2f668141864d5b0dbce0b3d9ebafa99f2",
+                        "25a2d97fa6b6b00d906aa5465a53c69e8b928fb810086305cd49a9980b608b6f",
+                        "CN=Alice",
+                    ),
+                    (
+                        "2d2e63a582d426216ff4e75a6eb838143f103ca4e5bb470616b0a53d881d30b1",
+                        "b12ded0af6128a2f29f7ef91b793ef11a4455685754f3ab551536946f9ff3b24",
+                        "CN=Alice",
+                    ),
+                    (
+                        "de3f72accdea9ecdc62a9158f9d27a3c1ec91e70ad8866ce1fde2f64cbf6ba23",
+                        "4991b1bd20cad414304920cbd113e0487e611550a9957bb8d26b4e2ed914addb",
+                        "CN=PIV Card mtg1:5D168619",
+                    ),
+                ],
+            ),
+            (
+                Some("laptop"),
+                [
+                    (
+                        "5ca3d47b84ae42da24b5c625342bc5298de67d439f325bd7acb3e2d3002a0d15",
+                        "bf5dac6b1bc47187d8a7b8566e5ada6803a099da67185ee589c938ce83f5f666",
+                        "CN=Alice PIV Root CA",
+                    ),
+                    (
+                        "28e6664817841e7c7b126703ff1587f3a8c00479e7a326aa6143781468b8617e",
+                        "460437b4a816d579d2e5c932233dd8fb4bb86c6a54afad7d2fb08a29e6910a2c",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "f526a2bf452f04e5e29df964590002846f34c9d722191b0f38a3c21c5da4e336",
+                        "1e88d09481d725f0dc6795b97afe4e89208f09c587b874e4bf6f494381e3b9df",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "51faad5bf1bdd03d2a45d9e2069876e80be8c723f05f090781587ba6eaa2ce58",
+                        "b4b85885449f9ac0ae52d162c7233174738cf462d8e6a170e552484f6cc0ae58",
+                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
+                    ),
+                    (
+                        "f0f97f6e17d65793a3e80eafe682fbc224a3b339ca382d37cd810a17e25cb4e1",
+                        "6830b51d07b1b5a3a09c551370e0685ed4cc97645e6fdda3236812bd796217dc",
+                        "CN=PIV Card mtg1:95BCA3CF",
+                    ),
+                ],
+            ),
+        ],
+    );
+}
+
 /// One pinned certificate: its SPKI digest, its DER digest, and its subject
 type Pinned = (&'static str, &'static str, &'static str);
 
@@ -463,6 +689,60 @@ fn curve25519_chain_is_ed25519_and_x25519_throughout() {
     }
 }
 
+/// `--algorithm rsa2048` switches the whole chain to RSA: authorities, every slot, and
+/// PKCS#1 v1.5 signatures that verify.
+#[test]
+fn rsa_chain_is_rsa_throughout() {
+    let chain = alice()
+        .with_algorithm(Algorithm::Rsa2048)
+        .with_intermediate(true)
+        .certify(CertificateKind::Chain)
+        .unwrap();
+
+    let rsa = (RSA_ENCRYPTION.to_string(), SHA256_WITH_RSA.to_string());
+    assert_eq!(algorithms(&chain.root), rsa);
+    let issuer = chain.issuer();
+    assert_eq!(algorithms(issuer), rsa);
+    assert!(verifies_under(&chain.root, &chain.root), "root is not self-signed");
+    assert!(verifies_under(issuer, &chain.root), "issuing CA is not signed by the root");
+
+    for (slot, cert) in &chain.leaves {
+        assert_eq!(algorithms(cert), rsa, "{slot:?} slot has the wrong algorithms");
+        assert!(verifies_under(cert, issuer), "{slot:?} slot is not signed by the issuer");
+    }
+
+    // An RSA key management key transports keys rather than agreeing on them
+    let (slot, cert) = &chain.leaves[2];
+    assert_eq!(*slot, SlotId::KeyManagement);
+    let usage = key_usage(cert);
+    assert!(usage.key_encipherment() && !usage.key_agreement());
+}
+
+/// The modulus follows the algorithm: each size derives a key of exactly that many bits.
+#[test]
+fn rsa_sizes_reach_the_certificates() {
+    for (algorithm, bits) in [
+        (Algorithm::Rsa2048, 2048),
+        (Algorithm::Rsa3072, 3072),
+        (Algorithm::Rsa4096, 4096),
+    ] {
+        use rsa::pkcs8::DecodePublicKey;
+        use rsa::traits::PublicKeyParts;
+        let chain = alice()
+            .with_algorithm(algorithm)
+            .certify(CertificateKind::Root)
+            .unwrap();
+        let spki = chain
+            .root
+            .tbs_certificate()
+            .subject_public_key_info()
+            .to_der()
+            .unwrap();
+        let key = rsa::RsaPublicKey::from_public_key_der(&spki).unwrap();
+        assert_eq!(key.n().bits(), bits, "{algorithm:?}");
+    }
+}
+
 /// The default chain stays P-256 end to end, so the algorithm flag changes nothing unasked.
 #[test]
 fn default_chain_is_p256_throughout() {
@@ -530,13 +810,18 @@ fn curves_share_no_keys() {
             .collect::<Vec<_>>()
     };
 
-    let a = spkis(Algorithm::P256);
-    let b = spkis(Algorithm::Curve25519);
-    let c = spkis(Algorithm::P384);
-    for key in &a {
-        // Compared on the raw key bits: the algorithm identifiers differ anyway
-        assert!(!b.contains(key), "a key appears under both algorithms");
-        assert!(!c.contains(key), "a key appears on P-256 and P-384");
+    let chains = [
+        Algorithm::P256,
+        Algorithm::P384,
+        Algorithm::Curve25519,
+        Algorithm::Rsa2048,
+    ]
+    .map(spkis);
+    for (i, a) in chains.iter().enumerate() {
+        for b in &chains[i + 1..] {
+            // Compared on the raw key bits: the algorithm identifiers differ anyway
+            assert!(a.iter().all(|key| !b.contains(key)), "a key appears under two algorithms");
+        }
     }
 }
 
@@ -1229,6 +1514,53 @@ fn openssl_encrypts_to_key_management_cert() {
     assert!(
         parsed.contains("dhSinglePass"),
         "expected ECDH key agreement in the enveloped data:\n{parsed}"
+    );
+}
+
+/// The RSA counterpart: openssl enciphers the content key to the 9D certificate with RSA
+/// key transport, which is what `keyEncipherment` allows.
+#[test]
+#[cfg_attr(not(has_openssl), ignore = "openssl not found in PATH")]
+fn openssl_encrypts_to_rsa_key_management_cert() {
+    let chain = alice()
+        .with_algorithm(Algorithm::Rsa2048)
+        .certify(CertificateKind::Chain)
+        .unwrap();
+    let (slot, cert) = &chain.leaves[2];
+    assert_eq!(*slot, SlotId::KeyManagement);
+
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    let recipient = dir.join("9d.pem");
+    let message = dir.join("msg.txt");
+    let enveloped = dir.join("msg.p7m");
+    std::fs::write(&recipient, cert.to_pem(x509_cert::der::pem::LineEnding::LF).unwrap()).unwrap();
+    std::fs::write(&message, b"hello").unwrap();
+
+    let output = std::process::Command::new("openssl")
+        .args(["cms", "-encrypt", "-aes256", "-in"])
+        .arg(&message)
+        .arg("-out")
+        .arg(&enveloped)
+        .args(["-outform", "DER"])
+        .arg(&recipient)
+        .output()
+        .expect("openssl vanished since the build.rs probe ran");
+    assert!(
+        output.status.success(),
+        "openssl cms -encrypt failed for the RSA key management certificate:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let parsed = std::process::Command::new("openssl")
+        .args(["asn1parse", "-inform", "DER", "-in"])
+        .arg(&enveloped)
+        .output()
+        .unwrap();
+    let parsed = String::from_utf8_lossy(&parsed.stdout);
+    assert!(
+        parsed.contains("rsaEncryption"),
+        "expected RSA key transport in the enveloped data:\n{parsed}"
     );
 }
 

@@ -2,11 +2,11 @@
 //!
 //! [`SeededSmartcard`] derives a root certificate authority, an optional issuing authority
 //! and the four slot keys (9A, 9C, 9D, 9E) on NIST P-256, on NIST P-384 with
-//! [`Algorithm::P384`] or, with [`Algorithm::Curve25519`], as Ed25519 and X25519 keys. The
-//! chain is signed with RFC 6979 deterministic ECDSA or pure Ed25519 so re-runs are
-//! byte-identical, and keys, certificates, identifiers and per-slot policies are written to
-//! the card through the `yubikey` crate. The chain layout and its constraints are documented
-//! in the certificates chapter,
+//! [`Algorithm::P384`], as Ed25519 and X25519 keys with [`Algorithm::Curve25519`], or as
+//! RSA keys. The chain is signed with RFC 6979 deterministic ECDSA, pure Ed25519 or PKCS#1
+//! v1.5, all deterministic, so re-runs are byte-identical, and keys, certificates,
+//! identifiers and per-slot policies are written to the card through the `yubikey` crate.
+//! The chain layout and its constraints are documented in the certificates chapter,
 //! <https://gliology.github.io/mind-the-gap/piv-certificates.html>.
 
 use std::str::FromStr;
@@ -18,7 +18,7 @@ use crate::seed::{self, Algorithm, Seed256, Seed256Derive};
 use anyhow::{Result, anyhow, bail};
 
 use yubikey::certificate::CertInfo;
-use yubikey::piv::{self, AlgorithmId, ManagementSlotId, RetiredSlotId, SlotId};
+use yubikey::piv::{self, AlgorithmId, ManagementSlotId, RetiredSlotId, RsaKeyData, SlotId};
 use yubikey::reader::Context;
 use yubikey::{
     CardId, CccId, Certificate as CardCertificate, ChuId, Error as CardError, MgmAlgorithmId,
@@ -29,6 +29,12 @@ use cms::content_info::ContentInfo;
 
 use p256::ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{DerSignature, SigningKey};
+
+use rsa::RsaPrivateKey;
+use rsa::pkcs1v15::{Signature as RsaSignature, SigningKey as RsaSigningKey};
+use rsa::pkcs8::DecodePublicKey;
+use rsa::sha2::Sha256 as RsaSha256;
+use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
@@ -415,15 +421,16 @@ pub enum SlotRole {
 }
 
 impl SlotRole {
-    /// Key usage bits appropriate for this role
-    fn key_usage(&self) -> FlagSet<KeyUsages> {
+    /// Key usage bits appropriate for this role, for an RSA key if `rsa`
+    fn key_usage(&self, rsa: bool) -> FlagSet<KeyUsages> {
         match self {
             SlotRole::Authentication => KeyUsages::DigitalSignature.into(),
             SlotRole::Signature => KeyUsages::DigitalSignature | KeyUsages::NonRepudiation,
-            // These are ECDH keys. `keyEncipherment` describes RSA key transport and is
-            // invalid for EC keys (RFC 5480 section 3, RFC 8813); NSS rejects such a
-            // certificate for S/MIME decryption. `encipherOnly`/`decipherOnly` are left
-            // unset as either would break `openssl verify -purpose smimeencrypt`.
+            // An RSA key transports keys, which is `keyEncipherment`; an EC key agrees on
+            // them, and `keyEncipherment` is invalid there (RFC 5480 section 3, RFC 8813),
+            // NSS rejects such a certificate for S/MIME decryption. `encipherOnly` and
+            // `decipherOnly` stay unset, as either breaks `openssl verify -purpose smimeencrypt`.
+            SlotRole::KeyManagement if rsa => KeyUsages::KeyEncipherment.into(),
             SlotRole::KeyManagement => KeyUsages::KeyAgreement.into(),
             SlotRole::CardAuthentication => KeyUsages::DigitalSignature.into(),
         }
@@ -462,6 +469,9 @@ impl SlotRole {
             (Algorithm::P384, _) => AlgorithmId::EccP384,
             (Algorithm::Curve25519, SlotRole::KeyManagement) => AlgorithmId::X25519,
             (Algorithm::Curve25519, _) => AlgorithmId::Ed25519,
+            (Algorithm::Rsa2048, _) => AlgorithmId::Rsa2048,
+            (Algorithm::Rsa3072, _) => AlgorithmId::Rsa3072,
+            (Algorithm::Rsa4096, _) => AlgorithmId::Rsa4096,
         }
     }
 }
@@ -630,6 +640,7 @@ enum IssuerKey {
     P256(SigningKey),
     P384(p384::ecdsa::SigningKey),
     Ed25519(ed25519_dalek::SigningKey),
+    Rsa(Box<RsaSigningKey<RsaSha256>>),
 }
 
 impl IssuerKey {
@@ -653,6 +664,11 @@ impl IssuerKey {
             Algorithm::Curve25519 => Ok(IssuerKey::Ed25519(ed25519_dalek::SigningKey::from_bytes(
                 &parent.derive(Some(&label)),
             ))),
+            Algorithm::Rsa2048 | Algorithm::Rsa3072 | Algorithm::Rsa4096 => {
+                let bits = algorithm.rsa_bits().expect("an RSA algorithm");
+                let key = crate::rsa::derive_key(&parent.derive(Some(&label)), bits)?;
+                Ok(IssuerKey::Rsa(Box::new(RsaSigningKey::new(key))))
+            }
         }
     }
 
@@ -662,17 +678,26 @@ impl IssuerKey {
             IssuerKey::P256(key) => SubjectPublicKeyInfoOwned::from_key(key.verifying_key())?,
             IssuerKey::P384(key) => SubjectPublicKeyInfoOwned::from_key(key.verifying_key())?,
             IssuerKey::Ed25519(key) => SubjectPublicKeyInfoOwned::from_key(&key.verifying_key())?,
+            IssuerKey::Rsa(key) => SubjectPublicKeyInfoOwned::from_key(
+                AsRef::<RsaPrivateKey>::as_ref(key.as_ref()).as_public_key(),
+            )?,
         })
     }
 }
 
-/// A slot's private key: the raw bytes the card imports, and the algorithm they are for
-///
-/// The bytes are a vector because their width follows the algorithm: 48 for a P-384
-/// scalar, 32 for everything else.
+/// A slot's private key: what the card imports, and the algorithm it is for
 struct SlotKey {
     algorithm: AlgorithmId,
-    bytes: Zeroizing<Vec<u8>>,
+    secret: SlotSecret,
+}
+
+/// The secret half of a slot key, in the shape its algorithm family imports
+enum SlotSecret {
+    /// The raw bytes an elliptic curve key is: 48 for a P-384 scalar, 32 for a P-256
+    /// scalar, an Ed25519 seed or an X25519 key
+    Bytes(Zeroizing<Vec<u8>>),
+    /// An RSA key, of which the card takes the primes and their CRT exponents
+    Rsa(Box<RsaPrivateKey>),
 }
 
 impl SlotKey {
@@ -683,18 +708,33 @@ impl SlotKey {
         role: SlotRole,
         algorithm: Algorithm,
     ) -> Result<Self> {
+        let rsa_bits = algorithm.rsa_bits();
         let algorithm = role.card_algorithm(algorithm);
-        let bytes = match algorithm {
-            AlgorithmId::EccP256 => {
-                Zeroizing::new(seed::derive_p256_scalar(parent, Some(label))?.to_vec())
+        let secret = match (algorithm, rsa_bits) {
+            (_, Some(bits)) => SlotSecret::Rsa(Box::new(crate::rsa::derive_key(
+                &parent.derive(Some(label)),
+                bits,
+            )?)),
+            (AlgorithmId::EccP256, _) => SlotSecret::Bytes(Zeroizing::new(
+                seed::derive_p256_scalar(parent, Some(label))?.to_vec(),
+            )),
+            (AlgorithmId::EccP384, _) => {
+                SlotSecret::Bytes(seed::derive_p384_scalar(parent, Some(label))?)
             }
-            AlgorithmId::EccP384 => seed::derive_p384_scalar(parent, Some(label))?,
             // Ed25519 takes any 32 bytes as its seed, X25519 clamps on use; the card does
             // the same with the very same bytes, so neither needs rejection sampling
-            _ => Zeroizing::new(parent.derive(Some(label)).to_vec()),
+            _ => SlotSecret::Bytes(Zeroizing::new(parent.derive(Some(label)).to_vec())),
         };
 
-        Ok(SlotKey { algorithm, bytes })
+        Ok(SlotKey { algorithm, secret })
+    }
+
+    /// The raw bytes of an elliptic curve key
+    fn bytes(&self) -> Result<&Zeroizing<Vec<u8>>> {
+        match &self.secret {
+            SlotSecret::Bytes(bytes) => Ok(bytes),
+            SlotSecret::Rsa(_) => bail!("{:?} keys are not raw bytes", self.algorithm),
+        }
     }
 
     /// The public half, encoded exactly as the card reports it through `GET METADATA`
@@ -703,14 +743,17 @@ impl SlotKey {
     /// encoding is spelled out because `x25519-dalek` has no SPKI support: RFC 8410 gives
     /// the algorithm no parameters and the raw 32-byte point as the subject key.
     fn spki(&self) -> Result<SubjectPublicKeyInfoOwned> {
+        if let SlotSecret::Rsa(key) = &self.secret {
+            return Ok(SubjectPublicKeyInfoOwned::from_key(key.as_public_key())?);
+        }
         Ok(match self.algorithm {
             AlgorithmId::EccP256 => {
-                let key = SigningKey::from_slice(&self.bytes)
+                let key = SigningKey::from_slice(self.bytes()?)
                     .map_err(|err| anyhow!("Invalid P-256 scalar: {err}"))?;
                 SubjectPublicKeyInfoOwned::from_key(key.verifying_key())?
             }
             AlgorithmId::EccP384 => {
-                let key = p384::ecdsa::SigningKey::from_slice(&self.bytes)
+                let key = p384::ecdsa::SigningKey::from_slice(self.bytes()?)
                     .map_err(|err| anyhow!("Invalid P-384 scalar: {err}"))?;
                 SubjectPublicKeyInfoOwned::from_key(key.verifying_key())?
             }
@@ -729,11 +772,12 @@ impl SlotKey {
 
     /// The bytes as the 32-byte seed the Curve25519 keys take
     fn seed(&self) -> Result<Zeroizing<Seed256>> {
+        let bytes = self.bytes()?;
         let mut seed = Zeroizing::new([0u8; 32]);
-        if self.bytes.len() != seed.len() {
-            bail!("{:?} key is {} bytes, not 32", self.algorithm, self.bytes.len());
+        if bytes.len() != seed.len() {
+            bail!("{:?} key is {} bytes, not 32", self.algorithm, bytes.len());
         }
-        seed.copy_from_slice(&self.bytes);
+        seed.copy_from_slice(bytes);
         Ok(seed)
     }
 
@@ -745,27 +789,48 @@ impl SlotKey {
         touch_policy: TouchPolicy,
         pin_policy: PinPolicy,
     ) -> Result<()> {
-        match self.algorithm {
-            AlgorithmId::EccP256 | AlgorithmId::EccP384 => piv::import_ecc_key(
-                token,
-                slot,
-                self.algorithm,
-                &self.bytes,
-                touch_policy,
-                pin_policy,
-            )?,
-            _ => piv::import_cv_key(
-                token,
-                slot,
-                self.algorithm,
-                &self.bytes,
-                touch_policy,
-                pin_policy,
-            )?,
+        match (&self.secret, self.algorithm) {
+            (SlotSecret::Rsa(key), _) => {
+                let [p, q] = key.primes() else {
+                    bail!("An RSA key without two primes")
+                };
+                let (p, q) = (Zeroizing::new(p.to_be_bytes()), Zeroizing::new(q.to_be_bytes()));
+                piv::import_rsa_key(
+                    token,
+                    slot,
+                    self.algorithm,
+                    RsaKeyData::new(&p, &q)?,
+                    touch_policy,
+                    pin_policy,
+                )?
+            }
+            (SlotSecret::Bytes(bytes), AlgorithmId::EccP256 | AlgorithmId::EccP384) => {
+                piv::import_ecc_key(token, slot, self.algorithm, bytes, touch_policy, pin_policy)?
+            }
+            (SlotSecret::Bytes(bytes), _) => {
+                piv::import_cv_key(token, slot, self.algorithm, bytes, touch_policy, pin_policy)?
+            }
         }
 
         Ok(())
     }
+}
+
+/// A SHA-256 `digest` in the block a raw RSA private key operation signs: EMSA-PKCS1-v1_5
+/// (RFC 8017 section 9.2), padded to the modulus size in bytes
+fn pkcs1_sha256_block(digest: &[u8], size: usize) -> Vec<u8> {
+    const DIGEST_INFO: [u8; 19] = [
+        0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+        0x05, 0x00, 0x04, 0x20,
+    ];
+    let mut block = vec![0xff; size];
+    block[0] = 0x00;
+    block[1] = 0x01;
+    let tail = DIGEST_INFO.len() + digest.len();
+    block[size - tail - 1] = 0x00;
+    block[size - tail..size - digest.len()].copy_from_slice(&DIGEST_INFO);
+    block[size - digest.len()..].copy_from_slice(digest);
+    block
 }
 
 /// Serial number from the last 20 bytes of the subject public key fingerprint.
@@ -796,12 +861,13 @@ fn issue<P: BuilderProfile>(
 
     // The explicit signature type is required: SigningKey implements Signer for more than
     // one signature representation. Deliberately `build`, not `build_with_rng`: ECDSA here
-    // uses RFC 6979 deterministic nonces and Ed25519 is deterministic by construction,
-    // which is what makes the output reproducible.
+    // uses RFC 6979 deterministic nonces, and Ed25519 and PKCS#1 v1.5 are deterministic by
+    // construction, which is what makes the output reproducible.
     Ok(match issuer {
         IssuerKey::P256(key) => builder.build::<_, DerSignature>(key)?,
         IssuerKey::P384(key) => builder.build::<_, p384::ecdsa::DerSignature>(key)?,
         IssuerKey::Ed25519(key) => builder.build::<_, ed25519_dalek::Signature>(key)?,
+        IssuerKey::Rsa(key) => builder.build::<_, RsaSignature>(key.as_ref())?,
     })
 }
 
@@ -1259,8 +1325,9 @@ impl SeededSmartcard {
 
     /// Prove that `slot` holds the key behind `spki` on a card that cannot report it
     ///
-    /// The card signs a fresh random digest, as wide as the curve's field, and the signature
-    /// has to verify under the derived public key. Only the holder of the derived private
+    /// The card signs a fresh random digest, as wide as the curve's field or SHA-256 wrapped
+    /// in a PKCS#1 v1.5 block for RSA, and the signature has to verify under the derived
+    /// public key. Only the holder of the derived private
     /// key can produce one, so this proves the key as firmly as reading it back would. It
     /// returns the mismatch to report, or `None` when the key verified or could not be
     /// challenged, which is warned about rather than failed: that is a limit of the card,
@@ -1274,7 +1341,11 @@ impl SeededSmartcard {
     ) -> Result<Option<String>> {
         let algorithm = slot_role(slot).card_algorithm(self.algorithm);
         let width = match algorithm {
-            AlgorithmId::EccP256 => 32,
+            // RSA signs a SHA-256 digest, padded below
+            AlgorithmId::EccP256
+            | AlgorithmId::Rsa2048
+            | AlgorithmId::Rsa3072
+            | AlgorithmId::Rsa4096 => 32,
             AlgorithmId::EccP384 => 48,
             // Cards without GET METADATA predate Ed25519 and X25519 by several firmware
             // generations, so this is a card answering inconsistently
@@ -1313,7 +1384,16 @@ impl SeededSmartcard {
         if touch_policy != TouchPolicy::Never {
             eprintln!("[Please touch device to prove the {slot:?} key!]");
         }
-        let signature = match piv::sign_data(token, &digest, algorithm, slot) {
+        // The card applies the raw RSA private key operation, so the padding is ours
+        let input = match algorithm {
+            AlgorithmId::Rsa2048 | AlgorithmId::Rsa3072 | AlgorithmId::Rsa4096 => {
+                let key = rsa::RsaPublicKey::from_public_key_der(&spki.to_der()?)
+                    .map_err(|err| anyhow!("Derived RSA key is malformed: {err}"))?;
+                pkcs1_sha256_block(&digest, key.size())
+            }
+            _ => digest.clone(),
+        };
+        let signature = match piv::sign_data(token, &input, algorithm, slot) {
             Ok(signature) => signature,
             Err(err) => {
                 return Ok(Some(format!("{slot:?} slot: signature challenge failed: {err}")));
@@ -1322,6 +1402,14 @@ impl SeededSmartcard {
 
         let point = spki.subject_public_key.raw_bytes();
         let verified = match algorithm {
+            AlgorithmId::Rsa2048 | AlgorithmId::Rsa3072 | AlgorithmId::Rsa4096 => {
+                use rsa::signature::hazmat::PrehashVerifier as _;
+                let key = rsa::RsaPublicKey::from_public_key_der(&spki.to_der()?)
+                    .map_err(|err| anyhow!("Derived RSA key is malformed: {err}"))?;
+                let key = rsa::pkcs1v15::VerifyingKey::<RsaSha256>::new(key);
+                RsaSignature::try_from(&signature[..])
+                    .is_ok_and(|signature| key.verify_prehash(&digest, &signature).is_ok())
+            }
             AlgorithmId::EccP256 => {
                 let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(point)
                     .map_err(|err| anyhow!("Derived P-256 key is malformed: {err}"))?;
@@ -1888,7 +1976,9 @@ impl BuilderProfile for PivLeaf {
     ) -> x509_cert::builder::Result<Vec<Extension>> {
         let mut extensions: Vec<Extension> = Vec::new();
 
-        extensions.push(KeyUsage(self.role.key_usage()).to_extension(tbs.subject(), &extensions)?);
+        let rsa = spk.algorithm.oid == rsa::pkcs1::ALGORITHM_OID;
+        extensions
+            .push(KeyUsage(self.role.key_usage(rsa)).to_extension(tbs.subject(), &extensions)?);
 
         extensions.push(
             ExtendedKeyUsage(self.role.extended_key_usage())

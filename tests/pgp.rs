@@ -265,7 +265,49 @@ fn p256_certificate_is_valid_under_policy() {
     assert!(vc.keys().subkeys().for_authentication().next().is_some());
 }
 
-/// The two algorithms derive under different labels, so they never share a key.
+/// `--algorithm rsa2048` makes every key an RSA key of that size, each usable for what
+/// its flags say, and the certificate is valid under the standard policy.
+#[test]
+fn rsa_certificate_is_rsa_throughout() {
+    let cert = builder(&SEED_A, "Alice", "alice@example.com")
+        .with_algorithm(Algorithm::Rsa2048)
+        .unwrap()
+        .certify(CertificateKind::default())
+        .unwrap();
+
+    let policy = StandardPolicy::new();
+    let vc = cert.with_policy(&policy, None).unwrap();
+    assert_eq!(vc.keys().count(), 4);
+    for ka in vc.keys() {
+        assert_eq!(ka.key().pk_algo(), PublicKeyAlgorithm::RSAEncryptSign);
+        match ka.key().mpis() {
+            mpi::PublicKey::RSA { e, n } => {
+                assert_eq!(e.value(), [1, 0, 1], "public exponent is not 65537");
+                assert_eq!(n.bits(), 2048, "modulus has the wrong size");
+            }
+            other => panic!("not an RSA key: {other:?}"),
+        }
+    }
+    assert!(vc.keys().subkeys().for_signing().next().is_some());
+    assert!(
+        vc.keys()
+            .subkeys()
+            .for_transport_encryption()
+            .next()
+            .is_some()
+    );
+    assert!(vc.keys().subkeys().for_authentication().next().is_some());
+}
+
+/// The legacy scheme refuses RSA like any other algorithm it never derived.
+#[test]
+fn legacy_scheme_refuses_rsa() {
+    let result = SeededSmartcard::with_scheme(&SEED_A, None, "Alice".into(), Scheme::Legacy)
+        .with_algorithm(Algorithm::Rsa2048);
+    assert!(result.is_err(), "the legacy scheme accepted RSA");
+}
+
+/// The algorithms derive under different labels, so they never share a key.
 #[test]
 fn curves_share_no_keys() {
     let fingerprints = |algorithm| {
@@ -279,10 +321,13 @@ fn curves_share_no_keys() {
             .collect::<Vec<_>>()
     };
 
-    let a = fingerprints(Algorithm::Curve25519);
-    let b = fingerprints(Algorithm::P256);
-    for fp in &a {
-        assert!(!b.contains(fp), "{fp} appears under both algorithms");
+    let sets = [Algorithm::Curve25519, Algorithm::P256, Algorithm::Rsa2048].map(fingerprints);
+    for (i, a) in sets.iter().enumerate() {
+        for b in &sets[i + 1..] {
+            for fp in a {
+                assert!(!b.contains(fp), "{fp} appears under two algorithms");
+            }
+        }
     }
 }
 
@@ -391,72 +436,80 @@ fn fp_hex(cert: &Cert) -> String {
 #[test]
 #[cfg_attr(not(has_sq), ignore = "sq not found in PATH")]
 fn sq_inspect_accepts_exported_cert() {
-    let cert = builder(&SEED_A, "Alice", "alice@example.com")
-        .certify(CertificateKind::default())
-        .unwrap();
-    let armored = cert.armored().to_vec().unwrap();
+    for algorithm in [Algorithm::Curve25519, Algorithm::Rsa2048] {
+        let cert = builder(&SEED_A, "Alice", "alice@example.com")
+            .with_algorithm(algorithm)
+            .unwrap()
+            .certify(CertificateKind::default())
+            .unwrap();
+        let armored = cert.armored().to_vec().unwrap();
 
-    let tmp = tempfile::Builder::new().suffix(".asc").tempfile().unwrap();
-    std::fs::write(tmp.path(), &armored).unwrap();
+        let tmp = tempfile::Builder::new().suffix(".asc").tempfile().unwrap();
+        std::fs::write(tmp.path(), &armored).unwrap();
 
-    let result = std::process::Command::new("sq")
-        .args(["inspect", tmp.path().to_str().unwrap()])
-        .output();
+        let result = std::process::Command::new("sq")
+            .args(["inspect", tmp.path().to_str().unwrap()])
+            .output();
 
-    // Gated by cfg(has_sq): a spawn failure here means the build.rs probe went
-    // stale, which must fail loudly, not pass silently (see build.rs)
-    let output = result.expect("sq vanished since the build.rs probe ran");
-    assert!(
-        output.status.success(),
-        "sq inspect failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+        // Gated by cfg(has_sq): a spawn failure here means the build.rs probe went
+        // stale, which must fail loudly, not pass silently (see build.rs)
+        let output = result.expect("sq vanished since the build.rs probe ran");
+        assert!(
+            output.status.success(),
+            "sq inspect failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Strip whitespace so we match regardless of the spaced-hex display format
-    let stdout_nows: String = stdout.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(
-        stdout_nows.to_uppercase().contains(&fp_hex(&cert)),
-        "fingerprint not found in sq output:\n{}",
-        stdout
-    );
-    assert!(stdout.contains("alice@example.com"), "UID not found in sq output:\n{}", stdout);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Strip whitespace so we match regardless of the spaced-hex display format
+        let stdout_nows: String = stdout.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            stdout_nows.to_uppercase().contains(&fp_hex(&cert)),
+            "fingerprint not found in sq output:\n{}",
+            stdout
+        );
+        assert!(stdout.contains("alice@example.com"), "UID not found in sq output:\n{}", stdout);
+    }
 }
 
 #[test]
 #[cfg_attr(not(has_gpg), ignore = "gpg not found in PATH")]
 fn gpg_accepts_exported_cert() {
-    let cert = builder(&SEED_A, "Alice", "alice@example.com")
-        .certify(CertificateKind::default())
-        .unwrap();
-    let armored = cert.armored().to_vec().unwrap();
+    for algorithm in [Algorithm::Curve25519, Algorithm::Rsa2048] {
+        let cert = builder(&SEED_A, "Alice", "alice@example.com")
+            .with_algorithm(algorithm)
+            .unwrap()
+            .certify(CertificateKind::default())
+            .unwrap();
+        let armored = cert.armored().to_vec().unwrap();
 
-    let tmp = tempfile::Builder::new().suffix(".asc").tempfile().unwrap();
-    std::fs::write(tmp.path(), &armored).unwrap();
+        let tmp = tempfile::Builder::new().suffix(".asc").tempfile().unwrap();
+        std::fs::write(tmp.path(), &armored).unwrap();
 
-    // --show-keys parses and displays key info without importing or touching GNUPGHOME
-    let result = std::process::Command::new("gpg")
-        .args(["--show-keys", "--with-colons", tmp.path().to_str().unwrap()])
-        .output();
+        // --show-keys parses and displays key info without importing or touching GNUPGHOME
+        let result = std::process::Command::new("gpg")
+            .args(["--show-keys", "--with-colons", tmp.path().to_str().unwrap()])
+            .output();
 
-    // Gated by cfg(has_gpg): a spawn failure here means the build.rs probe went
-    // stale, which must fail loudly, not pass silently (see build.rs)
-    let output = result.expect("gpg vanished since the build.rs probe ran");
-    assert!(
-        output.status.success(),
-        "gpg --show-keys failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+        // Gated by cfg(has_gpg): a spawn failure here means the build.rs probe went
+        // stale, which must fail loudly, not pass silently (see build.rs)
+        let output = result.expect("gpg vanished since the build.rs probe ran");
+        assert!(
+            output.status.success(),
+            "gpg --show-keys failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // In colon format fingerprints appear as "fpr::::::<40-char-hex>:" — uppercase, no spaces
-    assert!(
-        stdout.to_uppercase().contains(&fp_hex(&cert)),
-        "fingerprint not found in gpg output:\n{}",
-        stdout
-    );
-    // At least one uid record should contain the email
-    assert!(stdout.contains("alice@example.com"), "UID not found in gpg output:\n{}", stdout);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // In colon format fingerprints appear as "fpr::::::<40-char-hex>:" — uppercase, no spaces
+        assert!(
+            stdout.to_uppercase().contains(&fp_hex(&cert)),
+            "fingerprint not found in gpg output:\n{}",
+            stdout
+        );
+        // At least one uid record should contain the email
+        assert!(stdout.contains("alice@example.com"), "UID not found in gpg output:\n{}", stdout);
+    }
 }
 
 /// `--shared` makes the named subkey fall back to the derivation used when no subkey id is
@@ -662,6 +715,81 @@ fn current_scheme_is_frozen_on_p256() {
                 "527C736AE891638340027B85FA9B38F89A250FAE",
                 "1525D466A14E657B947CB297A57A7121F7265DA0",
                 "0188C936832FD954C674DC41AEB42B6118B3B23A",
+            ),
+        ],
+    );
+}
+
+/// The RSA-2048 half of the same promise: `--algorithm rsa2048` is part of `mtg1` and
+/// frozen with it.
+#[test]
+fn current_scheme_is_frozen_on_rsa2048() {
+    assert_current_scheme_frozen(
+        Algorithm::Rsa2048,
+        [
+            (
+                None,
+                "648EF922E310FCFF534CEC58989A1599B3760585",
+                "FC99E7F898391AA5D95905870A2A3819CAF7E132",
+                "E98D89838836620F055CE0A1921560ABCBF6CAD9",
+                "86147765F2F160C3ECCFAD34336F294CE9C91055",
+            ),
+            (
+                Some("laptop"),
+                "648EF922E310FCFF534CEC58989A1599B3760585",
+                "94ED21C46D0AC6B335F69E81F47A6DEA7EA16ED5",
+                "66FC340DDDB592E5F089FACA2A6C54E328A9DE66",
+                "124CEA22D4E87BB9AE2BECA23783ECC7FCDEE20B",
+            ),
+        ],
+    );
+}
+
+/// The RSA-3072 half of the same promise: `--algorithm rsa3072` is part of `mtg1` and
+/// frozen with it.
+#[test]
+fn current_scheme_is_frozen_on_rsa3072() {
+    assert_current_scheme_frozen(
+        Algorithm::Rsa3072,
+        [
+            (
+                None,
+                "E2A7215DB4AB3648D24B67C8A45193DD5E8D1B31",
+                "AC5EF1F59ECD2439A6DBD7E1963ABF5CD9577920",
+                "8D6A15131D1A5AABA15A6AA727D91E5CE03F3F34",
+                "CBBA2D15EFC789503D044074FF63C2E688A9E78D",
+            ),
+            (
+                Some("laptop"),
+                "E2A7215DB4AB3648D24B67C8A45193DD5E8D1B31",
+                "A1C3CBD6EAB625637CCB72F3E1431230751B53EE",
+                "8380BF575FCB27B9DA01292631A5401DD64987D2",
+                "A6F0D44317780A711277582B62B00DBF07743188",
+            ),
+        ],
+    );
+}
+
+/// The RSA-4096 half of the same promise: `--algorithm rsa4096` is part of `mtg1` and
+/// frozen with it.
+#[test]
+fn current_scheme_is_frozen_on_rsa4096() {
+    assert_current_scheme_frozen(
+        Algorithm::Rsa4096,
+        [
+            (
+                None,
+                "A1567C043EA08D341C85D0C112D94D500A200AF9",
+                "F35D4CF40303FD51878EE034393A6E7602DF1534",
+                "FCB6A67C62AFDA4FF5C8BDA7389EEFA7D245F675",
+                "1BDC3A7A343A3DC7BC7DF006D4901D56E0B45B90",
+            ),
+            (
+                Some("laptop"),
+                "A1567C043EA08D341C85D0C112D94D500A200AF9",
+                "9D9F0D874C5B31956E60A7ADE9B23A1746FD5D3D",
+                "25D380358B0CF34347E63648345F2F8631BC87C8",
+                "2AA627714863A36B94EEDA4C345DE60C77D15F3F",
             ),
         ],
     );

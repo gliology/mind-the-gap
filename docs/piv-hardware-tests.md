@@ -151,7 +151,9 @@ it.
 A YubiKey 5 series (or any PIV token supporting AES-256 management keys and P-256 import), a
 CCID reader, and a running `pcscd` (a socket-activated `pcscd.socket` is enough). The
 Curve25519 run of the suite (`--ignored`, see below) additionally needs a token that imports
-Ed25519 and X25519 keys: YubiKey firmware 5.7 or later, or the patched trussed PIV app.
+Ed25519 and X25519 keys: YubiKey firmware 5.7 or later, or the patched trussed PIV app. The
+RSA-2048 run (`provision_and_verify_rsa2048_card`) works on any YubiKey 5; the RSA-3072 and
+RSA-4096 runs need firmware 5.7 as well.
 
 All of the tooling is in the project's dev shell, so just:
 

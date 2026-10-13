@@ -42,9 +42,11 @@ use mind_the_gap::piv::{CertChain, CertificateKind, SeededSmartcard};
 use mind_the_gap::seed::{Algorithm, Seed256};
 
 use p256::ecdh;
+
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{DerSignature, VerifyingKey};
 use p256::{PublicKey, SecretKey};
+use rsa::traits::PublicKeyParts;
 
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
@@ -121,11 +123,52 @@ fn slot_algorithm(cert: &Certificate) -> AlgorithmId {
         .to_string()
         .as_str()
     {
-        "1.2.840.10045.2.1" => AlgorithmId::EccP256,
+        // Both curves share id-ecPublicKey; the uncompressed point's length tells them apart
+        "1.2.840.10045.2.1" => match public_key_bytes(cert).len() {
+            65 => AlgorithmId::EccP256,
+            97 => AlgorithmId::EccP384,
+            len => panic!("slot certificate carries an EC point of {len} bytes"),
+        },
         "1.3.101.112" => AlgorithmId::Ed25519,
         "1.3.101.110" => AlgorithmId::X25519,
+        "1.2.840.113549.1.1.1" => match rsa_public_key(cert).n().bits() {
+            2048 => AlgorithmId::Rsa2048,
+            3072 => AlgorithmId::Rsa3072,
+            4096 => AlgorithmId::Rsa4096,
+            bits => panic!("slot certificate carries an RSA key of {bits} bits"),
+        },
         other => panic!("slot certificate carries an unexpected key algorithm: {other}"),
     }
+}
+
+/// The RSA public key a certificate carries
+fn rsa_public_key(cert: &Certificate) -> rsa::RsaPublicKey {
+    use rsa::pkcs8::DecodePublicKey;
+    let spki = cert
+        .tbs_certificate()
+        .subject_public_key_info()
+        .to_der()
+        .unwrap();
+    rsa::RsaPublicKey::from_public_key_der(&spki).expect("slot certificate has no RSA key")
+}
+
+/// `message` hashed and padded into the block a raw RSA private key operation signs:
+/// EMSA-PKCS1-v1_5 with SHA-256 (RFC 8017 section 9.2), the card doing no padding itself
+fn pkcs1_sha256_block(message: &[u8], cert: &Certificate) -> Vec<u8> {
+    const DIGEST_INFO: [u8; 19] = [
+        0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+        0x05, 0x00, 0x04, 0x20,
+    ];
+    let size = rsa_public_key(cert).size();
+    let digest = sha256(message);
+    let mut block = vec![0xff; size];
+    block[0] = 0x00;
+    block[1] = 0x01;
+    let tail = DIGEST_INFO.len() + digest.len();
+    block[size - tail - 1] = 0x00;
+    block[size - tail..size - digest.len()].copy_from_slice(&DIGEST_INFO);
+    block[size - digest.len()..].copy_from_slice(&digest);
+    block
 }
 
 /// The raw subject public key a certificate carries
@@ -246,6 +289,54 @@ fn provision_and_verify_curve25519_card() {
     provision_and_verify(&subject, &serial, 7);
 }
 
+/// The card-level half of the checklist on P-384: ECDSA P-384 authorities and slot keys
+/// signing SHA-384 digests, and ECDH P-384 in 9D. Every YubiKey 5 imports it, and so does
+/// a YubiKey 4.
+#[test]
+#[ignore = "the card-level half of the checklist on P-384"]
+fn provision_and_verify_p384_card() {
+    let subject = subject().with_algorithm(Algorithm::P384);
+    let serial = target();
+
+    provision_and_verify(&subject, &serial, 7);
+}
+
+/// The card-level half of the checklist on RSA-2048: every slot key and authority in RSA,
+/// the card signing with each and decrypting with 9D.
+///
+/// The virtual PIV check runs it against the trussed card. RSA-2048 import works on every
+/// YubiKey 5, but the PKCS#11 end use stays with the P-256 run, so this stays ignored like
+/// the other card-level halves.
+#[test]
+#[ignore = "the card-level half of the checklist on RSA-2048, run by the virtual PIV check"]
+fn provision_and_verify_rsa2048_card() {
+    let subject = subject().with_algorithm(Algorithm::Rsa2048);
+    let serial = target();
+
+    provision_and_verify(&subject, &serial, 7);
+}
+
+/// The same on RSA-3072, which a YubiKey imports into PIV from firmware 5.7 on.
+#[test]
+#[ignore = "needs a card that imports RSA-3072 PIV keys, YubiKey firmware 5.7 or later"]
+fn provision_and_verify_rsa3072_card() {
+    let subject = subject().with_algorithm(Algorithm::Rsa3072);
+    let serial = target();
+
+    provision_and_verify(&subject, &serial, 7);
+}
+
+/// The same on RSA-4096, from firmware 5.7 on as well. Also needs a yubikey crate that
+/// fits the larger key into its import command, which the pinned revision does not yet.
+#[test]
+#[ignore = "needs RSA-4096 PIV import, YubiKey firmware 5.7 or later and a yubikey crate with room for it"]
+fn provision_and_verify_rsa4096_card() {
+    let subject = subject().with_algorithm(Algorithm::Rsa4096);
+    let serial = target();
+
+    provision_and_verify(&subject, &serial, 7);
+}
+
 /// Sections 1 to 4 of the checklist: provision, then assert what landed on the card and
 /// that the card signs and agrees with it. Returns the chain and the open token for the
 /// steps that follow; `total` is only for the step counter in the progress lines.
@@ -288,15 +379,26 @@ fn provision_and_verify(
     eprintln!("[4/{total}] asserting slot policies and certificates");
     let mut token = open();
 
-    for (slot, pin_policy, touch_policy) in EXPECTED_POLICIES {
-        let metadata = piv::metadata(&mut token, slot)
-            .unwrap_or_else(|e| panic!("cannot read {slot:?} metadata: {e}"));
+    // GET METADATA arrived with YubiKey firmware 5.3; before it the policies cannot be read
+    // back, and what proves the keys there is the certificate comparison below and the
+    // card using every key in section 3
+    let version = token.version();
+    let has_metadata = (version.major, version.minor) >= (5, 3);
+    if !has_metadata {
+        eprintln!("      firmware {version} has no GET METADATA, slot policies are not readable");
+    }
 
-        assert_eq!(
-            metadata.policy,
-            Some((pin_policy, touch_policy)),
-            "{slot:?} policy is not {pin_policy:?}/{touch_policy:?}",
-        );
+    for (slot, pin_policy, touch_policy) in EXPECTED_POLICIES {
+        if has_metadata {
+            let metadata = piv::metadata(&mut token, slot)
+                .unwrap_or_else(|e| panic!("cannot read {slot:?} metadata: {e}"));
+
+            assert_eq!(
+                metadata.policy,
+                Some((pin_policy, touch_policy)),
+                "{slot:?} policy is not {pin_policy:?}/{touch_policy:?}",
+            );
+        }
 
         // Byte-identical, not merely "a certificate is present"
         let on_card = yubikey::certificate::Certificate::read(&mut token, slot)
@@ -349,6 +451,7 @@ fn provision_and_verify(
     card_authentication_needs_no_pin(&mut token, &offline);
     signature_slot_refuses_without_pin(&mut token, &offline);
     authentication_slot_signs(&mut token, &offline);
+    signature_slot_signs(&mut token, &offline);
     key_management_slot_agrees(&mut token, &offline);
 
     (offline, token)
@@ -1028,6 +1131,26 @@ fn authentication_slot_signs(token: &mut YubiKey, chain: &CertChain) {
     verify(&signature, message, cert, "9A");
 }
 
+/// Slot 9C signs once the PIN is presented right before, and the signature verifies.
+///
+/// The positive half of `PinPolicy::Always`, so that every algorithm's run proves the
+/// signature key works rather than only that it is guarded; the full checklist's S/MIME step
+/// covers the same slot through PKCS#11, on P-256 only.
+fn signature_slot_signs(token: &mut YubiKey, chain: &CertChain) {
+    token
+        .verify_pin(TEST_PIN.as_bytes())
+        .expect("card rejected the PIN we provisioned it with");
+
+    let message = b"signature slot";
+    let cert = leaf(chain, SlotId::Signature);
+
+    eprintln!("      9C signing -- TOUCH THE TOKEN when it blinks");
+    let signature = sign(token, message, cert, SlotId::Signature)
+        .expect("9C refused to sign right after a PIN and a touch");
+
+    verify(&signature, message, cert, "9C");
+}
+
 /// Slot 9D performs ECDH on the card, and agrees with the same computation done off it.
 ///
 /// This is the hardware half of the `keyAgreement` decision. The offline suite asserts that
@@ -1037,8 +1160,13 @@ fn authentication_slot_signs(token: &mut YubiKey, chain: &CertChain) {
 fn key_management_slot_agrees(token: &mut YubiKey, chain: &CertChain) {
     let cert = leaf(chain, SlotId::KeyManagement);
 
-    if slot_algorithm(cert) == AlgorithmId::X25519 {
-        return x25519_key_management_slot_agrees(token, cert);
+    match slot_algorithm(cert) {
+        AlgorithmId::X25519 => return x25519_key_management_slot_agrees(token, cert),
+        algorithm @ (AlgorithmId::Rsa2048 | AlgorithmId::Rsa3072 | AlgorithmId::Rsa4096) => {
+            return rsa_key_management_slot_decrypts(token, cert, algorithm);
+        }
+        AlgorithmId::EccP384 => return p384_key_management_slot_agrees(token, cert),
+        _ => {}
     }
 
     let card_public = PublicKey::from_sec1_bytes(public_key_bytes(cert))
@@ -1091,13 +1219,64 @@ fn x25519_key_management_slot_agrees(token: &mut YubiKey, cert: &Certificate) {
     );
 }
 
+/// An RSA key management key decrypts rather than agrees: the card applies the raw private
+/// key operation, which is the same for decryption and signing. Fed a PKCS#1 v1.5
+/// signature block, it has to return a signature the certificate's public key accepts,
+/// which proves the 9D key on the card is the derived one without any padding oracle.
+fn rsa_key_management_slot_decrypts(
+    token: &mut YubiKey,
+    cert: &Certificate,
+    algorithm: AlgorithmId,
+) {
+    let message = b"key management slot";
+
+    eprintln!("      9D private key operation -- TOUCH THE TOKEN when it blinks");
+    let result = piv::decrypt_data(
+        token,
+        &pkcs1_sha256_block(message, cert),
+        algorithm,
+        SlotId::KeyManagement,
+    )
+    .expect("9D refused the private key operation");
+
+    verify(&result, message, cert, "9D");
+}
+
+/// The P-384 twin of the P-256 agreement: the card takes the peer's uncompressed point and
+/// returns the shared x coordinate, which the same computation off the card has to match.
+fn p384_key_management_slot_agrees(token: &mut YubiKey, cert: &Certificate) {
+    let card_public = p384::PublicKey::from_sec1_bytes(public_key_bytes(cert))
+        .expect("9D certificate does not carry a P-384 point");
+    let ephemeral =
+        p384::SecretKey::from_slice(&[0x2bu8; 48]).expect("ephemeral scalar is invalid");
+    let point = ephemeral.public_key().to_sec1_bytes();
+
+    eprintln!("      9D key agreement -- TOUCH THE TOKEN when it blinks");
+    let on_card = piv::decrypt_data(token, &point, AlgorithmId::EccP384, SlotId::KeyManagement)
+        .expect("9D refused to perform key agreement");
+    let off_card =
+        p384::ecdh::diffie_hellman(ephemeral.to_nonzero_scalar(), card_public.as_affine());
+
+    assert_eq!(
+        on_card.as_slice(),
+        off_card.raw_secret_bytes().as_slice(),
+        "9D derived a different shared secret than the same key does off the card",
+    );
+}
+
+fn sha384(data: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha384};
+    Sha384::digest(data).to_vec()
+}
+
 fn sha256(data: &[u8]) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     Sha256::digest(data).to_vec()
 }
 
 /// Sign `message` in `slot`, the way its algorithm wants it: ECDSA takes the digest, the
-/// card never hashing for it, while pure Ed25519 hashes internally and takes the message.
+/// card never hashing for it, pure Ed25519 hashes internally and takes the message, and
+/// RSA takes the whole padded block.
 fn sign(
     token: &mut YubiKey,
     message: &[u8],
@@ -1106,6 +1285,11 @@ fn sign(
 ) -> yubikey::Result<yubikey::Buffer> {
     match slot_algorithm(cert) {
         AlgorithmId::Ed25519 => piv::sign_data(token, message, AlgorithmId::Ed25519, slot),
+        algorithm @ (AlgorithmId::Rsa2048 | AlgorithmId::Rsa3072 | AlgorithmId::Rsa4096) => {
+            piv::sign_data(token, &pkcs1_sha256_block(message, cert), algorithm, slot)
+        }
+        // ECDSA on P-384 signs a SHA-384 digest, the hash its strength calls for
+        AlgorithmId::EccP384 => piv::sign_data(token, &sha384(message), AlgorithmId::EccP384, slot),
         algorithm => piv::sign_data(token, &sha256(message), algorithm, slot),
     }
 }
@@ -1124,6 +1308,24 @@ fn verify(signature: &[u8], message: &[u8], cert: &Certificate, slot: &str) {
             .expect("slot certificate does not carry an Ed25519 point");
             let signature = ed25519_dalek::Signature::from_slice(signature)
                 .unwrap_or_else(|e| panic!("{slot} signature is not an Ed25519 signature: {e}"));
+            key.verify(message, &signature).unwrap_or_else(|e| {
+                panic!("{slot} signature does not verify under its certificate: {e}")
+            });
+        }
+        AlgorithmId::Rsa2048 | AlgorithmId::Rsa3072 | AlgorithmId::Rsa4096 => {
+            let key = rsa::pkcs1v15::VerifyingKey::<rsa::sha2::Sha256>::new(rsa_public_key(cert));
+            let signature = rsa::pkcs1v15::Signature::try_from(signature)
+                .unwrap_or_else(|e| panic!("{slot} result is not an RSA signature: {e}"));
+            rsa::signature::Verifier::verify(&key, message, &signature).unwrap_or_else(|e| {
+                panic!("{slot} signature does not verify under its certificate: {e}")
+            });
+        }
+        AlgorithmId::EccP384 => {
+            use p384::ecdsa::signature::Verifier as _;
+            let key = p384::ecdsa::VerifyingKey::from_sec1_bytes(public_key_bytes(cert))
+                .expect("slot certificate does not carry a P-384 point");
+            let signature = p384::ecdsa::DerSignature::from_bytes(signature)
+                .unwrap_or_else(|e| panic!("{slot} signature is not DER: {e}"));
             key.verify(message, &signature).unwrap_or_else(|e| {
                 panic!("{slot} signature does not verify under its certificate: {e}")
             });

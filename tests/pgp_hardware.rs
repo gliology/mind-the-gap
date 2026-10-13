@@ -12,8 +12,9 @@
 //!   cargo test --features destructive-hardware-tests --test pgp_hardware -- --nocapture
 //! ```
 //!
-//! Unlike the PIV suite this one needs **no touches**: the OpenPGP applet is provisioned
-//! through the admin pin, and a YubiKey ships with its touch policies off.
+//! Provisioning needs no touch, the applet being set up through the admin pin, but `upload`
+//! leaves the keys at the cached touch policy, so on a YubiKey the steps that use the keys
+//! (sign, authenticate, decrypt, and gpg doing the same) blink for a touch each.
 //!
 //! The card is addressed by its OpenPGP *application identifier* (`0006:20381784`), not the
 //! bare serial the PIV suite wants -- that is what `openpgp-card` matches on. `mind-the-gap
@@ -35,6 +36,11 @@ use sequoia_openpgp::policy::StandardPolicy;
 use card_backend_pcsc::PcscBackend;
 use openpgp_card::Card;
 use openpgp_card::ocard::KeyType;
+use openpgp_card::ocard::crypto::{Cryptogram, HashAlgo, SigningAlgo};
+use openpgp_card::state::Transaction;
+
+use sequoia_openpgp::crypto::mpi;
+use sequoia_openpgp::types::Curve as PgpCurve;
 
 use zeroize::Zeroizing;
 
@@ -172,16 +178,31 @@ fn provision_and_verify_p256_card() {
     );
 }
 
+/// The same checklist with RSA keys, at each size: every YubiKey 5 imports RSA up to 4096
+/// bits into its OpenPGP applet, and the larger keys are the ones whose import needs more
+/// than one short APDU. Same `--test-threads 1` caveat as above.
+#[test]
+fn provision_and_verify_rsa_cards() {
+    for algorithm in [Algorithm::Rsa2048, Algorithm::Rsa3072, Algorithm::Rsa4096] {
+        eprintln!("--- {algorithm:?}");
+        provision_and_verify(
+            subject()
+                .with_algorithm(algorithm)
+                .expect("the current scheme takes any algorithm"),
+        );
+    }
+}
+
 fn provision_and_verify(subject: SeededSmartcard) {
     let ident = target();
 
     // -- Provision -----------------------------------------------------------------------
-    eprintln!("[1/6] deriving the certificate offline");
+    eprintln!("[1/7] deriving the certificate offline");
     let offline = subject
         .certify(CertificateKind::Full)
         .expect("offline certify failed");
 
-    eprintln!("[2/6] uploading to card {ident} (no touch needed)");
+    eprintln!("[2/7] uploading to card {ident} (no touch needed)");
     let uploaded = subject
         .upload(Some(ident.clone()))
         .expect("upload to card failed");
@@ -193,7 +214,7 @@ fn provision_and_verify(subject: SeededSmartcard) {
     );
 
     // -- The crate's own check agrees ----------------------------------------------------
-    eprintln!("[3/6] running check");
+    eprintln!("[3/7] running check");
     subject
         .check(Some(ident.clone()))
         .expect("check disagreed with the card");
@@ -201,7 +222,7 @@ fn provision_and_verify(subject: SeededSmartcard) {
     // -- Independent verification --------------------------------------------------------
     //
     // `check` is the thing under test, so read the card directly rather than taking its word.
-    eprintln!("[4/6] asserting card contents independently");
+    eprintln!("[4/7] asserting card contents independently");
     let expected = derived_fingerprints(&offline);
 
     let mut card = open();
@@ -227,17 +248,28 @@ fn provision_and_verify(subject: SeededSmartcard) {
         .verify_user_pin(secrecy::SecretString::from(TEST_PIN.to_string()))
         .expect("card rejected the pin we provisioned it with");
 
+    // -- Every key works on the card ------------------------------------------------------
+    //
+    // A matching fingerprint only says the right public key was recorded. Here each key
+    // does its job and the result is checked against the certificate off the card: the
+    // signing and authentication keys sign, the decryption key decrypts (RSA) or agrees
+    // (ECDH). The X25519 agreement is the one that settles the scalar byte order, since the
+    // card computes with the bytes it was sent and the certificate holds the public key
+    // derived from them here.
+    eprintln!("[5/7] each key signs, authenticates or decrypts -- TOUCH if the card blinks");
+    keys_work_on_card(&mut transaction, &offline);
+
     drop(transaction);
     drop(card);
 
-    eprintln!("[5/6] gpg sees the card");
-    gpg_sees_the_keys(&expected);
+    eprintln!("[6/7] gpg sees the card and uses its keys -- TOUCH if the card blinks");
+    gpg_sees_the_keys(&expected, &offline);
 
     // -- Post-provisioning configuration ---------------------------------------------------
     //
     // `configure` adjusts the card under the derived admin pin without reprovisioning; a
     // later factory reset by the next run reverts everything, so nothing here persists.
-    eprintln!("[6/6] configure adjusts the provisioned card");
+    eprintln!("[7/7] configure adjusts the provisioned card");
     subject
         .configure(
             Some(ident.clone()),
@@ -271,8 +303,186 @@ fn provision_and_verify(subject: SeededSmartcard) {
 /// Uses a throwaway GNUPGHOME so the caller's keyring and agent are untouched, and forces
 /// scdaemon through PC/SC -- its internal CCID driver claims the USB interface directly and
 /// fails with "No such device" whenever pcscd already holds the reader.
+/// A subkey's public key material, as the certificate carries it
+fn public_mpis(cert: &Cert, role: SubkeyRole) -> mpi::PublicKey {
+    let policy = StandardPolicy::new();
+    let valid = cert
+        .with_policy(&policy, None)
+        .expect("derived certificate is not valid under the standard policy");
+    valid
+        .keys()
+        .subkeys()
+        .find(|key| key.key_flags().is_some_and(|flags| role.matches(&flags)))
+        .unwrap_or_else(|| panic!("derived certificate has no {role:?} subkey"))
+        .key()
+        .mpis()
+        .clone()
+}
+
+fn sha256(data: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(data).to_vec()
+}
+
+/// The RSA public key in a certificate's key material
+fn rsa_public(e: &mpi::MPI, n: &mpi::MPI) -> rsa::RsaPublicKey {
+    rsa::RsaPublicKey::new(
+        crypto_bigint::BoxedUint::from_be_slice_vartime(n.value()),
+        crypto_bigint::BoxedUint::from_be_slice_vartime(e.value()),
+    )
+    .expect("certificate carries an invalid RSA key")
+}
+
+/// What the card signs for `message`: RSA wraps a SHA-256 digest in a DigestInfo, ECDSA takes
+/// the digest bare, and EdDSA signs the bytes it is given, here the same digest
+fn signing_input(public: &mpi::PublicKey, message: &[u8]) -> (SigningAlgo, Vec<u8>) {
+    match public {
+        mpi::PublicKey::RSA { .. } => (SigningAlgo::RSA(HashAlgo::SHA256), sha256(message)),
+        _ => (SigningAlgo::ECC, sha256(message)),
+    }
+}
+
+/// Check a card signature over `message` against the certificate's public key
+fn verify_card_signature(public: &mpi::PublicKey, message: &[u8], signature: &[u8], what: &str) {
+    match public {
+        mpi::PublicKey::RSA { e, n } => {
+            use rsa::signature::Verifier;
+            let key = rsa::pkcs1v15::VerifyingKey::<rsa::sha2::Sha256>::new(rsa_public(e, n));
+            let signature = rsa::pkcs1v15::Signature::try_from(signature)
+                .unwrap_or_else(|e| panic!("{what} is not an RSA signature: {e}"));
+            key.verify(message, &signature)
+                .unwrap_or_else(|e| panic!("{what} does not verify under the certificate: {e}"));
+        }
+        mpi::PublicKey::EdDSA { q, .. } => {
+            use ed25519_dalek::Verifier;
+            // OpenPGP prefixes the native point with 0x40
+            let point: [u8; 32] = q.value()[1..].try_into().expect("not an Ed25519 point");
+            let key = ed25519_dalek::VerifyingKey::from_bytes(&point).expect("not an Ed25519 key");
+            let signature = ed25519_dalek::Signature::from_slice(signature)
+                .unwrap_or_else(|e| panic!("{what} is not an Ed25519 signature: {e}"));
+            key.verify(&sha256(message), &signature)
+                .unwrap_or_else(|e| panic!("{what} does not verify under the certificate: {e}"));
+        }
+        mpi::PublicKey::ECDSA { q, .. } => {
+            use p256::ecdsa::signature::hazmat::PrehashVerifier;
+            let key =
+                p256::ecdsa::VerifyingKey::from_sec1_bytes(q.value()).expect("not a P-256 point");
+            let signature = p256::ecdsa::Signature::from_slice(signature)
+                .unwrap_or_else(|e| panic!("{what} is not an ECDSA signature: {e}"));
+            key.verify_prehash(&sha256(message), &signature)
+                .unwrap_or_else(|e| panic!("{what} does not verify under the certificate: {e}"));
+        }
+        other => panic!("{what}: unexpected signing key {other:?}"),
+    }
+}
+
+/// Encipher `message` to an RSA key with PKCS#1 v1.5 padding (RFC 8017 section 7.2.1)
+///
+/// The padding string is fixed rather than random: the card's private key is what is under
+/// test, and a constant keeps the test deterministic.
+fn rsa_encipher(e: &mpi::MPI, n: &mpi::MPI, message: &[u8]) -> Vec<u8> {
+    use crypto_bigint::modular::{BoxedMontyForm, BoxedMontyParams};
+    use crypto_bigint::{BoxedUint, Odd};
+
+    let size = n.value().len();
+    let mut block = vec![0x5a; size];
+    block[0] = 0x00;
+    block[1] = 0x02;
+    block[size - message.len() - 1] = 0x00;
+    block[size - message.len()..].copy_from_slice(message);
+
+    let modulus = BoxedUint::from_be_slice_vartime(n.value());
+    let bits = modulus.bits_precision();
+    let params = BoxedMontyParams::new(Odd::new(modulus).expect("RSA modulus is odd"));
+    let block = BoxedUint::from_be_slice(&block, bits).expect("block fits the modulus");
+    let exponent = BoxedUint::from_be_slice_vartime(e.value());
+    let cipher = BoxedMontyForm::new(block, &params)
+        .pow(&exponent)
+        .retrieve();
+
+    let bytes = cipher.to_be_bytes();
+    bytes[bytes.len() - size..].to_vec()
+}
+
+/// The three keys at work on the card, each result checked off the card
+fn keys_work_on_card(transaction: &mut Card<Transaction<'_>>, cert: &Cert) {
+    let pin = || secrecy::SecretString::from(TEST_PIN.to_string());
+
+    // Signing key: PW1 in signing mode, the one the card resets after every signature
+    let public = public_mpis(cert, SubkeyRole::Signing);
+    let message = b"openpgp signing key";
+    let (algo, input) = signing_input(&public, message);
+    transaction
+        .verify_user_signing_pin(pin())
+        .expect("card rejected the signing pin");
+    let signature = transaction
+        .card()
+        .signature_for_hash(algo, &input)
+        .expect("signing key refused to sign");
+    verify_card_signature(&public, message, &signature, "signing key signature");
+
+    // Authentication key: INTERNAL AUTHENTICATE, PW1 in user mode
+    let public = public_mpis(cert, SubkeyRole::Authentication);
+    let message = b"openpgp authentication key";
+    let (algo, input) = signing_input(&public, message);
+    transaction
+        .verify_user_pin(pin())
+        .expect("card rejected the user pin");
+    let signature = transaction
+        .card()
+        .authenticate_for_hash(algo, &input)
+        .expect("authentication key refused to authenticate");
+    verify_card_signature(&public, message, &signature, "authentication key signature");
+
+    // Decryption key: RSA decrypts, ECDH returns the shared secret
+    let public = public_mpis(cert, SubkeyRole::Decryption);
+    match &public {
+        mpi::PublicKey::RSA { e, n } => {
+            let message = b"openpgp decryption key";
+            let cipher = rsa_encipher(e, n, message);
+            let plain = transaction
+                .card()
+                .decipher(Cryptogram::RSA(&cipher))
+                .expect("decryption key refused to decrypt");
+            assert_eq!(plain, message, "decryption key decrypted to something else");
+        }
+        mpi::PublicKey::ECDH { curve: PgpCurve::Cv25519, q, .. } => {
+            let card: [u8; 32] = q.value()[1..].try_into().expect("not an X25519 point");
+            let ephemeral = x25519_dalek::StaticSecret::from([0x2bu8; 32]);
+            let point = x25519_dalek::PublicKey::from(&ephemeral);
+            let on_card = transaction
+                .card()
+                .decipher(Cryptogram::ECDH(point.as_bytes()))
+                .expect("decryption key refused to agree");
+            let off_card = ephemeral.diffie_hellman(&x25519_dalek::PublicKey::from(card));
+            assert_eq!(
+                on_card,
+                off_card.as_bytes(),
+                "the card's X25519 key is not the one in the certificate",
+            );
+        }
+        mpi::PublicKey::ECDH { curve: PgpCurve::NistP256, q, .. } => {
+            let card = p256::PublicKey::from_sec1_bytes(q.value()).expect("not a P-256 point");
+            let ephemeral = p256::SecretKey::from_slice(&[0x2bu8; 32]).expect("invalid scalar");
+            let point = ephemeral.public_key().to_sec1_bytes();
+            let on_card = transaction
+                .card()
+                .decipher(Cryptogram::ECDH(&point))
+                .expect("decryption key refused to agree");
+            let off_card =
+                p256::ecdh::diffie_hellman(ephemeral.to_nonzero_scalar(), card.as_affine());
+            assert_eq!(
+                on_card,
+                off_card.raw_secret_bytes().as_slice(),
+                "the card's P-256 decryption key is not the one in the certificate",
+            );
+        }
+        other => panic!("unexpected decryption key {other:?}"),
+    }
+}
+
 #[cfg(has_gpg)]
-fn gpg_sees_the_keys(expected: &[(KeyType, [u8; 20])]) {
+fn gpg_sees_the_keys(expected: &[(KeyType, [u8; 20])], cert: &Cert) {
     // tempfile gives an unpredictable path, so nothing can pre-place a directory or
     // symlink there; into_path hands ownership to the ScdaemonGuard below
     let home = tempfile::tempdir()
@@ -321,10 +531,76 @@ fn gpg_sees_the_keys(expected: &[(KeyType, [u8; 20])]) {
             "gpg does not report the {kind:?} key ({hex}):\n{stdout}",
         );
     }
+
+    gpg_uses_the_keys(&home, cert);
+}
+
+/// gpg signs and decrypts with the card, end to end, the way a mail client would.
+///
+/// The low-level checks above prove the keys; this proves the whole client path around them,
+/// the ECDH key derivation and session key unwrapping included, which only a real client does.
+#[cfg(has_gpg)]
+fn gpg_uses_the_keys(home: &std::path::Path, cert: &Cert) {
+    use sequoia_openpgp::serialize::SerializeInto;
+    use std::io::Write;
+
+    let gpg = |args: &[&str], input: &[u8]| -> std::process::Output {
+        let mut child = std::process::Command::new("gpg")
+            .env("GNUPGHOME", home)
+            .args([
+                "--batch",
+                "--yes",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                TEST_PIN,
+            ])
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("cannot run gpg");
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait_with_output().expect("gpg did not finish")
+    };
+    let ok = |output: std::process::Output, what: &str| -> Vec<u8> {
+        assert!(
+            output.status.success(),
+            "gpg {what} failed:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        output.stdout
+    };
+
+    // The public certificate turns the card status stubs into usable keys
+    ok(gpg(&["--import"], &cert.armored().to_vec().unwrap()), "--import");
+    let fingerprint = cert.fingerprint().to_hex();
+
+    let message = b"signed and sealed on the card";
+    let signed = ok(gpg(&["--local-user", &fingerprint, "--sign"], message), "--sign");
+    let verified = ok(gpg(&["--decrypt"], &signed), "--verify of a card signature");
+    assert_eq!(verified, message, "gpg verified a different message");
+
+    let sealed = ok(
+        gpg(
+            &[
+                "--trust-model",
+                "always",
+                "--recipient",
+                &fingerprint,
+                "--encrypt",
+            ],
+            message,
+        ),
+        "--encrypt",
+    );
+    let opened = ok(gpg(&["--decrypt"], &sealed), "--decrypt on the card");
+    assert_eq!(opened, message, "gpg decrypted to a different message");
 }
 
 #[cfg(not(has_gpg))]
-fn gpg_sees_the_keys(_expected: &[(KeyType, [u8; 20])]) {
+fn gpg_sees_the_keys(_expected: &[(KeyType, [u8; 20])], _cert: &Cert) {
     // A destructive run that cannot finish its last assertion must say so in the result,
     // not in a line of buffered output: a pass with a skipped step is not a pass. The card
     // itself is fine -- provisioning succeeded before this step.

@@ -83,8 +83,8 @@ When stepping away from a live-image machine mid-session, run `forget`: it clear
 
 | Token | OpenPGP | PIV |
 |---|---|---|
-| YubiKey 5 | works, in production, on both curves; the hardware suite passed on firmware 5.4.3 | works, in production, on P-256; the full [hardware checklist](piv-hardware-tests.md) passed on firmware 5.4.3. Ed25519 and X25519 PIV keys need firmware 5.7 or later, which has not been tested here |
-| YubiKey 4 | untested | works on P-384 with the [build server profile](piv-build-server.md#yubikey-4): a card on firmware 4.3.7 took the derived 3DES management key, passed `check` with every slot key proven by a signature challenge (the card has no GET METADATA), and then served unattended as a build server identity through OpenSC, signing SSH logins, git commits and Nix store paths. P-256 is expected to work the same way but has not been tried on the card. Its firmware differences are covered on that real card only (see [hardware tests](hardware-tests.md)) |
+| YubiKey 5 | works, in production, on both curves; the hardware suite passed on both curves and RSA-2048, 3072 and 4096 on firmware 5.4.3 and 5.7.4 | works, in production, on P-256; the full [hardware checklist](piv-hardware-tests.md) passed on firmware 5.4.3 and 5.7.4, and the card-level checks on Curve25519 and RSA-2048, 3072 and 4096 on 5.7.4 (4096 with a yubikey crate that has room for the import, see the open items) |
+| YubiKey 4 | works with RSA, the only OpenPGP algorithm firmware 4 imports: on firmware 4.3.7 the hardware suite passed on RSA-2048, 3072 and 4096, each key signing, authenticating or decrypting on the card and gpg using them end to end | works on P-256, P-384 and RSA-2048: on firmware 4.3.7 the card-level hardware checks passed on all three, every slot key signing or agreeing on the card. It also runs the [build server profile](piv-build-server.md#yubikey-4): a card on firmware 4.3.7 took the derived 3DES management key, passed `check` with every slot key proven by a signature challenge (the card has no GET METADATA), and then served unattended as a build server identity through OpenSC, signing SSH logins, git commits and Nix store paths. Its firmware differences are covered on that real card only; the virtual card runs the app as it is (see [hardware tests](hardware-tests.md)) |
 | Nitrokey 3 | works, in production, on both curves — the same card code runs in CI as the [virtual card](hardware-tests.md) | works on both curves against [our patched card code](https://github.com/FlorianFranzen/piv-authenticator/tree/mtg-integration) in CI (the [virtual PIV checks](hardware-tests.md)); the shipped firmware (1.9.1 at the time of writing) lacks the ECC import, GET METADATA, RID selection and Curve25519 support that the patch set adds, all submitted to [trussed-dev/piv-authenticator](https://github.com/trussed-dev/piv-authenticator/pulls) |
 | Solo 2 | untested | works on both curves with the same patched card code, on an LPCXpresso55S69 running the Solo 2 firmware: the P-256 checklist and the Curve25519 card test passed over real CCID; a production Solo 2 is untested |
 | Gnuk | untested — planned as the second virtual-pgp target | no PIV applet |
@@ -94,7 +94,8 @@ test run. Anything marked untested may well work — the backends speak standard
 card and PIV protocols — but has not been verified against the device.
 
 Both backends take `--algorithm`: OpenPGP derives on Curve25519 by default and on NIST P-256
-on request, PIV the other way round, and PIV alone also takes NIST P-384. Every token above
-takes both curves for OpenPGP; for PIV, Ed25519 and X25519 keys need YubiKey firmware 5.7 or
-later, or the patched trussed PIV app as it runs in CI and on the dev kit. See the
-[derivation chapter](derivation.md#the-algorithm-segment).
+on request, PIV the other way round, PIV alone also takes NIST P-384, and either derives RSA
+keys of 2048, 3072 or 4096 bits on request. Every token above takes both curves for OpenPGP;
+for PIV, Ed25519 and X25519 keys need YubiKey firmware 5.7 or later, or the patched trussed
+PIV app as it runs in CI and on the dev kit. RSA-2048 PIV keys import into every YubiKey 5,
+the larger sizes need firmware 5.7. See the [derivation chapter](derivation.md#the-algorithm-segment).

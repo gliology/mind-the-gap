@@ -207,7 +207,8 @@ impl Seed256Derive for Seed256 {
 ///
 /// Scheme vocabulary rather than a backend detail: the algorithm is a segment of every key
 /// label (see [`algorithm_label`]), so both backends have to spell it the same way. The
-/// segments are the RFC names, `x25519` rather than OpenPGP's `cv25519`.
+/// segments are the RFC names, `x25519` rather than OpenPGP's `cv25519`; an RSA key signs
+/// and decrypts with the same key, so its segment is the same in either role.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Algorithm {
     /// NIST P-256: ECDSA signatures, ECDH key agreement
@@ -216,6 +217,12 @@ pub enum Algorithm {
     P384,
     /// Curve25519: Ed25519 signatures, X25519 key agreement
     Curve25519,
+    /// RSA with a 2048-bit modulus: PKCS#1 v1.5 signatures and decryption
+    Rsa2048,
+    /// RSA with a 3072-bit modulus
+    Rsa3072,
+    /// RSA with a 4096-bit modulus
+    Rsa4096,
 }
 
 impl Algorithm {
@@ -225,15 +232,55 @@ impl Algorithm {
             Algorithm::P256 => "p256",
             Algorithm::P384 => "p384",
             Algorithm::Curve25519 => "ed25519",
+            _ => self.name(),
         }
     }
 
-    /// Label segment of a key agreement key in this algorithm
+    /// Label segment of a key agreement (or, for RSA, decryption) key in this algorithm
     pub fn agreement_segment(self) -> &'static str {
         match self {
             Algorithm::P256 => "p256",
             Algorithm::P384 => "p384",
             Algorithm::Curve25519 => "x25519",
+            _ => self.name(),
+        }
+    }
+
+    /// The name the command line knows this algorithm by
+    pub fn name(self) -> &'static str {
+        match self {
+            Algorithm::P256 => "p256",
+            Algorithm::P384 => "p384",
+            Algorithm::Curve25519 => "curve25519",
+            Algorithm::Rsa2048 => "rsa2048",
+            Algorithm::Rsa3072 => "rsa3072",
+            Algorithm::Rsa4096 => "rsa4096",
+        }
+    }
+
+    /// Modulus size of an RSA algorithm, `None` for the elliptic curves
+    pub fn rsa_bits(self) -> Option<u32> {
+        match self {
+            Algorithm::Rsa2048 => Some(2048),
+            Algorithm::Rsa3072 => Some(3072),
+            Algorithm::Rsa4096 => Some(4096),
+            Algorithm::P256 | Algorithm::P384 | Algorithm::Curve25519 => None,
+        }
+    }
+
+    /// Security strength in bits: the curves as NIST SP 800-57 part 1 rates them, the RSA
+    /// moduli as SP 800-56B rev. 2 table 2 does
+    ///
+    /// The bar the phrase's entropy is held against: a key cannot be stronger than the
+    /// secret it is derived from, so a phrase below this level makes the larger key size
+    /// pointless rather than unsafe.
+    pub fn strength_bits(self) -> u32 {
+        match self {
+            Algorithm::P256 | Algorithm::Curve25519 => 128,
+            Algorithm::P384 => 192,
+            Algorithm::Rsa2048 => 112,
+            Algorithm::Rsa3072 => 128,
+            Algorithm::Rsa4096 => 152,
         }
     }
 }

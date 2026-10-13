@@ -72,6 +72,14 @@ impl MnemonicSeed {
         )
     }
 
+    /// Entropy the phrase carries, in bits: 128 for 12 words up to 256 for 24
+    ///
+    /// The password is deliberately not counted, since nothing here can tell how much of
+    /// it is guessable.
+    pub fn entropy_bits(&self) -> u32 {
+        u32::try_from(self.mnemonic.entropy().len() * 8).expect("at most 256 bits")
+    }
+
     /// Process and return seed
     pub fn seed(&self) -> Zeroizing<Seed256> {
         argon2id_256(self.mnemonic.entropy(), Some(self.password.as_bytes()))

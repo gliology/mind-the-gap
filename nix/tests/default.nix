@@ -5,6 +5,7 @@
   self,
   cards,
   piv-suite,
+  pgp-suite,
 }:
 
 let
@@ -42,7 +43,7 @@ in
   # upload, check and config through the real binary, with no hardware involved
   virtual-pgp = vmTest (
     import ./virtual-pgp.nix {
-      inherit pkgs;
+      inherit pkgs pgp-suite;
       inherit (cards) opcard-vpicc;
     }
   );
@@ -54,6 +55,7 @@ in
   # agreeing with the keys it took
   virtual-piv = virtualPiv "p256";
   virtual-piv-curve25519 = virtualPiv "curve25519";
+  virtual-piv-rsa2048 = virtualPiv "rsa2048";
 
   # The build server profile (docs/piv-build-server.md) on the same card: P-384, pin once,
   # touch never, management access without a touch, with the policies read back through
