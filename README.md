@@ -21,31 +21,13 @@ spells out what the fork changes and why.
 
 ## Quick start
 
-Install a flake enabled nix and build the live image:
-
 ```
 nix build github:gliology/mind-the-gap#iso
 ```
 
-Copy the image from `result/iso` to an install medium and boot it. To try the tool in your
-current online environment instead -- fine for testing, not for production keys:
-
-```
-nix run github:gliology/mind-the-gap
-```
-
-Start by minting a seed with `mind-the-gap generate`; the built-in help, man pages and shell
-completion guide you from there.
-
-Running `mind-the-gap` without a subcommand opens an interactive session, the recommended
-interface for most users: it asks for the seed and optional password once, holds them in process memory only, and
-refuses any line that would put a secret into the session history. The `--seed` and
-`--password` flags and the `MIND_THE_...` environment variables form a second, fully
-scriptable interface for experts and integrations. Arguments and environments are visible
-to other processes, so that interface is for scenarios where the caller takes extra care to
-protect the secrets; the
-[user guide](https://gliology.github.io/mind-the-gap/introduction.html) spells out the
-risks.
+Boot the image from `result/iso` and run `mind-the-gap`; the
+[user guide](https://gliology.github.io/mind-the-gap/introduction.html) takes it from there,
+including what the scriptable interface exposes and when trying it online is fine.
 
 ## Documentation
 
@@ -70,9 +52,10 @@ command:
 cachix use mind-the-gap
 ```
 
-`nix flake check` runs everything CI runs: format, clippy and the test suite, rustdoc, the
-rendered book and its consistency checks, the live system test, and boots the actual iso in
-qemu over both BIOS and UEFI.
+`nix flake check` runs everything CI runs on x86 apart from the networked advisory check:
+format, clippy and the test suite, rustdoc, the rendered book and its consistency checks,
+the virtual card checks, the live system test, and boots the actual iso in qemu over both
+BIOS and UEFI.
 
 Where things live: user documentation is the mdBook under [`docs/`](docs/), developer
 documentation is rustdoc on the modules and items themselves, open items are in

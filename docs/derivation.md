@@ -4,7 +4,7 @@
 
 
 While the project was inspired by the key derivation cryptography used in bitcoin and substrate, we ended up switching to `argon2id` for our key derivation function.
-This tools generates and accept only 24 word seeds, which is equivalent to 256bits of entropy (and 8 bits of checksum). 
+`generate` mints 24 word phrases, which carry 256 bits of entropy (and 8 bits of checksum); phrases of 12 to 24 words are accepted, see [the algorithm segment](#the-algorithm-segment) for what a shorter one costs.
 All keys are derived from this root entropy through multiple rounds of `argon2id` (64 MiB, three passes, one lane). These parameters are frozen constants of the scheme, exactly like the labels below: tuning them would move every key, so any change ships as a new scheme behind a new major version.
 
 The salt is always set to at least `MINDTHEGAP256HDKD` and optionally followed by an additional context like a password, (sub-)key or application identifiers. Two properties of this construction are deliberate. There is no random salt, because determinism is the point: the same phrase must re-derive the same keys years later, and uniqueness comes from the 256 bits of seed entropy instead. And the optional password enters in the salt position rather than the password input; argon2 folds both into its initial state symmetrically, so this is equivalent in strength, and the context prefix keeps the salt above the format's minimum length even with no password at all.
@@ -12,18 +12,18 @@ The salt is always set to at least `MINDTHEGAP256HDKD` and optionally followed b
 ```
 256-bit mnemonic seed/
 └── (optional password)/
-    ├── "openpgp"/
+    ├── app:pgp/
     │   ├── primary key
-    │   ├── (optional subkey id)/
+    │   ├── sub:(optional subkey id)/
     │   │   ├── admin pin
     │   │   ├── signing subkey
     │   │   ├── decryption subkey
     │   │   └── authentication subkey
-    │   └── (additional subkey id)/
+    │   └── sub:(additional subkey id)/
     │       └── any other subkey type
-    └── "piv"/
+    └── app:piv/
         ├── root CA key
-        ├── (optional subkey id)/
+        ├── sub:(optional subkey id)/
         │   ├── issuing CA key
         │   ├── mgmnt key             (AES-256, or 3DES)
         │   ├── card identifier
@@ -31,7 +31,7 @@ The salt is always set to at least `MINDTHEGAP256HDKD` and optionally followed b
         │   ├── signature key         (slot 9C)
         │   ├── key management key    (slot 9D)
         │   └── card authentication   (slot 9E)
-        └── (additional subkey id)/
+        └── sub:(additional subkey id)/
              └── any other subkey generation
 ```
 
@@ -213,14 +213,14 @@ single DES), parity bits ignored in both comparisons; the output then moves on t
 `argon2id(output, "key:tdes-retry")` and its first 24 bytes are tried again. The odds of
 that are about 2^-50.
 
-`piv upload --management-key auto` (the default) installs AES-256 when the card reports
+`piv upload --management-algorithm auto` (the default) installs AES-256 when the card reports
 firmware 5.4 or later and 3DES otherwise; `aes256` and `tdes` force one. `piv check` needs
 no flag: it asks the card which algorithm it holds and derives that key.
 
 ## The forked `sequoia-openpgp`
 
 The OpenPGP backend builds a pinned fork of `sequoia-openpgp` (`gitlab.com/gli.al/sequoia`,
-tag `openpgp/v2.2.0-mtg0`, revision locked in `Cargo.lock`). It carries exactly two commits
+tag `openpgp/v2.2.0-mtg0`, pinned by revision in `Cargo.toml`). It carries exactly two commits
 on top of the upstream 2.2.0 release: one drops the random 32 byte
 `salt@notations.sequoia-pgp.org` notation from v4 signatures, one drops the descriptive
 armor headers. Both shrink the certificate for QR transfer, and the salt removal is also
@@ -254,8 +254,8 @@ subkey ids rather than descriptive ones. They are names, and they will be read.
 seed provisions more than one card:
 
 ```
-MIND_THE_SUBKEY=laptop mind-the-gap piv upload
-MIND_THE_SUBKEY=desktop mind-the-gap piv upload
+mtg> piv -k laptop upload
+mtg> piv -k desktop upload
 ```
 
 Everything below the subkey id changes with it, while the authority above it does not:

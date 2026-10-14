@@ -90,7 +90,7 @@ compiles the tests out instead. Verified in all three configurations:
 |---|---|
 | `cargo test` | 0 |
 | `cargo test --all-features` | 0 |
-| `cargo test --features destructive-hardware-tests --test piv_hardware` | 1 |
+| `cargo test --features destructive-hardware-tests --test piv_hardware` | 7 (6 ignored) |
 
 ### scdaemon will hold the card
 
@@ -113,38 +113,9 @@ teardown.
 
 ### Can gpg and PIV share the card?
 
-Partly, and not reliably enough to depend on.
-
-The `yubikey` crate already connects with `pcsc::ShareMode::Shared`, so this side cooperates.
-scdaemon is the obstacle, in two separate ways:
-
-1. It defaults to its **internal CCID driver**, which claims the USB interface directly and
-   fails with `selecting card failed: No such device` whenever `pcscd` already holds it --
-   even with nothing else touching the card. `disable-ccid` routes it through PC/SC instead.
-2. Through PC/SC it still asks for an **exclusive** connection. `pcsc-shared` relaxes that,
-   which GnuPG's own manpage calls "somewhat dangerous… Scdaemon assumes exclusive access and
-   for example caches certain information from the card".
-
-With both set in `~/.gnupg/scdaemon.conf`:
-
-```
-disable-ccid
-pcsc-shared
-```
-
-gpg reads the OpenPGP applet while PIV keeps working -- but the cache warning is not
-theoretical. Six interleaved rounds of `gpg --card-status` and `mind-the-gap piv status`, with
-a single scdaemon, alternated exactly:
-
-| round | 1 | 2 | 3 | 4 | 5 | 6 |
-|---|---|---|---|---|---|---|
-| gpg | FAIL | OK | FAIL | OK | FAIL | OK |
-| piv | OK | OK | OK | OK | OK | OK |
-
-Every PIV access invalidates scdaemon's cached state, and the next gpg operation fails before
-recovering on the one after. PIV is unaffected throughout. So the two *can* coexist, but gpg
-needs a retry to be dependable -- which is why the tests stop scdaemon rather than share with
-it.
+Only with `pcsc-shared` and a retried gpg operation; see [Cards on a Linux
+system](linux.md#gpgs-scdaemon) for the measurements. That is why the tests stop scdaemon
+rather than share with it.
 
 ## Prerequisites
 
@@ -205,8 +176,10 @@ mind-the-gap piv -d 2026-01-01 certify --kind root -o root.pem
 mind-the-gap piv -d 2026-01-01 -v 10y upload -i <6-8 digit pin> -o uploaded.pem
 ```
 
-`upload` prompts for confirmation on stdin. Pass `-y` / `--yes` to skip the prompt when
-scripting; without a terminal and without `--yes` it now aborts rather than hanging.
+`upload` first opens the card and refuses one that cannot hold the keys (on YubiKeys, by
+firmware version), then asks for confirmation on the terminal, naming the card it is about to
+wipe. Pass `-y` / `--yes` to skip the question when scripting; without a terminal and without
+`--yes` it aborts rather than hanging.
 
 Expect **no** touch prompt during upload: the derived management key is installed without
 the touch requirement, and the requirement is only switched on at the very end, while the
