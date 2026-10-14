@@ -43,8 +43,8 @@ than a mismatch report.
 clone of the others: same keys, same certificates, same card id.
 
 ```
-MIND_THE_SUBKEY=laptop  mind-the-gap piv upload
-MIND_THE_SUBKEY=desktop mind-the-gap piv upload
+mtg> piv -k laptop upload
+mtg> piv -k desktop upload
 ```
 
 Everything below the subkey id changes with it; the authority above it does not:
@@ -101,8 +101,8 @@ There are two answers, and they are mirror images.
 ## Answer one: share the decryption key
 
 ```
-mind-the-gap pgp -k laptop  --shared decryption upload
-mind-the-gap pgp -k desktop --shared decryption upload
+mtg> pgp -k laptop  --shared decryption upload
+mtg> pgp -k desktop --shared decryption upload
 ```
 
 `--shared` derives the named keys without the subkey id, so they come out identical on every
@@ -135,7 +135,7 @@ Management* keys, twenty of them.
 Name the superseded generations while provisioning the new one, newest first:
 
 ```
-mind-the-gap piv -k gen3 --retire gen2 --retire gen1 upload
+mtg> piv -k gen3 --retire gen2 --retire gen1 upload
   0x82 <- sub:gen2 -> key:key-management
   0x83 <- sub:gen1 -> key:key-management
 ```
@@ -205,8 +205,8 @@ that lists four entries per lost card and one that lists one.
 `mind-the-gap pgp revoke` exists and works. It re-derives the primary key from the seed, so a
 revocation certificate can be produced **at any time, air-gapped, without the card** — you do
 not need to pre-generate one and store it somewhere safe, which is the usual ceremony. Reason
-codes follow the OpenPGP set (`0` unspecified, `1` superseded, `2` compromised, `3` retired,
-`32` UID retired, `100`–`110` private).
+codes follow the OpenPGP set (`0` unspecified, `1` superseded, `2` compromised, `3` retired),
+and `--kind` has no default: `certificate` retires the whole identity, `subkeys` one card.
 
 Hosting requirement: none beyond publishing the updated certificate wherever people fetch it —
 a keyserver, WKD, your website.
@@ -216,7 +216,7 @@ re-derivable from the seed, so a lost card can be retired without it present and
 touching the identity or any other card:
 
 ```
-mind-the-gap pgp -k laptop revoke --kind subkeys -c 1 -t "laptop lost"
+mtg> pgp -k laptop revoke --kind subkeys --code 3 --reason "laptop lost"
 ```
 
 What comes out is the certificate carrying the revocations, because a lone subkey revocation

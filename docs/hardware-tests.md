@@ -26,6 +26,12 @@ Each applet is reset independently, so one token can carry both suites -- just n
 time, since they contend for the reader. The PIV suite needs three touches (`check`, the 9A
 signature, the 9D key agreement); the OpenPGP suite needs none.
 
+Other cards can stay attached, so a test host can keep several plugged in. Each suite derives
+its test identity from the card it names, so no two cards ever hold the same keys, and it
+points the outside tools at that card alone: OpenSC sees only its reader, and gpg is handed
+its serial number. Run the suites one after another, though: the OpenPGP suite's gpg step
+starts an scdaemon that holds every reader exclusively while it runs.
+
 The second feature, `no-destructive-hardware-tests`, is a safety interlock that must never be
 enabled by hand. The tests compile only when `destructive-hardware-tests` is on and it is off,
 so `cargo test --all-features` -- which turns on both -- compiles them out rather than wiping
@@ -105,19 +111,42 @@ a complete Nitrokey 3 as a host process, and attaches it to the VM's kernel thro
 `vhci-hcd`. pcscd then finds a USB key by hotplug and talks to it through libccid, so the
 check covers what the `vpcd` checks skip: the USB descriptors, CCID framing, the
 firmware's APDU dispatcher choosing between its applications, and the backend wiring of
-the real app set. It provisions PIV on P-256, runs the card-level half of the PIV suite,
-and provisions OpenPGP on the same key. The firmware's PIV app is replaced by the
+the real app set. It provisions PIV and runs the card-level half of the PIV suite on every
+algorithm, then provisions OpenPGP and runs the OpenPGP suite on a fresh key. The firmware's PIV app is replaced by the
 piv-authenticator input, so the PIV code is the same as in `virtual-piv`; OpenPGP is the
-opcard release the firmware ships. The firmware is upstream's main, which gives PIV its
-software pin backend without the SE050 chip (Nitrokey/nitrokey-3-firmware#723). The USB/IP
+opcard release the firmware ships. The firmware is the `mind-the-gap` branch of its fork:
+upstream's main, which gives PIV its software pin backend without the SE050 chip
+(Nitrokey/nitrokey-3-firmware#723), plus the P-384 mechanism for PIV, which the firmware
+leaves out although the app advertises the curve. The USB/IP
 device emulation underneath comes from the `mind-the-gap` branch of its fork, upstream plus
 Sawchord/usbip-device#10: without it a reply could answer the wrong request, which made the
 kernel drop the key mid-enumeration.
 
+## What the simulations cover
+
+Every row runs in `nix flake check`. ✓ runs in a check · — not offered (P-384 is PIV only;
+the build server profile is P-384)
+
+| Check | Card | P-256 | P-384 | Curve25519 | RSA-2048 | RSA-3072 | RSA-4096 |
+|---|---|---|---|---|---|---|---|
+| `virtual-piv`, `-p384`, `-curve25519`, `-rsa2048`, `-rsa3072`, `-rsa4096` | piv-authenticator over vpcd | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `virtual-piv-builder`, `-tdes` | piv-authenticator over vpcd, build server profile | — | ✓ | — | — | — | — |
+| `virtual-pgp` | opcard over vpcd | ✓ | — | ✓ | ✓ | ✓ | ✓ |
+| `usbip-nk3`, PIV | Nitrokey 3 firmware over USB/IP | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `usbip-nk3`, OpenPGP | Nitrokey 3 firmware over USB/IP | ✓ | — | ✓ | ✓ | ✓ | ✓ |
+
+The PIV rows run the card-level half of the destructive PIV suite against the card (the
+PKCS#11 end use needs a real token and OpenSC's driver); the OpenPGP rows run the whole
+OpenPGP suite, three RSA sizes included. The simulated Nitrokey 3 carries the same two apps
+as the vpcd checks behind the firmware's own dispatcher, backends and USB stack, and it runs
+both suites on every algorithm. Its flash is kept in RAM and too small for PIV's four RSA-4096
+keys and OpenPGP's three at once, so the check restarts the key between the two.
+
 ## What is not emulated, and why
 
 [canokey-qemu](https://github.com/canokeys/canokey-qemu), a QEMU USB device implementing
-PIV and OpenPGP, remains the alternative that would also cover the USB transport. A Java
+PIV and OpenPGP, would add a second, independent card implementation behind the same kind
+of USB transport `usbip-nk3` already covers. A Java
 Card simulator (jCardSim + PivApplet) stays off the list: protocol gaps, plus a Java
 toolchain in the closure.
 
@@ -125,6 +154,5 @@ toolchain in the closure.
 (`--target=GNU_LINUX`) speaks USB/IP rather than PC/SC, so running it means loading the
 `vhci-hcd` kernel module and attaching the emulated device inside the test VM -- and the
 nixpkgs `gnuk` package currently builds only the STM32 firmware (and is marked broken).
-Packaging the emulation target plus the USB/IP plumbing is tracked in TODO.md; it would
-buy coverage of the *transport* (a USB CCID device instead of a virtual reader), which is
-the part opcard bypasses.
+Packaging the emulation target is tracked in TODO.md; it could reuse the USB/IP plumbing
+`usbip-nk3` already has, and would buy a second OpenPGP implementation next to opcard.

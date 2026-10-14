@@ -17,6 +17,11 @@ mind-the-gap -s '<mnemonic>' -k pavlov-1 -n 'pavlov builder' piv --algorithm p38
   upload -c <serial> --pin <pin> --yes
 ```
 
+Typed like this, the phrase and the pin sit in the shell history and the process list. On
+the live image that is moot (nothing persists and nothing else runs); anywhere else give the
+same flags in an interactive session, `mtg> piv -k pavlov-1 -n 'pavlov builder' --algorithm
+p384 ... upload -c <serial>`, which asks for the phrase and the pin on hidden prompts.
+
 Run it on the air-gapped machine (the live image), with the server's card attached. `-k`
 names the card: one id per server, so every server holds its own keys while one root
 certificate authority covers all of them (see [several cards from one
@@ -28,7 +33,7 @@ seed](multiple-cards.md)).
 | `--pin-policy once` | the server signs unattended: it unlocks the card with the pin once per session, not once per signature (9C would otherwise demand the pin before every one) |
 | `--touch-policy never` | nobody is at the server to touch the card |
 | `--management-key-touch never` | management access is only ever needed during provisioning, which happens on the air-gapped machine; the derived management key never reaches the server, so a touch would guard nothing there |
-| `--management-key auto` (default) | AES-256 where the card supports it; 3DES on a YubiKey 4, or a YubiKey 5 before firmware 5.4, which take nothing else |
+| `--management-algorithm auto` (default) | AES-256 where the card supports it; 3DES on a YubiKey 4, or a YubiKey 5 before firmware 5.4, which take nothing else |
 
 Slot 9E keeps its pin-less, touch-less policy whatever the overrides say, as the PIV
 specification requires; the overrides apply to 9A, 9C, 9D and any retired slots. The
@@ -44,7 +49,7 @@ A YubiKey 4 (firmware 4.3) takes P-256, P-384 and RSA keys with pin and touch po
 it carries this profile fine, with two differences from a YubiKey 5 that the tool handles on
 its own:
 
-- Its only management key algorithm is 3DES. `--management-key auto` reads the firmware
+- Its only management key algorithm is 3DES. `--management-algorithm auto` reads the firmware
   version the card reports and installs the derived 3DES key (see [the PIV management
   key](derivation.md#the-piv-management-key)); `check` asks the card which algorithm it
   holds, so it needs no flag.
