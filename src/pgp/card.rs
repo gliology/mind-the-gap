@@ -30,10 +30,11 @@ use openpgp_card::ocard::algorithm::Curve as CardCurve;
 use openpgp_card::ocard::crypto::EccType;
 use openpgp_card::{Card, Error as CardError};
 
+use openpgp_card::ocard::algorithm::AlgorithmAttributes;
 use openpgp_card::ocard::data::{
     Fingerprint as CardFingerprint, KeyGenerationTime, TouchPolicy, UserInteractionFlag,
 };
-use openpgp_card::state::Open;
+use openpgp_card::state::{Open, Transaction};
 
 /// Subkeys to export
 pub const DEFAULT_KEY_TYPES: [KeyType; 3] = [
@@ -106,12 +107,46 @@ fn open_card(target: Option<String>) -> Result<Card<Open>> {
             match backends.len() {
                 0 => bail!("No card detected, please insert card"),
                 1 => Card::new(backends.into_iter().next().unwrap())?,
-                n => bail!("Multiple cards ({n}) detected, please specify card by serial"),
+                n => {
+                    let mut cards = Vec::new();
+                    for backend in backends {
+                        let mut card = Card::new(backend)?;
+                        cards.push(format!("  {}", describe(&card.transaction()?)?));
+                    }
+                    bail!(
+                        "{n} cards are attached, pick one with --card <ident>:\n{}",
+                        cards.join("\n")
+                    )
+                }
             }
         }
     };
 
     Ok(card)
+}
+
+/// Refuse to spend the last try of the admin pin
+///
+/// The admin pin is derived per subkey id, so a wrong `-k` costs a try even when the
+/// fingerprints match (every subkey `--shared`), and three lock the card for good. With one
+/// try left, the next mistake is that lock; only `upload`, which resets the card, may go on.
+fn guard_admin_tries(card: &mut Card<Transaction<'_>>) -> Result<()> {
+    match card.pw_status_bytes()?.err_count_pw3() {
+        0 => bail!("The card's admin pin is blocked; only `pgp upload` can recover the card"),
+        1 => bail!(
+            "The card's admin pin has one try left, and a wrong subkey id would block it; \
+             check -k and --shared, or reprovision with `pgp upload`"
+        ),
+        2 => log::warn!("The card's admin pin has two tries left: an earlier attempt failed"),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The card as the confirmation and the logs name it: manufacturer and ident
+fn describe(card: &Card<Transaction<'_>>) -> Result<String> {
+    let aid = card.application_identifier()?;
+    Ok(format!("{} OpenPGP card {}", aid.manufacturer_name(), aid.ident()))
 }
 
 /// Set the touch policy of one key, on cards that predate OpenPGP card 3 as well
@@ -204,7 +239,8 @@ impl SeededSmartcard {
 
         let mut card = open_card(target)?;
         let mut transaction = card.transaction()?;
-        log::info!("Connected to smartcard '{}'", transaction.application_identifier()?.ident());
+        log::info!("Connected to {}", describe(&transaction)?);
+        guard_admin_tries(&mut transaction)?;
 
         let admin_pin = self.admin_pin();
         let mut admin =
@@ -263,6 +299,103 @@ impl SeededSmartcard {
         Ok(cert)
     }
 
+    /// Open the card `upload` would wipe, refuse it if it cannot hold the keys, and name it
+    ///
+    /// Meant for the confirmation: the question can name the card, and a card that would be
+    /// wiped for nothing is refused while it is still intact. `upload` repeats the check on
+    /// the card it opens itself.
+    pub fn preflight(&self, target: Option<String>) -> Result<String> {
+        let mut card = open_card(target)?;
+        let mut transaction = card.transaction()?;
+        self.refuse_unfit(&mut transaction)?;
+        describe(&transaction)
+    }
+
+    /// Refuse a card that cannot take what `upload` installs, before anything on it changes
+    ///
+    /// `upload` resets the card, then changes both pins, then imports one key at a time: a
+    /// card that fails any of those half way is left wiped, with pins of our choosing and
+    /// without the keys. Everything that decides those steps is readable without a pin.
+    fn refuse_unfit(&self, card: &mut Card<Transaction<'_>>) -> Result<()> {
+        let status = card.pw_status_bytes()?;
+        let pin = self.pin.as_ref().map_or(6, |pin| pin.map(|p| p.len()));
+        if pin > usize::from(status.pw1_max_len()) {
+            bail!(
+                "The card takes user pins of up to {} characters, this one has {pin}; \
+                 the card was not touched",
+                status.pw1_max_len()
+            );
+        }
+        let admin = self.admin_pin().len();
+        if admin > usize::from(status.pw3_max_len()) {
+            bail!(
+                "The card takes admin pins of up to {} characters, the derived one has {admin}; \
+                 the card was not touched",
+                status.pw3_max_len()
+            );
+        }
+
+        let aid = card.application_identifier()?;
+        let changeable = card.extended_capabilities()?.algo_attrs_changeable();
+        let information = card.algorithm_information()?;
+        for role in SubkeyRole::ALL {
+            let kt = role.key_type();
+            let fits = |attributes: &AlgorithmAttributes| match attributes {
+                AlgorithmAttributes::Rsa(rsa) => {
+                    self.algorithm.rsa_bits() == Some(u32::from(rsa.len_n()))
+                }
+                AlgorithmAttributes::Ecc(ecc) => self
+                    .card_curve(role.is_encryption())
+                    .is_ok_and(|(oid, _)| ecc.oid() == oid),
+                AlgorithmAttributes::Unknown(_) => false,
+            };
+            let supported = match &information {
+                Some(information) => information.for_keytype(kt).into_iter().any(fits),
+                None if !changeable => fits(&card.algorithm_attributes(kt)?),
+                // Without the list (OpenPGP card 3.4 added it) the version has to do: cards
+                // before 3.0 and YubiKeys before 5.2.3 (manufacturer 0006) hold RSA only
+                None if aid.version() < 0x0300 || aid.manufacturer() == 0x0006 => {
+                    self.algorithm.rsa_bits().is_some()
+                }
+                None => true,
+            };
+            if !supported {
+                bail!(
+                    "The card cannot hold {} keys for {kt:?}; the card was not touched",
+                    self.algorithm
+                );
+            }
+        }
+
+        if self.cardholder_name().is_none() {
+            log::warn!(
+                "Cards take the cardholder name in ASCII and under 40 bytes; this one is left \
+                 unset, the user id carries the name"
+            );
+        }
+        Ok(())
+    }
+
+    /// The name for the card's cardholder data object, when the card can store it
+    ///
+    /// Cosmetic, unlike the user id: no card needs it to work, and refusing a name over it
+    /// would turn away every non-ASCII name.
+    fn cardholder_name(&self) -> Option<&str> {
+        (self.name.is_ascii() && self.name.len() < 40).then_some(self.name.as_str())
+    }
+
+    /// The curve and key type the card stores a key under, for ECC algorithms
+    fn card_curve(&self, agreement: bool) -> Result<(&'static [u8], EccType)> {
+        Ok(match (self.algorithm, agreement) {
+            (Algorithm::Curve25519, true) => (CardCurve::Curve25519.oid(), EccType::ECDH),
+            (Algorithm::Curve25519, false) => (CardCurve::Ed25519.oid(), EccType::EdDSA),
+            (Algorithm::P256, true) => (CardCurve::NistP256r1.oid(), EccType::ECDH),
+            (Algorithm::P256, false) => (CardCurve::NistP256r1.oid(), EccType::ECDSA),
+            (Algorithm::P384, _) => bail!(P384_REFUSED),
+            (algorithm, _) => bail!("{algorithm} is not an ECC algorithm"),
+        })
+    }
+
     /// Check that smartcard can be accessed with derived admin pin
     pub fn check_admin_pin(&self, target: Option<String>) -> Result<()> {
         // Determine smartcard to which to connect
@@ -270,9 +403,10 @@ impl SeededSmartcard {
 
         // Establish connection and receive metadata
         let mut transaction = card.transaction()?;
-        log::info!("Connected to smartcard '{}'", transaction.application_identifier()?.ident());
+        log::info!("Connected to {}", describe(&transaction)?);
 
         // Verify admin pin derived from subseed
+        guard_admin_tries(&mut transaction)?;
         let admin_pin = self.admin_pin();
         transaction.verify_admin_pin(SecretString::from(admin_pin.as_str().to_owned()))?;
 
@@ -307,7 +441,7 @@ impl SeededSmartcard {
 
         // Establish connection and receive metadata
         let mut transaction = card.transaction()?;
-        log::info!("Connected to smartcard '{}'", transaction.application_identifier()?.ident());
+        log::info!("Connected to {}", describe(&transaction)?);
 
         // Get the certificate subkeys
         let policy = &StandardPolicy::new();
@@ -361,7 +495,9 @@ impl SeededSmartcard {
 
         // Establish connection and receive metadata
         let mut transaction = card.transaction()?;
-        log::info!("Connected to smartcard '{}'", transaction.application_identifier()?.ident());
+        log::info!("Connected to {}", describe(&transaction)?);
+
+        self.refuse_unfit(&mut transaction)?;
 
         // Factory reset smartcard
         transaction.factory_reset()?;
@@ -388,7 +524,9 @@ impl SeededSmartcard {
         let mut admin =
             transaction.as_admin_card(SecretString::from(admin_pin.as_str().to_owned()))?;
 
-        admin.set_cardholder_name(&self.name)?;
+        if let Some(name) = self.cardholder_name() {
+            admin.set_cardholder_name(name)?;
+        }
         admin.set_lang(&[['e', 'n'].into()])?;
 
         let p = &StandardPolicy::new();
@@ -441,14 +579,7 @@ impl SeededSmartcard {
                     _ => bail!("{:?} key has unexpected algorithm in cert", kt),
                 };
 
-                let (oid, ecc_type) = match (self.algorithm, agreement) {
-                    (Algorithm::Curve25519, true) => (CardCurve::Curve25519.oid(), EccType::ECDH),
-                    (Algorithm::Curve25519, false) => (CardCurve::Ed25519.oid(), EccType::EdDSA),
-                    (Algorithm::P256, true) => (CardCurve::NistP256r1.oid(), EccType::ECDH),
-                    (Algorithm::P256, false) => (CardCurve::NistP256r1.oid(), EccType::ECDSA),
-                    (Algorithm::P384, _) => bail!(P384_REFUSED),
-                    _ => unreachable!("RSA is handled above"),
-                };
+                let (oid, ecc_type) = self.card_curve(agreement)?;
 
                 // OpenPGP cards take the X25519 scalar big-endian, the way GnuPG stores it,
                 // where RFC 7748 and everything derived here is little-endian: sent as is,
@@ -469,16 +600,22 @@ impl SeededSmartcard {
                 admin.import_key(&key, kt)?;
             }
 
-            // Prefer Cached (one touch valid for ~15s), but only advisorily: Cached is a
-            // Yubico extension to the UIF data object, and a spec-conforming card -- the
-            // Nitrokey 3's opcard rejects it with "incorrect parameters" -- must not lose
-            // its freshly imported keys over a nicety. `pgp configure --touch` can set
-            // whatever the card actually supports afterwards.
-            if let Err(err) = set_touch_policy(&mut admin, kt, TouchPolicy::Cached) {
-                log::warn!(
-                    "Card refused the cached touch policy for the {kt:?} key ({err}); \
-                     set a supported one with `pgp configure --touch`"
-                );
+            // Prefer Cached (one touch valid for ~15s), then plain On, but only advisorily:
+            // Cached is a Yubico extension to the UIF data object that a spec-conforming card
+            // (the Nitrokey 3's opcard) and a YubiKey 4 refuse, and no card must lose its
+            // freshly imported keys over a nicety. `pgp configure --touch` can set whatever
+            // the card actually supports afterwards.
+            if let Err(cached) = set_touch_policy(&mut admin, kt, TouchPolicy::Cached) {
+                match set_touch_policy(&mut admin, kt, TouchPolicy::On) {
+                    Ok(()) => log::info!(
+                        "Card refused the cached touch policy for the {kt:?} key ({cached}), \
+                         every use takes a touch instead"
+                    ),
+                    Err(err) => log::warn!(
+                        "Card refused a touch policy for the {kt:?} key ({err}); \
+                         set a supported one with `pgp configure --touch`"
+                    ),
+                }
             }
         }
 

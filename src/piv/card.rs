@@ -2,9 +2,12 @@
 
 use std::str::FromStr;
 
-use super::{CertChain, ManagementKeyArg, SeededSmartcard, keys::NAME_CCC_ID, keys::NAME_CHUID_ID};
+use super::{
+    CertChain, ManagementKeyArg, SeededSmartcard, keys::NAME_CCC_ID, keys::NAME_CHUID_ID,
+    slots::DEFAULT_KEY_SLOTS,
+};
 use crate::common;
-use crate::seed::Seed256Derive;
+use crate::seed::{Algorithm, Seed256Derive};
 
 use anyhow::{Result, anyhow, bail};
 
@@ -13,7 +16,7 @@ use yubikey::piv::{self, RetiredSlotId, SlotId};
 use yubikey::reader::Context;
 use yubikey::{
     CardId, CccId, Certificate as CardCertificate, ChuId, Error as CardError, MgmAlgorithmId,
-    MgmKey, MsRoots, Serial, Version, YubiKey,
+    MgmKey, MsRoots, Serial, TouchPolicy, Version, YubiKey,
 };
 
 use cms::content_info::ContentInfo;
@@ -33,6 +36,12 @@ const DEFAULT_MANAGEMENT_KEY: [u8; 24] = [
 
 /// First firmware with AES management keys; YubiKey 4 and YubiKey 5 before 5.4 take 3DES only
 const FIRST_AES_MANAGEMENT: Version = Version { major: 5, minor: 4, patch: 0 };
+
+/// First YubiKey firmware that imports Ed25519, X25519, RSA-3072 and RSA-4096 keys
+const FIRST_EXTENDED_ALGORITHMS: Version = Version { major: 5, minor: 7, patch: 0 };
+
+/// First YubiKey firmware with the cached touch policy
+const FIRST_CACHED_TOUCH: Version = Version { major: 4, minor: 3, patch: 0 };
 
 /// FIPS 201 CHUID, with a zeroed Card UUID.
 ///
@@ -76,7 +85,7 @@ pub fn status() -> Result<()> {
     }
 
     for reader in cards {
-        println!(" - Reader '{}'", reader.name());
+        println!(" - Reader '{}'", common::printable(&reader.name()));
 
         // A reader that is busy or holds a non-PIV card must not abort the whole listing:
         // status is a read-only overview and is expected to report what it can.
@@ -146,7 +155,7 @@ pub fn status() -> Result<()> {
 pub(super) fn open_token(target: Option<String>) -> Result<YubiKey> {
     if let Some(serial) = target {
         let token = YubiKey::open_by_serial(Serial::from_str(&serial)?)?;
-        log::info!("Connected to reader '{}'", token.name());
+        log::info!("Connected to {}", describe(&token));
         return Ok(token);
     }
 
@@ -157,11 +166,60 @@ pub(super) fn open_token(target: Option<String>) -> Result<YubiKey> {
         0 => bail!("No card detected, please insert card"),
         1 => {
             let token = readers[0].open()?;
-            log::info!("Connected to reader '{}'", token.name());
+            log::info!("Connected to {}", describe(&token));
             Ok(token)
         }
-        n => bail!("Multiple cards ({n}) detected, please specify card by serial"),
+        n => {
+            let cards: Vec<String> = readers
+                .iter()
+                .map(|reader| match reader.open() {
+                    Ok(token) => format!("  {}", describe(&token)),
+                    Err(_) => format!("  {} (not a PIV card)", common::printable(&reader.name())),
+                })
+                .collect();
+            bail!("{n} cards are attached, pick one with --card <serial>:\n{}", cards.join("\n"))
+        }
     }
+}
+
+/// Spend the tries of a pin or puk until the card itself reports it blocked
+///
+/// The counter is never taken on trust: a card that keeps a verified pin across SELECT
+/// answers the status query with 9000, which reads as no tries left, and skipping the pin on
+/// that word would then block the puk of a card whose pin still works. Bounded, because the
+/// counters are a u8 on the wire: a conversation that does not converge within that is
+/// firmware misbehaving, and a report beats hammering the card forever.
+fn exhaust(
+    what: &str,
+    accepted: &str,
+    mut attempt: impl FnMut() -> yubikey::Result<()>,
+) -> Result<()> {
+    for _ in 0..=u8::MAX {
+        match attempt() {
+            // The lock-out value was accepted: the counter has just reset, so spending tries
+            // can never converge from here
+            Ok(()) => bail!("{accepted}"),
+            // Depending on the firmware, a blocked pin comes back as PinLocked instead of a
+            // zero try count
+            Err(CardError::WrongPin { tries: 0 }) | Err(CardError::PinLocked) => return Ok(()),
+            Err(CardError::WrongPin { .. }) => {}
+            Err(other) => return Err(other.into()),
+        }
+    }
+    bail!("Card {what} did not lock after exhausting its retries")
+}
+
+/// The card as the confirmation and the logs name it: reader, serial and firmware
+fn describe(token: &YubiKey) -> String {
+    let version = token.version();
+    format!(
+        "{}, serial {}, firmware {}.{}.{}",
+        common::printable(token.name()),
+        token.serial(),
+        version.major,
+        version.minor,
+        version.patch
+    )
 }
 
 impl SeededSmartcard {
@@ -172,6 +230,7 @@ impl SeededSmartcard {
         let chain = self.generate_chain()?;
 
         let mut token = open_token(target)?;
+        self.refuse_unfit(&token)?;
 
         let algorithm = self.reset_and_lock(&mut token)?;
         self.upload_card_identifiers(&mut token)?;
@@ -193,8 +252,12 @@ impl SeededSmartcard {
         // would guard nothing there while costing every unattended re-check a button press.
         if self.management_touch {
             log::info!("Requiring touch for future management access");
-            self.management_key(algorithm)?
-                .set_manual(&mut token, true)?;
+            // Everything else is on the card by now, so a card that refuses the flag (stock
+            // piv-authenticator rejects P2=FE) keeps a working provisioning; `check` reports
+            // the missing touch as a policy mismatch
+            if let Err(err) = self.management_key(algorithm)?.set_manual(&mut token, true) {
+                log::warn!("The card refused a touch requirement for management access: {err}");
+            }
         } else {
             log::info!("Management access stays touch-free (--management-key-touch never)");
         }
@@ -210,6 +273,62 @@ impl SeededSmartcard {
     }
 
     /// Algorithm of the management key `upload` installs on `token`
+    /// Open the card `upload` would wipe, refuse it if it cannot hold the keys, and name it
+    ///
+    /// Meant for the confirmation: the question can name the card, and a card that would be
+    /// wiped for nothing is refused while it is still intact. `upload` repeats the check on
+    /// the card it opens itself.
+    pub fn preflight(&self, target: Option<String>) -> Result<String> {
+        let token = open_token(target)?;
+        self.refuse_unfit(&token)?;
+        Ok(describe(&token))
+    }
+
+    /// Refuse a card that cannot take what `upload` installs, before anything on it changes
+    ///
+    /// Only YubiKeys can be judged up front, by firmware version. Other PIV cards advertise
+    /// algorithms in their SELECT response that their build may lack (piv-authenticator lists
+    /// all nine whatever the backend has), so for them the import itself is the first answer.
+    fn refuse_unfit(&self, token: &YubiKey) -> Result<()> {
+        let version = token.version();
+        let firmware = format!("{}.{}.{}", version.major, version.minor, version.patch);
+        if !token.name().starts_with("Yubico") {
+            log::warn!(
+                "Not a YubiKey: whether the card imports {} keys shows only once it is reset",
+                self.algorithm
+            );
+            return Ok(());
+        }
+
+        let extended = matches!(
+            self.algorithm,
+            Algorithm::Curve25519 | Algorithm::Rsa3072 | Algorithm::Rsa4096
+        );
+        if extended && version < FIRST_EXTENDED_ALGORITHMS {
+            bail!(
+                "YubiKey firmware {firmware} cannot import {} keys into PIV (5.7 and later can); \
+                 the card was not touched",
+                self.algorithm
+            );
+        }
+        if self.management_algorithm == ManagementKeyArg::Aes256 && version < FIRST_AES_MANAGEMENT {
+            bail!(
+                "YubiKey firmware {firmware} takes 3DES management keys only (AES from 5.4); \
+                 use --management-key auto or tdes. The card was not touched"
+            );
+        }
+        let cached = DEFAULT_KEY_SLOTS
+            .iter()
+            .any(|(slot, ..)| self.policies_for(*slot).1 == TouchPolicy::Cached);
+        if cached && version < FIRST_CACHED_TOUCH {
+            bail!(
+                "YubiKey firmware {firmware} has no cached touch policy (4.3 and later have); \
+                 pass --touch-policy always or never. The card was not touched"
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn management_algorithm(&self, token: &YubiKey) -> MgmAlgorithmId {
         match self.management_algorithm {
             ManagementKeyArg::Aes256 => MgmAlgorithmId::Aes256,
@@ -252,53 +371,13 @@ impl SeededSmartcard {
     ///
     /// Returns the algorithm of the installed management key, for `upload` to finish with.
     fn reset_and_lock(&self, token: &mut YubiKey) -> Result<MgmAlgorithmId> {
-        // Lock pin (by repeated tries) ...
-        //
-        // Both loops are bounded: the retry counters are a u8 on the wire, so no card can
-        // ever grant more tries than that, and a conversation that fails to converge within
-        // the bound is firmware misbehaving -- better to stop with a report than to hammer
-        // the card forever.
+        // Lock pin and puk by spending their tries, so that the card allows a reset ...
         log::info!("Locking smart card pin");
-        let mut retries = token.get_pin_retries()?;
-        for _ in 0..=u8::MAX as u32 {
-            if retries == 0 {
-                break;
-            }
-            match token.verify_pin(&DUMMY_PIN) {
-                // The dummy verified: the card's pin *is* the dummy value, and the
-                // successful try has just reset the retry counter, so locking by
-                // exhaustion can never converge from here
-                Ok(()) => bail!("Card pin equals the lock-out pin; change it and retry"),
-                Err(CardError::WrongPin { tries }) => retries = tries,
-                // Depending on the firmware, a blocked pin may come back as PinLocked
-                // instead of a zero try count
-                Err(CardError::PinLocked) => retries = 0,
-                Err(other) => return Err(other.into()),
-            }
-        }
-        if retries > 0 {
-            bail!("Card pin did not lock after exhausting its retries");
-        }
-
-        // ... lock puk (by repeated tries) ...
+        exhaust("pin", "Card pin equals the lock-out pin; change it and retry", || {
+            token.verify_pin(&DUMMY_PIN)
+        })?;
         log::info!("Locking smart card puk");
-        retries = 1;
-        for _ in 0..=u8::MAX as u32 {
-            if retries == 0 {
-                break;
-            }
-            match token.unblock_pin(b"", b"") {
-                // An empty puk just unblocked the pin: the puk *is* empty, the retry
-                // counter has reset, and exhaustion can never converge from here
-                Ok(()) => bail!("Card puk is empty; set one and retry"),
-                Err(CardError::WrongPin { tries }) => retries = tries,
-                Err(CardError::PinLocked) => retries = 0,
-                Err(other) => return Err(other.into()),
-            }
-        }
-        if retries > 0 {
-            bail!("Card puk did not lock after exhausting its retries");
-        }
+        exhaust("puk", "Card puk is empty; set one and retry", || token.unblock_pin(b"", b""))?;
 
         // ... to reset the device
         log::info!("Resetting smart card");
@@ -317,10 +396,22 @@ impl SeededSmartcard {
         // nothing provisioned in exchange -- and the prompt only lasts as long as the token's
         // touch timeout. `require_touch` is switched on at the end of `upload` instead, where
         // the same failure costs nothing and can simply be repeated.
-        let algorithm = self.management_algorithm(token);
+        let mut algorithm = self.management_algorithm(token);
         log::info!("Installing the derived {algorithm:?} management key");
-        let mgmt_key = self.management_key(algorithm)?;
-        mgmt_key.set_manual(token, false)?;
+        let mut mgmt_key = self.management_key(algorithm)?;
+        if let Err(err) = mgmt_key.set_manual(token, false) {
+            // Outside the YubiKey table the version only hints at AES, and the default key is
+            // still in force after a refusal, so `auto` can still settle on 3DES
+            if self.management_algorithm != ManagementKeyArg::Auto
+                || algorithm == MgmAlgorithmId::ThreeDes
+            {
+                return Err(err.into());
+            }
+            log::warn!("The card refused an {algorithm:?} management key ({err}); using 3DES");
+            algorithm = MgmAlgorithmId::ThreeDes;
+            mgmt_key = self.management_key(algorithm)?;
+            mgmt_key.set_manual(token, false)?;
+        }
         token.authenticate(&mgmt_key)?;
 
         // Update pin
@@ -332,7 +423,13 @@ impl SeededSmartcard {
             token.verify_pin(b"123456")?;
         }
 
-        // Disable puk
+        // Disable puk. Blocked by a bounded loop of our own first: `block_puk` retries any
+        // error but a wrong pin forever, and a card answering 6300 to a wrong puk would never
+        // let go. Called afterwards, it stops at once and only records the blocked puk in the
+        // admin data, where ykman looks for it.
+        exhaust("puk", "Card puk equals the lock-out value; reset the card and retry", || {
+            token.change_puk(&DUMMY_PIN, &DUMMY_PIN)
+        })?;
         token.block_puk()?;
 
         Ok(algorithm)

@@ -14,7 +14,7 @@ use std::os::fd::AsFd;
 use anyhow::{Result, anyhow, bail};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
-use qrcode::QrCode;
+use qrcode::{EcLevel, QrCode};
 use qrcode::render::unicode;
 use zeroize::Zeroizing;
 
@@ -25,7 +25,9 @@ use crate::prompt;
 /// Wrapped in `Zeroizing` because the payload may be key material: the image is a
 /// pixel-for-pixel encoding of it, so it wipes like the secret it carries.
 fn render(data: &[u8]) -> Result<Zeroizing<String>> {
-    let code = QrCode::new(data)
+    // The lowest error correction, so that the capacity checked in `show_qr` holds: a screen
+    // is read in one go and damage is not a concern
+    let code = QrCode::with_error_correction_level(data, EcLevel::L)
         .map_err(|e| anyhow!("Data too large for QR code ({} bytes): {e}", data.len()))?;
     Ok(Zeroizing::new(
         code.render::<unicode::Dense1x2>()
@@ -42,10 +44,10 @@ fn render(data: &[u8]) -> Result<Zeroizing<String>> {
 /// screen is cleared before and after instead; equivalent in effect, since modern
 /// kernels keep no console scrollback at all.
 ///
-/// A sensitive payload never reaches stdout: redirected output is refused instead of
-/// writing key material to a file that skips `write_sensitive`'s permissions, and the
-/// oversized fallback goes to the controlling terminal with a scrollback warning.
-/// Public payloads simply print in both cases.
+/// A sensitive payload never reaches stdout or scrollback: redirected output is refused
+/// instead of writing key material to a file that skips `write_sensitive`'s permissions,
+/// and a code larger than the screen waits on the alternate screen until it fits. Public
+/// payloads simply print in both cases.
 pub fn show_qr(data: &[u8], sensitive: bool) -> Result<()> {
     // The largest QR code carries 2953 bytes; say so up front instead of letting the
     // encoder's raw error surface, and name the way out
@@ -73,30 +75,37 @@ pub fn show_qr(data: &[u8], sensitive: bool) -> Result<()> {
         .unwrap_or(0) as u16;
     let (cols, rows) = terminal::size()?;
     // One extra row for the dismissal hint
-    if width > cols || height + 1 > rows {
-        if sensitive {
-            // Inline on the controlling terminal, never stdout: a redirect must not
-            // catch key material by surprise
-            let mut tty = prompt::tty()?;
-            tty.write_all(image.as_bytes())?;
-            writeln!(tty)?;
-        } else {
-            println!("{}", *image);
-        }
+    if !sensitive && (width > cols || height + 1 > rows) {
+        println!("{}", *image);
         log::warn!(
             "QR code larger than the screen; reduce the terminal font size \
              (often Ctrl+Minus, Ctrl+Alt+Minus on the console) to fit it on one screen"
         );
-        if sensitive {
-            log::warn!(
-                "The code was rendered inline, clear the scrollback once transferred \
-                 (e.g. `clear && printf '\\e[3J'`, or `forget` on the live image)"
-            );
-        }
         return Ok(());
     }
 
     let mut screen = Screen::enter()?;
+    // A secret never leaves the alternate screen: until the code fits, the screen says how
+    // to make room and waits for the terminal to grow
+    let (cols, rows) = loop {
+        let (cols, rows) = terminal::size()?;
+        if width <= cols && height < rows {
+            break (cols, rows);
+        }
+        screen.wipe()?;
+        write!(
+            screen.tty,
+            "The code needs {width}x{} cells, the terminal has {cols}x{rows}.\r\n\
+             Reduce the font size (often Ctrl+Minus, Ctrl+Alt+Minus on the console) \
+             and it appears.\r\nEsc cancels.",
+            height + 1
+        )?;
+        screen.tty.flush()?;
+        if pressed_within(&mut screen.tty.0, 250)? {
+            bail!("QR code cancelled before it fit the screen; use --output for a protected file");
+        }
+    };
+    screen.wipe()?;
 
     let top = (rows - height) / 2;
     let left = (cols - width) / 2;
@@ -208,6 +217,23 @@ fn wait_for_escape(tty: &mut File) -> Result<()> {
             _ => {}
         }
     }
+}
+
+/// Whether a dismissing key arrives within the given number of milliseconds
+///
+/// Any other input is drained and ignored, so a stray keypress while zooming out does not
+/// cancel the display.
+fn pressed_within(tty: &mut File, timeout_ms: u16) -> Result<bool> {
+    let mut byte = [0u8; 1];
+    if !readable_within(tty, timeout_ms)? {
+        return Ok(false);
+    }
+    tty.read_exact(&mut byte)?;
+    let lone_escape = byte[0] == 0x1b && !readable_within(tty, 50)?;
+    while readable_within(tty, 5)? {
+        tty.read_exact(&mut byte)?;
+    }
+    Ok(lone_escape || matches!(byte[0], b'q' | 0x03))
 }
 
 /// Whether the tty has input ready within the given number of milliseconds

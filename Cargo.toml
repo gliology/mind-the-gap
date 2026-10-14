@@ -89,10 +89,11 @@ tiny-bip39 = { version = "2.0", default-features = false }
 #
 # NOTE: argon2 0.5 is shared with the sequoia fork, and its output is a frozen constant
 # of the mtg1 scheme -- do not bump it alone: a new major here is a new derivation
-# scheme by definition, like sha2 below. Default features off: the PHC-string API and
-# its password-hash/rand tree are unused, key material flows through
-# `hash_password_into` alone.
-argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+# scheme by definition, like sha2 below. Default features off, so that this crate does
+# not ask for the PHC-string API itself (sequoia brings it in regardless); key material
+# flows through `hash_password_into` alone. `zeroize` wipes the 64 MiB of block memory and
+# the hashes every derivation leaves behind, from which its output could be recomputed.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
 base64 = "0.22"
 
 # RSA keys from a derived seed (src/rsa.rs). The stream the primes are read from, its

@@ -43,7 +43,7 @@ impl Drop for IgnoreInterrupts {
 ///
 /// Returns the minted seed so an interactive session can adopt it; the one-shot path
 /// drops it, since a fresh phrase is only useful once it exists on paper anyway.
-pub(super) fn generate() -> Result<MnemonicSeed> {
+pub(super) fn generate(in_session: bool) -> Result<MnemonicSeed> {
     let seed = MnemonicSeed::generate()?;
     let words = seed.words();
 
@@ -91,11 +91,14 @@ pub(super) fn generate() -> Result<MnemonicSeed> {
 
     let mut tty = prompt::tty()?;
     writeln!(tty, "Seed phrase confirmed.")?;
-    writeln!(tty, "Pass it with --seed where a script needs it.")?;
-    writeln!(tty)?;
-    writeln!(tty, "To provision several cards in one sitting without retyping it, run")?;
-    writeln!(tty, "mind-the-gap without arguments: the interactive session asks for the")?;
-    writeln!(tty, "phrase once and keeps it in memory until you leave.")?;
+    if in_session {
+        writeln!(tty, "The session keeps it for the commands that follow, until you leave.")?;
+    } else {
+        writeln!(tty)?;
+        writeln!(tty, "To provision cards with it, run mind-the-gap without arguments: the")?;
+        writeln!(tty, "interactive session asks for the phrase once and keeps it in memory")?;
+        writeln!(tty, "until you leave. Scripts take it with --seed.")?;
+    }
 
     Ok(seed)
 }

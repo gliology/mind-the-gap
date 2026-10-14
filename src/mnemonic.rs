@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 use anyhow::{Error, anyhow};
 
-use bip39::{Language, Mnemonic};
+use bip39::{ErrorKind, Language, Mnemonic};
 
 use zeroize::Zeroizing;
 
@@ -43,11 +43,24 @@ impl MnemonicSeed {
     }
 
     /// Create seed from mnemonic
+    ///
+    /// The errors name what is wrong and where, counting words from one, and never repeat
+    /// a word: the phrase is the secret, and an error message ends up in scrollback.
     pub fn from_phrase(phrase: &str) -> Result<Self, Error> {
-        Ok(MnemonicSeed {
-            mnemonic: Mnemonic::from_phrase(phrase, Language::English)?,
-            password: String::new().into(),
-        })
+        let mnemonic =
+            Mnemonic::from_phrase(phrase, Language::English).map_err(|err| match err {
+                ErrorKind::InvalidWord(index) => {
+                    anyhow!("Word {} of the phrase is not on the BIP-39 list", index + 1)
+                }
+                ErrorKind::InvalidChecksum => {
+                    anyhow!("The phrase fails its checksum: a word is mistyped or out of order")
+                }
+                ErrorKind::InvalidWordLength(count) => {
+                    anyhow!("A phrase has 12, 15, 18, 21 or 24 words, this one has {count}")
+                }
+                other => anyhow!("Not a valid phrase: {other}"),
+            })?;
+        Ok(MnemonicSeed { mnemonic, password: String::new().into() })
     }
 
     /// Protect seed with password
@@ -98,4 +111,14 @@ impl FromStr for MnemonicSeed {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         MnemonicSeed::from_phrase(s)
     }
+}
+
+/// Whether a line looks like (part of) a seed phrase: three or more words, all from the
+/// BIP-39 list
+///
+/// For the session, which must neither store nor echo a phrase typed at its prompt; a
+/// command line never consists of list words alone.
+pub fn looks_like_phrase(tokens: &[String]) -> bool {
+    let words = Language::English.wordmap();
+    tokens.len() >= 3 && tokens.iter().all(|token| words.get_bits(token).is_some())
 }

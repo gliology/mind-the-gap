@@ -11,12 +11,11 @@ all-features = true
 [advisories]
 yanked = "deny"
 ignore = [
-    # The Marvin RSA timing attack: `rsa` is a transitive dependency (through the yubikey
-    # stack alone; sequoia reaches RSA through nettle), but nothing here performs an RSA
-    # private-key operation whose timing an attacker could observe -- this tool derives
-    # and writes keys, it does not run an RSA decryption oracle. Revisit if PIV RSA slot
-    # support is ever added.
-    { id = "RUSTSEC-2023-0071", reason = "no RSA private-key operations are performed" },
+    # The Marvin RSA timing attack. The one RSA private-key operation here is signing the
+    # PIV chain (src/piv/chain.rs), once, deterministically, on an air-gapped machine:
+    # nobody can submit ciphertexts or time the operation, and there is no decryption to
+    # make an oracle of. Card-side RSA happens on the card.
+    { id = "RUSTSEC-2023-0071", reason = "RSA signing runs offline, with no decryption oracle" },
 ]
 
 [licenses]

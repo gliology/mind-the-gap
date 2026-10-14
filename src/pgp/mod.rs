@@ -39,8 +39,7 @@ pub use card::{DEFAULT_KEY_TYPES, status};
 ///
 /// The curve exists for PIV chains whose consumers insist on P-384. Deriving OpenPGP keys
 /// on it would add a third set of labels to a frozen scheme for no card that asked for it.
-const P384_REFUSED: &str =
-    "P-384 is a PIV-only curve: the OpenPGP backend derives on p256 or curve25519";
+pub(crate) const P384_REFUSED: &str = "P-384 is a PIV-only curve: the OpenPGP backend derives on curve25519, p256 or rsa2048 to rsa4096";
 
 /// What a revocation covers
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -362,7 +361,7 @@ impl SeededSmartcard {
             shared_seed,
             shared: vec![],
             scheme,
-            subkey: subkey.as_ref().map(|id| id.to_string()),
+            subkey,
             name,
             pin: None,
             creation_time: None,

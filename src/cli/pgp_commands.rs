@@ -1,6 +1,6 @@
 //! The `pgp` subcommands and their handler.
 
-use super::{Identity, confirm, warn_if_phrase_is_weaker, write_sensitive};
+use super::{Identity, confirm, spelled, spelled_all, warn_if_phrase_is_weaker, write_sensitive};
 use crate::common;
 use crate::pgp::{self, CertificateKind, VerificationKind};
 use crate::qr;
@@ -11,7 +11,7 @@ use std::{path::PathBuf, time::Duration};
 use std::fs;
 use std::io::Write;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 
 use chrono::{DateTime, Utc};
 
@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 
 #[derive(Subcommand, Clone, PartialEq)]
 pub(super) enum PGPCommand {
-    /// Display current status
+    /// List the attached OpenPGP cards and the keys they hold (needs no seed)
     Status,
 
     /// Check validity of smartcard
@@ -78,9 +78,14 @@ pub(super) enum PGPCommand {
         sign_pin: Option<pgp::SignPinValidity>,
     },
 
-    /// Export key to smartcard
+    /// Reset the card and import the derived subkeys
+    ///
+    /// Erases the card's OpenPGP application. Then sets the user pin and an admin pin derived
+    /// from the phrase and the subkey id, which `check` and `config` re-derive, and imports
+    /// the three subkeys. A forgotten pin is recovered by running upload again. Asks before
+    /// the reset and names the card.
     Upload {
-        /// Pin to protect exported keys on smartcards
+        /// User pin to set on the card (the factory 123456 when omitted)
         #[arg(short = 'i', long, env = "MIND_THE_PIN")]
         pin: Option<Zeroizing<String>>,
 
@@ -88,7 +93,7 @@ pub(super) enum PGPCommand {
         #[arg(short, long, env = "MIND_THE_CARD")]
         card: Option<String>,
 
-        /// Accept potentially dangerous operations
+        /// Reset the card without asking first
         #[arg(short, long)]
         yes: bool,
 
@@ -138,11 +143,12 @@ pub(super) enum PGPCommand {
         #[arg(short = 't', long, value_enum, default_value_t)]
         kind: pgp::RevocationKind,
 
-        /// Numeric revocation reason code (RFC 4880)
+        /// Revocation reason: 0 unspecified, 1 superseded, 2 compromised, 3 retired
         ///
-        /// Long-only on purpose: `-c` means the card everywhere else, and this is typed
-        /// about once per revocation.
-        #[arg(long, default_value_t = 0)]
+        /// A lost or stolen card is 2 if the pin may be known, else 3.
+        // Long-only on purpose: `-c` means the card everywhere else, and this is typed about
+        // once per revocation
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=3))]
         code: u8,
 
         /// Human-readable revocation reason
@@ -200,6 +206,16 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
     let Identity { seed, subkey, name, emails } = identity;
     let PGPOptions { date, subdate, validity, shared, legacy, algorithm } = options;
 
+    // Refused before the seed is stretched, which takes argon2 seconds per derivation level
+    if algorithm == Some(Algorithm::P384) {
+        bail!(pgp::P384_REFUSED);
+    }
+    // The legacy scheme derives the primary under the label 0x01 and a subkey id under its
+    // own bytes, so this one id would hand the card the primary key itself
+    if legacy && subkey.as_deref() == Some("\u{1}") {
+        bail!("Subkey id 0x01 collides with the primary key under --legacy; pick another");
+    }
+
     // Built lazily, so a command that needs no builder -- status today, anything later --
     // simply never calls it; the closure moves the identity in and can run at most once
     // Only the commands that mint user ids need emails; check compares keys, revoke
@@ -210,11 +226,18 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
     );
 
     let builder = move || -> Result<pgp::SeededSmartcard> {
-        let name = name.ok_or_else(|| anyhow!("No name given, pass --name (or MIND_THE_NAME)"))?;
-
-        if needs_emails && emails.is_empty() {
-            bail!("No email given, pass --emails (or MIND_THE_EMAILS)");
+        // Everything missing at once, so a script is fixed in one round
+        let mut missing = Vec::new();
+        if name.is_none() {
+            missing.push("--name (or MIND_THE_NAME)");
         }
+        if needs_emails && emails.is_empty() {
+            missing.push("--emails (or MIND_THE_EMAILS)");
+        }
+        if !missing.is_empty() {
+            bail!("Missing {}; in a session, `set` them", missing.join(" and "));
+        }
+        let name = name.expect("checked above");
 
         // Prepare pgp cert
         log::info!("Initializing PGP certificate for '{}'", name);
@@ -233,7 +256,7 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
 
         // Applied before anything else derives: the algorithm is part of every key's label
         if let Some(algorithm) = algorithm {
-            log::info!("Deriving {algorithm:?} keys");
+            log::info!("Deriving {algorithm} keys");
             warn_if_phrase_is_weaker(seed, algorithm);
             builder = builder.with_algorithm(algorithm)?;
         }
@@ -256,7 +279,7 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
         }
 
         if !shared.is_empty() {
-            log::info!("Deriving without the subkey id: {:?}", shared);
+            log::info!("Deriving without the subkey id: {}", spelled_all(&shared));
             builder = builder.with_shared(shared.clone());
         }
 
@@ -324,14 +347,11 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
                 builder = builder.with_pin(pin.clone());
             }
 
-            // Show info about target card
-            if let Some(serial) = card.as_ref() {
-                log::info!("Exporting secret key to smartcard: {}", serial);
-            }
-
-            // Check user confirmation
+            // Opened before the question, so that it names the card and an unfit card is
+            // refused while still intact
+            let target = builder.preflight(card.clone())?;
             if !yes {
-                confirm("PGP")?;
+                confirm("OpenPGP", &target)?;
             }
 
             // Generate and save result
@@ -353,7 +373,7 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
             let builder = builder()?;
 
             // Generate public certificate and save result
-            log::info!("Certifying uids and seeded keys: {:?}", kind);
+            log::info!("Certifying the {} certificate", spelled(&kind));
             let cert = builder.certify(kind)?;
 
             log::info!("Generated PGP certificate '{}'", cert);
@@ -392,9 +412,6 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
             }
             if show_qr {
                 qr::show_qr(&tsk_bytes, true)?;
-                log::warn!(
-                    "Secret keys were rendered on the terminal, clear the scrollback once transferred (e.g. `clear && printf '\\e[3J'`)"
-                );
             }
 
             Ok(())
@@ -404,7 +421,7 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
 
             // Generate rev cert and save result
             let raw = builder.revoke(kind, code, &reason)?;
-            log::info!("Generated PGP revocation: {:?}", kind);
+            log::info!("Generated a revocation of the {}", spelled(&kind));
 
             // Armor the revocation packet (gnupg convention: Kind::PublicKey)
             let mut armored = Vec::new();
@@ -422,9 +439,6 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
                 // A revocation certificate is a capability, so its QR gets the same
                 // no-stdout discipline as key material
                 qr::show_qr(&armored, true)?;
-                log::warn!(
-                    "The revocation certificate was rendered on the terminal, treat the scrollback accordingly"
-                );
             }
 
             Ok(())

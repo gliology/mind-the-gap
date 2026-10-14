@@ -149,7 +149,12 @@ impl SeededSmartcard {
                     // hand, and `upload` itself lets them be overridden
                     if let Some(policy) = metadata.policy {
                         let expected_policy = self.policies_for(*slot);
-                        if policy != expected_policy {
+                        // `--pin-policy default` and `--touch-policy default` leave the
+                        // choice to the card, so whatever it reports is the expected value
+                        let (pin, touch) = expected_policy;
+                        let pin_ok = pin == PinPolicy::Default || pin == policy.0;
+                        let touch_ok = touch == TouchPolicy::Default || touch == policy.1;
+                        if !(pin_ok && touch_ok) {
                             log::warn!(
                                 "Policy mismatch in {:?} slot: card={:?}, expected={:?}",
                                 slot,

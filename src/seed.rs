@@ -225,6 +225,14 @@ pub enum Algorithm {
     Rsa4096,
 }
 
+impl std::fmt::Display for Algorithm {
+    // The command-line spelling, so a message names the value the user would type
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = clap::ValueEnum::to_possible_value(self).expect("no variant is skipped");
+        f.write_str(value.get_name())
+    }
+}
+
 impl Algorithm {
     /// Label segment of a signing key in this algorithm
     pub fn signing_segment(self) -> &'static str {

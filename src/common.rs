@@ -62,7 +62,12 @@ pub(crate) fn warn_factory_pin(missing: bool) {
 pub(crate) fn printable(text: &str) -> String {
     text.chars()
         .map(|ch| {
-            if ch.is_control() || ('\u{80}'..='\u{9f}').contains(&ch) {
+            // Bidi controls are not control characters to Unicode, but they reorder what
+            // follows them on screen, so a card could make its name read as something else
+            let bidi = matches!(ch, '\u{61c}' | '\u{200e}' | '\u{200f}')
+                || ('\u{202a}'..='\u{202e}').contains(&ch)
+                || ('\u{2066}'..='\u{2069}').contains(&ch);
+            if ch.is_control() || ('\u{80}'..='\u{9f}').contains(&ch) || bidi {
                 ch.escape_unicode().to_string()
             } else {
                 ch.to_string()

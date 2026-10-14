@@ -48,9 +48,6 @@ fn main() -> ExitCode {
         .filter_or("MIND_THE_LOG_LEVEL", "mind_the_gap=info")
         .write_style_or("MIND_THE_LOG_STYLE", "auto");
 
-    // The card stacks trace raw APDUs, which carry pins and imported key bytes, so
-    // MIND_THE_LOG_LEVEL=trace while debugging a stubborn reader must not become a key
-    // logger: their targets are clamped to info no matter what the filter says.
     let mut builder = match &flag_filter {
         Some(filter) => {
             let mut builder = env_logger::Builder::new();
@@ -62,16 +59,14 @@ fn main() -> ExitCode {
         }
         None => env_logger::Builder::from_env(env),
     };
-    for target in [
-        "openpgp_card",
-        "card_backend",
-        "card_backend_pcsc",
-        "yubikey",
-        "pcsc",
-    ] {
-        builder.filter_module(target, log::LevelFilter::Info);
+    // Timestamps help whoever chose a filter to debug; at the default level the log is the
+    // tool talking to its user
+    if flag_filter.is_none() && std::env::var_os("MIND_THE_LOG_LEVEL").is_none() {
+        builder.format_timestamp(None).format_target(false);
     }
-    builder.init();
+    let logger = CardSafeLogger(builder.build());
+    log::set_max_level(logger.0.filter());
+    log::set_boxed_logger(Box::new(logger)).expect("the logger is set once");
 
     #[cfg(target_os = "linux")]
     if let Err(reason) = memory_lock {
@@ -88,6 +83,50 @@ fn main() -> ExitCode {
             log::error!("{err:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// The card stacks trace raw APDUs, which carry pins and imported key bytes, so a filter
+/// raised to trace while debugging a stubborn reader must not turn into a key logger
+///
+/// Their records above info are dropped here, after the filter: a directive can only ever
+/// be overridden by a more specific one (`openpgp_card::ocard::apdu=debug` beats
+/// `openpgp_card=info`), so no filter directive can make that promise.
+struct CardSafeLogger(env_logger::Logger);
+
+impl CardSafeLogger {
+    const CARD_TARGETS: [&'static str; 5] = [
+        "openpgp_card",
+        "card_backend",
+        "card_backend_pcsc",
+        "yubikey",
+        "pcsc",
+    ];
+
+    fn allows(metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Info
+            || !Self::CARD_TARGETS.iter().any(|card| {
+                metadata
+                    .target()
+                    .strip_prefix(card)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+            })
+    }
+}
+
+impl log::Log for CardSafeLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        Self::allows(metadata) && self.0.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if Self::allows(record.metadata()) {
+            self.0.log(record);
+        }
+    }
+
+    fn flush(&self) {
+        self.0.flush();
     }
 }
 

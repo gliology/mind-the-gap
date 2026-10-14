@@ -1,6 +1,6 @@
 //! The `piv` subcommands and their handler.
 
-use super::{Identity, confirm, warn_if_phrase_is_weaker};
+use super::{Identity, confirm, spelled, spelled_all, warn_if_phrase_is_weaker};
 use crate::common;
 use crate::piv;
 use crate::qr;
@@ -23,7 +23,7 @@ use zeroize::Zeroizing;
 
 #[derive(Subcommand, Clone, PartialEq)]
 pub(super) enum PIVCommand {
-    /// Display current status
+    /// List the attached PIV cards and what their slots hold (needs no seed)
     Status,
 
     /// Export the derived certificate chain
@@ -39,7 +39,7 @@ pub(super) enum PIVCommand {
 
     /// Check validity of smartcard
     Check {
-        /// Pin to protect exported keys on smartcards
+        /// User pin, for slots whose keys need it to prove themselves
         #[arg(short = 'i', long, env = "MIND_THE_PIN")]
         pin: Option<Zeroizing<String>>,
 
@@ -48,9 +48,14 @@ pub(super) enum PIVCommand {
         card: Option<String>,
     },
 
-    /// Export key to smartcard
+    /// Reset the card and provision the derived chain
+    ///
+    /// Erases the card's PIV application: every key and certificate on it. Then installs the
+    /// derived management key, sets the user pin and blocks the puk, so a forgotten pin is
+    /// recovered by running upload again from the phrase, not by a puk. Asks before the reset
+    /// and names the card.
     Upload {
-        /// Pin to protect exported keys on smartcards
+        /// User pin to set on the card (the factory 123456 when omitted)
         #[arg(short = 'i', long, env = "MIND_THE_PIN")]
         pin: Option<Zeroizing<String>>,
 
@@ -58,7 +63,7 @@ pub(super) enum PIVCommand {
         #[arg(short, long, env = "MIND_THE_CARD")]
         card: Option<String>,
 
-        /// Accept potentially dangerous operations
+        /// Reset the card without asking first
         #[arg(short, long)]
         yes: bool,
 
@@ -114,7 +119,8 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
     // Built lazily, so a command that needs no builder -- status today, anything later --
     // simply never calls it; the closure moves the identity in and can run at most once
     let builder = move || -> Result<piv::SeededSmartcard> {
-        let name = name.ok_or_else(|| anyhow!("No name given, pass --name (or MIND_THE_NAME)"))?;
+        let name = name
+            .ok_or_else(|| anyhow!("Missing --name (or MIND_THE_NAME); in a session, `set` it"))?;
 
         // Configure and run backend
         log::info!("Generating PIV certificates for '{}'", name);
@@ -124,7 +130,7 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
         let mut builder = piv::SeededSmartcard::new(&seed.seed(), subkey, name);
 
         if let Some(algorithm) = algorithm {
-            log::info!("Deriving {algorithm:?} keys");
+            log::info!("Deriving {algorithm} keys");
             warn_if_phrase_is_weaker(seed, algorithm);
             builder = builder.with_algorithm(algorithm);
         }
@@ -153,22 +159,22 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
         }
 
         if !shared.is_empty() {
-            log::info!("Deriving without the subkey id: {:?}", shared);
+            log::info!("Deriving without the subkey id: {}", spelled_all(&shared));
             builder = builder.with_shared(shared.clone());
         }
 
         if !retired.is_empty() {
-            log::info!("Archiving key management keys of: {:?}", retired);
+            log::info!("Archiving key management keys of: {}", retired.join(", "));
             builder = builder.with_retired(retired.clone());
         }
 
         // Policy overrides only affect the user slots, never card authentication
         if let Some(policy) = pin_policy {
-            log::info!("Setting slot pin policy: {:?}", policy);
+            log::info!("Setting slot pin policy: {}", spelled(&policy));
             builder = builder.with_pin_policy(policy.into());
         }
         if let Some(policy) = touch_policy {
-            log::info!("Setting slot touch policy: {:?}", policy);
+            log::info!("Setting slot touch policy: {}", spelled(&policy));
             builder = builder.with_touch_policy(policy.into());
         }
 
@@ -178,11 +184,11 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
         }
 
         if let Some(algorithm) = management_key {
-            log::info!("Setting management key algorithm: {:?}", algorithm);
+            log::info!("Setting management key algorithm: {}", spelled(&algorithm));
             builder = builder.with_management_key(algorithm);
         }
         if let Some(touch) = management_key_touch {
-            log::info!("Setting management key touch: {:?}", touch);
+            log::info!("Setting management key touch: {}", spelled(&touch));
             builder = builder.with_management_touch(touch);
         }
 
@@ -212,16 +218,21 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
             let builder = builder()?;
 
             // Generate the chain and report what it contains
-            log::info!("Generating PIV certificate chain: {:?}", kind);
+            log::info!("Generating the PIV certificates: {}", spelled(&kind));
             let chain = builder.certify(kind.clone())?;
             let selected = chain.select(kind.clone())?;
 
+            // The person slots share a subject, so a leaf is named by its slot
             for cert in selected.iter() {
-                log::info!(
-                    "{}: {:x}",
-                    cert.tbs_certificate().subject(),
-                    Sha256::digest(cert.to_der()?)
-                );
+                let slot = chain
+                    .leaves
+                    .iter()
+                    .find(|(_, leaf)| std::ptr::eq(leaf, *cert));
+                let name = match slot {
+                    Some((slot, _)) => format!("{slot:?} slot"),
+                    None => cert.tbs_certificate().subject().to_string(),
+                };
+                log::info!("{name}: SHA-256 {:x}", Sha256::digest(cert.to_der()?));
             }
 
             // Export certificates in PEM format
@@ -284,14 +295,11 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
                 builder = builder.with_pin(pin.clone());
             }
 
-            // Show info about target card
-            if let Some(serial) = card.as_ref() {
-                log::info!("Upload keys to smartcard: {}", serial);
-            }
-
-            // Check confirmation
+            // Opened before the question, so that it names the card and an unfit card is
+            // refused while still intact
+            let target = builder.preflight(card.clone())?;
             if !yes {
-                confirm("PIV")?;
+                confirm("PIV", &target)?;
             }
 
             // Generate, upload and save result

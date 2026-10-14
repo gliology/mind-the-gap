@@ -6,8 +6,8 @@ use super::{
     piv_commands::PIVCommand,
 };
 use crate::common;
-use crate::mnemonic::MnemonicSeed;
-use crate::pgp::{self};
+use crate::mnemonic::{self, MnemonicSeed};
+use crate::pgp;
 use crate::piv;
 use crate::prompt;
 use crate::seed::Algorithm;
@@ -46,6 +46,8 @@ pub(super) struct Session {
     /// no password but must still count as answered, or a later `generate` would ask
     /// the same question twice
     pub(super) password_asked: bool,
+    /// Whether the password came from the command line or environment rather than a prompt
+    pub(super) password_supplied: bool,
     /// Whether this session may prompt at all: true only when stdin is a terminal.
     /// The piped path keeps the one-shot contract: errors and warnings, never a
     /// prompt a script would hang on.
@@ -131,22 +133,27 @@ impl Session {
             return Ok(seed.clone());
         }
 
-        let text = match self.pending_seed.take() {
-            Some(text) => text,
+        let mut seed: MnemonicSeed = match self.pending_seed.take() {
+            Some(text) => text.trim().parse()?,
             None if self.interactive => {
-                // The password belongs to the seed, so an interactively entered seed
-                // comes with the password question in the same breath; a seed supplied
-                // as an argument keeps its password on the argument side too
-                let text = prompt::read_secret("Seed phrase: ")?;
+                // A typo is reported before anything else is asked, and costs only the
+                // phrase: the password belongs to the seed, so it follows in the same
+                // breath, once the phrase is known to be valid
+                let seed = loop {
+                    let text = prompt::read_secret("Seed phrase: ")?;
+                    match text.trim().parse() {
+                        Ok(seed) => break seed,
+                        Err(err) => log::error!("{err}; try again, or Ctrl-C to abort"),
+                    }
+                };
                 self.ask_password_once()?;
-                text
+                seed
             }
             None => bail!(
                 "No seed phrase given. A piped session never prompts; pass --seed \
                  (or MIND_THE_SEED) when starting it."
             ),
         };
-        let mut seed: MnemonicSeed = text.trim().parse()?;
 
         if let Some(password) = self.resolve_password() {
             seed = seed.with_password(&password);
@@ -198,18 +205,23 @@ impl Session {
     }
 }
 
-/// One line of the interactive session, parsed like a tiny argv
-///
-/// Deliberately not `Debug`, like [`CLI`] and for the same reason. There are no seed or
-/// password arguments here: the secrets are session state, and any line naming them is
-/// rejected before parsing so a secret can never reach the in-memory history. The
-/// identity overrides carry no `env` bindings either: the session captured the
-/// `MIND_THE_...` variables once at startup, and a per-line re-read would silently
-/// resurrect values that `set` changed away. The options *inside* the backends keep
-/// their env fallbacks; the process environment cannot change mid-session, so they
-/// resolve to the same values as a one-shot invocation.
+// One line of the interactive session, parsed like a tiny argv.
+//
+// Deliberately not `Debug`, like [`CLI`] and for the same reason. There are no seed or
+// password arguments here: the secrets are session state, and any line naming them is
+// rejected before parsing so a secret can never reach the in-memory history. The identity
+// overrides carry no `env` bindings either: the session captured the `MIND_THE_...`
+// variables once at startup, and a per-line re-read would silently resurrect values that
+// `set` changed away. The options *inside* the backends keep their env fallbacks; the
+// process environment cannot change mid-session, so they resolve to the same values as a
+// one-shot invocation.
 #[derive(Parser)]
-#[command(name = "mtg", bin_name = "mtg", disable_version_flag = true)]
+#[command(
+    name = "mtg",
+    bin_name = "mtg",
+    disable_version_flag = true,
+    about = "Commands of the interactive session: the command line's, minus the secrets"
+)]
 pub(super) struct ReplLine {
     /// Override the session subkey id for this command only
     #[arg(short = 'k', long, global = true)]
@@ -371,7 +383,8 @@ pub(super) fn repl(mut session: Session) -> Result<()> {
     session.interactive = true;
 
     println!("mind-the-gap interactive session");
-    println!("The seed phrase is asked for once, kept only in memory, and gone on exit.");
+    println!("The first command that needs the seed phrase asks for it on a hidden prompt;");
+    println!("it is kept only in memory and gone on exit.");
     println!("Commands match the command line; `help` lists them, `exit` or Ctrl-D leaves.");
 
     let mut editor: rustyline::Editor<(), MemHistory> = rustyline::Editor::with_history(
@@ -382,12 +395,13 @@ pub(super) fn repl(mut session: Session) -> Result<()> {
     loop {
         match editor.readline("mtg> ") {
             Ok(line) => {
-                // Only clean lines become recallable: a rejected secret-naming line
-                // must not be one arrow press away, and a line the splitter cannot
-                // parse (an unbalanced quote around, say, half a seed phrase) has to
-                // count as secret-bearing rather than slip through unsplit
+                // Only commands become recallable. A rejected secret-naming line must not
+                // be one arrow press away, and neither may anything that does not parse:
+                // a seed phrase typed at the prompt, a password after `password`, or an
+                // unbalanced quote around half of either
                 if let Some(tokens) = shlex::split(&line)
                     && !names_a_secret(&tokens)
+                    && ReplLine::try_parse_from(std::iter::once("mtg".into()).chain(tokens)).is_ok()
                 {
                     let _ = editor.add_history_entry(&line);
                 }
@@ -454,7 +468,8 @@ fn merge_defaults(backend: &mut Backend, d: &Stickies) {
                 shared.clone_from(&d.shared_pgp);
             }
             *legacy |= d.legacy;
-            *algorithm = algorithm.or(d.algorithm);
+            // `set --algorithm p384` is meant for PIV, the one backend that has it
+            *algorithm = algorithm.or(d.algorithm.filter(|sticky| *sticky != Algorithm::P384));
         }
         Backend::PIV {
             date,
@@ -547,14 +562,29 @@ pub(super) fn handle_line(session: &mut Session, line: &str) -> Result<Flow> {
     }
 
     // The parser wants a program name in front, mirroring the prompt
-    let line = match ReplLine::try_parse_from(std::iter::once("mtg".into()).chain(tokens)) {
-        Ok(line) => line,
-        Err(err) => {
-            // clap errors carry their own formatting, including help and usage output
-            let _ = err.print();
-            return Ok(Flow::Continue);
-        }
-    };
+    let line =
+        match ReplLine::try_parse_from(std::iter::once("mtg".into()).chain(tokens.iter().cloned()))
+        {
+            Ok(line) => line,
+            // clap repeats an unexpected argument in its error, so the two lines that most
+            // likely carry a secret are answered without echoing it
+            Err(_) if mnemonic::looks_like_phrase(&tokens) => {
+                log::error!(
+                    "That looks like a seed phrase; it was neither stored nor echoed. A command \
+                 that needs it asks for it on a hidden prompt"
+                );
+                return Ok(Flow::Continue);
+            }
+            Err(_) if tokens[0] == "password" => {
+                log::error!("`password` takes no argument, it asks on a hidden prompt");
+                return Ok(Flow::Continue);
+            }
+            Err(err) => {
+                // clap errors carry their own formatting, including help and usage output
+                let _ = err.print();
+                return Ok(Flow::Continue);
+            }
+        };
 
     let overrides = Overrides { subkey: line.subkey, name: line.name, emails: line.emails };
 
@@ -721,15 +751,30 @@ pub(super) fn handle_line(session: &mut Session, line: &str) -> Result<Flow> {
                     "The session already holds a seed; generate will replace it \
                      for every later command.",
                 )?;
-                session.password_asked = false;
+                // A password answered at the prompt belonged to the old phrase, so the new
+                // one asks again; one from the invocation is the user's standing choice
+                if session.password_supplied {
+                    log::info!("The password from the command line applies to the new phrase");
+                } else {
+                    session.password = None;
+                    session.password_asked = false;
+                }
             }
-            generate().and_then(|seed| session.adopt(seed))
+            generate(true).and_then(|seed| session.adopt(seed))
         })(),
         ReplCommand::Backend(mut backend) => {
             let needs_seed = backend.needs_seed();
             merge_defaults(&mut backend, &session.defaults);
+            // The seed and its password come first: a mistyped phrase is reported before
+            // anything else is asked, and nothing typed later can land in the wrong prompt
             let prep = if session.interactive {
-                ask_upload_pin(&mut backend).and_then(|()| ask_identity(session, &backend))
+                let seed = if needs_seed {
+                    session.resolve_seed().map(drop)
+                } else {
+                    Ok(())
+                };
+                seed.and_then(|()| ask_identity(session, &backend))
+                    .and_then(|()| ask_upload_pin(&mut backend))
             } else {
                 Ok(())
             };

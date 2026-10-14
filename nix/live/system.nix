@@ -270,6 +270,20 @@ in
     "rndis_host"
     "r8152"
   ];
+  # A blacklist only stops a module's own aliases: a wifi or modem driver loaded by its PCI
+  # or USB id still pulls cfg80211, bluetooth or usbnet in as a dependency. Refusing the
+  # stacks themselves closes that path, whatever driver asks.
+  boot.extraModprobeConfig =
+    lib.concatMapStrings
+      (module: ''
+        install ${module} ${pkgs.coreutils}/bin/false
+      '')
+      [
+        "bluetooth"
+        "cfg80211"
+        "mac80211"
+        "usbnet"
+      ];
 
   # Refuse to load kernel modules once booted. The supported tokens (YubiKey, Nitrokey) are
   # driven from userspace through pcscd and need no device modules of their own, so the only
@@ -294,7 +308,13 @@ in
   # Add services and udev rules for common smartcards
   services.pcscd.enable = true;
 
-  hardware.gpgSmartcards.enable = true;
+  # scdaemon through pcscd rather than its own CCID driver, which would take the token away
+  # from pcscd and with it from mind-the-gap; see docs/linux.md. This also makes the udev
+  # rules that driver needs (hardware.gpgSmartcards) unnecessary.
+  environment.etc."gnupg/scdaemon.conf".text = ''
+    disable-ccid
+  '';
+
   hardware.nitrokey.enable = true;
 
   services.udev.packages = [
@@ -344,6 +364,9 @@ in
       "mtg" = "mind-the-gap";
       "forget" = "history -c; command forget";
     };
+    # No shell writes its history to a file, so every line typed ends with the shell that
+    # holds it: `forget` clears the running one, and an exited shell leaves nothing behind
+    bash.interactiveShellInit = "unset HISTFILE";
 
     # Enable gnupg ssh agent
     gnupg.agent = {

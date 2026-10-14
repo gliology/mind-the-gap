@@ -66,6 +66,15 @@
     machine.wait_for_unit("disable-kernel-module-loading.service")
     machine.fail("modprobe cdc_ether")
 
+    # The radio and tethering stacks cannot arrive as another driver's dependency either:
+    # modprobe refuses them by name, whichever module asks, and none is loaded
+    for stack in ("bluetooth", "cfg80211", "mac80211", "usbnet"):
+        machine.succeed(f"modprobe -n --show-depends {stack} | grep -q '^install .*false'")
+        machine.fail(f"lsmod | grep -qw {stack}")
+
+    # No shell keeps a history file for `forget` to miss
+    machine.succeed("su - alice -c 'bash -ic \"test -z \\$HISTFILE\"'")
+
     # The kernel that booted keeps running, with the retired hardened profile's leftovers
     # and the interfaces nothing here uses switched off; the lid and the sleep states no
     # longer offer a dark screen with the seed still in RAM behind it

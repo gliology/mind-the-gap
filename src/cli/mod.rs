@@ -35,11 +35,10 @@ use clap::{Command, CommandFactory, Parser, Subcommand};
 use zeroize::Zeroizing;
 
 /// The parsed command line, global arguments plus the subcommand
-///
-/// Deliberately not `Debug`: the struct carries the seed phrase, password and pins, and a
-/// stray `{:?}` must not be able to print them.
+// Deliberately not `Debug`: the struct carries the seed phrase, password and pins, and a
+// stray `{:?}` must not be able to print them.
 #[derive(Parser)]
-#[command(author, version, about)]
+#[command(author, version, about, long_about = None)]
 pub struct CLI {
     /// Mnemonic seed phrase of root secret
     ///
@@ -77,10 +76,10 @@ pub struct CLI {
 
     /// Logging filter, like MIND_THE_LOG_LEVEL (the flag wins)
     ///
-    /// Same grammar as env_logger, e.g. `info` or `mind_the_gap=debug`. Applied when
-    /// the process starts, so it cannot be changed from inside a session; the card
-    /// stacks stay clamped to info either way, see main.rs.
-    #[arg(long, global = true, value_name = "FILTER")]
+    /// Same grammar as env_logger, e.g. `info` or `mind_the_gap=debug`. Applied when the
+    /// process starts, so a session keeps the level it started with. Card traffic, which
+    /// carries pins and key bytes, is never logged above info.
+    #[arg(long, global = true, value_name = "FILTER", env = "MIND_THE_LOG_LEVEL")]
     log_level: Option<String>,
 
     /// The backend and subcommand to run; omitted, an interactive session starts
@@ -244,10 +243,11 @@ fn write_sensitive(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn confirm(backend: &str) -> Result<()> {
+/// Ask before `upload` wipes `card`, the card's own description taken from its preflight
+fn confirm(application: &str, card: &str) -> Result<()> {
     confirm_destruction(&format!(
-        "Uploading new keys will reset the {backend} smartcard.\n\
-         This will clear any existing keys or data on the card!"
+        "Uploading resets the {application} application of\n  {card}\n\
+         Every key and certificate it holds is erased."
     ))
 }
 
@@ -310,6 +310,7 @@ pub fn run() -> Result<()> {
         seed: None,
         password: None,
         pending_seed: seed,
+        password_supplied: password.is_some(),
         pending_password: password,
         password_asked: false,
         interactive: false,
@@ -344,7 +345,7 @@ fn dispatch(backend: Backend, identity: Identity) -> Result<()> {
     match backend {
         // The seed generation ceremony needs no other input; the one-shot path drops the
         // minted seed, which lives on paper now, while the session path adopts it
-        Backend::Generate => generate().map(|_| ()),
+        Backend::Generate => generate(false).map(|_| ()),
         // ... then command
         Backend::PGP { date, subdate, validity, shared, legacy, algorithm, command } => run_pgp(
             identity,
@@ -413,4 +414,16 @@ fn warn_if_phrase_is_weaker(seed: &MnemonicSeed, algorithm: Algorithm) {
             algorithm.name()
         );
     }
+}
+
+/// The command-line spelling of a value, for messages that echo an option back
+fn spelled<T: clap::ValueEnum>(value: &T) -> String {
+    value
+        .to_possible_value()
+        .map_or_else(String::new, |value| value.get_name().to_string())
+}
+
+/// The command-line spelling of a list of values, as the flag takes it
+fn spelled_all<T: clap::ValueEnum>(values: &[T]) -> String {
+    values.iter().map(spelled).collect::<Vec<_>>().join(",")
 }
