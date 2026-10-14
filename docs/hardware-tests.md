@@ -69,7 +69,7 @@ certificate authorities in msroots -- the check asserts that none of the advisor
 comparisons warn. The check runs once per algorithm: `virtual-piv` provisions the P-256
 chain, `virtual-piv-curve25519` the Ed25519 and X25519 one, and `virtual-piv-rsa2048` an
 RSA-2048 chain imported in the Yubico layout. Each then runs the
-card-level half of the destructive PIV suite (`tests/piv_hardware.rs`, built as the
+card-level half of the destructive PIV suite (`tests/piv_hardware/`, built as the
 `piv-suite` binary) against the same card: its own provisioning, the policy and
 certificate read-back, msroots and the card identifiers, and then the card signing in
 9A, 9C and 9E under their pin policies and agreeing (or, for RSA, decrypting) in 9D,

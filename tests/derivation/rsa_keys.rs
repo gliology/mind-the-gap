@@ -1,3 +1,5 @@
+//! RSA keys from two primes read off a SHAKE256 stream.
+
 use mind_the_gap::rsa::{PUBLIC_EXPONENT, derive_key};
 use mind_the_gap::seed::Seed256;
 

@@ -3,7 +3,7 @@
 The PIV certificate chain is fully covered by `cargo test --test piv` *except* for everything
 that needs a physical card. This document is the remaining manual checklist.
 
-Sections 1 to 5 have been automated as `tests/piv_hardware.rs`; see *Automated card tests*
+Sections 1 to 5 have been automated as `tests/piv_hardware/`; see *Automated card tests*
 immediately below. The manual steps are kept because they are what the test was derived from,
 and because they are still how you diagnose a failure. Nothing on the list needs GUI
 software: the TLS handshake and the S/MIME round trip that a browser or mail client would
@@ -29,7 +29,7 @@ Reference rig the checklist was written against:
 
 ## Automated card tests
 
-Most of sections 1 to 4 now run as a real test, `tests/hardware.rs`, so the manual walk below
+Most of sections 1 to 4 now run as a real test, `tests/piv_hardware/`, so the manual walk below
 is for the parts that need a human or a GUI. The automated test asserts the same things this
 document does, and a few the checklist could only eyeball:
 
@@ -80,7 +80,7 @@ destructive-hardware-tests = []      # opt in
 no-destructive-hardware-tests = []   # safety interlock -- never enable by hand
 ```
 
-`tests/hardware.rs` compiles only when the first is on and the second is off. The second
+`tests/piv_hardware/` compiles only when the first is on and the second is off. The second
 exists because `--all-features` turns on *every* feature, so without it a routine
 `cargo test --all-features` -- in CI, or from a habit -- would silently wipe whatever card
 happened to be plugged in. Enabling both, which is exactly what `--all-features` does,
@@ -247,7 +247,7 @@ done
 Two observations that are expected, not faults:
 
 - `PUK is blocked` / `PUK tries remaining: 0/3`. `upload` blocks the PUK on purpose after
-  provisioning (`src/piv.rs`, `token.block_puk()`); there is no PUK recovery path by design,
+  provisioning (`src/piv/card.rs`, `token.block_puk()`); there is no PUK recovery path by design,
   since the keys are re-derivable from the seed.
 - `WARNING: Using default PIN!` appears only when the PIN passed to `-i` is the PIV default
   `123456`.
@@ -434,7 +434,7 @@ NSS is the crypto stack Firefox, Chrome and Thunderbird share, so its recognisin
 is the compatibility statement that matters. Step 12 of the suite automates the touch-free
 half: it loads the OpenSC module into a scratch NSS database and asserts all four slot
 certificates appear, each with a private key, under the trusted derived root. Two things
-stay manual. `certutil -V` usage validation runs offline in `tests/piv.rs` instead, against
+stay manual. `certutil -V` usage validation runs offline in `tests/piv/external.rs` instead, against
 non-expiring certs -- this fixture's ten-year window is long past, so a real-time NSS
 validation would fail on expiry, not trust. And on-card *decryption* through NSS's
 `cmsutil` is not asserted. Its token login does work once you know the flag -- `cmsutil -f
@@ -456,7 +456,7 @@ card's ECDH is proven correct by steps 7 and 10. To reproduce by hand:
 it is an RSA-era check that was never updated for ECDH. The certificate carries `keyAgreement`,
 as it must. The meaningful check is `openssl cms -encrypt`, which succeeds and negotiates
 `dhSinglePass-stdDH` + `aes256-wrap`. This is asserted by
-`openssl_encrypts_to_key_management_cert` in `tests/piv.rs`, and was confirmed on hardware.
+`openssl_encrypts_to_key_management_cert` in `tests/piv/external.rs`, and was confirmed on hardware.
 
 **`openssl cms -encrypt` defaults to a SHA-1 based ECDH KDF** (`dhSinglePass-stdDH-sha1kdf`).
 That is an OpenSSL default, not something the certificate selects, and is unrelated to the

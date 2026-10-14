@@ -1,3 +1,6 @@
+//! The seed tree: labels, derivation and the P-384 scalar.
+
+use crate::DEFAULT_INPUT;
 use mind_the_gap::seed::{
     Algorithm, Seed256, Seed256Derive, algorithm_label, argon2id_256, derive_p384_scalar, label,
 };
@@ -6,7 +9,6 @@ use base64::Engine;
 use base64::prelude::BASE64_STANDARD_NO_PAD;
 
 const SEED: Seed256 = [42u8; 32];
-const DEFAULT_INPUT: &[u8] = b"Mind the gap, bro!";
 
 #[test]
 fn derive_is_deterministic() {

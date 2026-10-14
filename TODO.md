@@ -43,11 +43,11 @@
 - For the next derivation scheme (`mtg2`): fold the TBS content (validity, subject, flags)
   into the PIV certificate serial, so re-issuing with different flags cannot repeat an
   (issuer, serial) pair (RFC 5280 4.1.2.2); frozen within `mtg1` because `check` compares
-  certificates byte for byte (see `serial_for` in `src/piv.rs`)
+  certificates byte for byte (see `serial_for` in `src/piv/chain.rs`)
 - Report the NSS CMS ECDH decrypt failure upstream: `cmsutil -D -f <pinfile>` on a 9D
   enveloped message returns `SEC_ERROR_INVALID_KEY` even though the token key is
   `CKA_DERIVE` and `pkcs11-tool` does the same `CKM_ECDH1_DERIVE` (see the commented block
-  in `tests/piv_hardware.rs::nss_recognises_card`). Needs a minimal reproduction against a
+  in `tests/piv_hardware/end_use.rs::nss_recognises_card`). Needs a minimal reproduction against a
   virtual PIV token, then a Mozilla NSS bug; restore the commented decrypt assertion once
   fixed. (The OpenSSL counterpart is already filed as openssl/openssl#24698.)
 - RSA PIV keys beyond 2048 bits: yubikey.rs cannot import RSA-4096 (its key buffer is 1024

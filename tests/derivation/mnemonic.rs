@@ -1,3 +1,5 @@
+//! The phrase: parsing, the password and the seed it yields.
+
 use mind_the_gap::mnemonic::MnemonicSeed;
 use mind_the_gap::seed::Seed256Derive;
 

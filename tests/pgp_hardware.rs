@@ -1,10 +1,10 @@
 //! On-card tests for the OpenPGP backend.
 //!
-//! The counterpart to `tests/hardware.rs`, gated on the same two features -- see the feature
+//! The counterpart to `tests/piv_hardware/`, gated on the same two features -- see the feature
 //! comments in `Cargo.toml` for why the second one exists.
 //!
 //! **Running this wipes the card's OpenPGP applet.** `upload` factory-resets it. Note that it
-//! resets *only* that applet: a card provisioned by `tests/hardware.rs` keeps its PIV keys, so
+//! resets *only* that applet: a card provisioned by `tests/piv_hardware/` keeps its PIV keys, so
 //! the two suites can share a token, just not at the same time.
 //!
 //! ```text

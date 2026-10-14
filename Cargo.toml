@@ -178,7 +178,7 @@ ignored = ["tiny-bip39"]
 [dev-dependencies]
 # Unpredictable, self-cleaning temp paths for the tests that shell out to external tools
 tempfile = "3"
-# The on-card key agreement test (tests/piv_hardware.rs) needs `ecdh`, which is not in p256's
+# The on-card key agreement test (tests/piv_hardware/) needs `ecdh`, which is not in p256's
 # default feature set. Kept here rather than on the main dependency so that a production
 # build does not carry it -- Cargo unifies features per build, so test targets get it and
 # `cargo build` does not.
