@@ -370,7 +370,7 @@ fn revoke_packet_is_key_revocation() {
     use sequoia_openpgp::parse::Parse;
 
     let raw = builder(&SEED_A, "Alice", "alice@example.com")
-        .revoke(RevocationKind::default(), 0, "Unspecified")
+        .revoke(RevocationKind::Certificate, 0, "Unspecified")
         .unwrap();
 
     match Packet::from_bytes(&raw).unwrap() {

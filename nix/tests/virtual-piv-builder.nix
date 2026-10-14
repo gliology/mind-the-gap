@@ -6,7 +6,7 @@
 # slots, and management access without a touch. yubikit then reads back what the card
 # reports, so the policies are seen on the card rather than taken from our own log.
 #
-# `managementKey` is what `--management-key` asks `upload` for, or null for the automatic
+# `managementKey` is what `--management-algorithm` asks `upload` for, or null for the automatic
 # choice, which is AES-256 on this card. The triple DES variant is what a YubiKey 4 or a
 # YubiKey 5 before 5.4 takes, forced onto a card that would take either.
 {
@@ -122,7 +122,7 @@ in
     piv = (
         "piv --algorithm p384 --pin-policy once --touch-policy never "
         "--management-key-touch never${
-          if managementKey == null then "" else " --management-key ${managementKey}"
+          if managementKey == null then "" else " --management-algorithm ${managementKey}"
         }"
     )
     card = "-c 5437251"

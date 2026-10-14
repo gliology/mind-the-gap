@@ -97,7 +97,7 @@ fn repl_session_certifies() {
     let script = format!(
         "set -n 'Jane Doe' -m jane@example.com
 pgp certify --kind full -o {}
-exit
+quit
 ",
         path.display()
     );
@@ -116,7 +116,7 @@ fn repl_recovers_from_errors() {
     let script = format!(
         "bogus command
 pgp certify --kind full -o {} -n Jane -m jane@example.com
-exit
+quit
 ",
         path.display()
     );
@@ -140,7 +140,7 @@ fn repl_rejects_secret_arguments() {
         let out = repl(
             &format!(
                 "{line}
-exit
+quit
 "
             ),
             &[],
@@ -165,7 +165,7 @@ fn piped_session_never_prompts_for_seed() {
     let script = format!(
         "pgp certify --kind full -n Jane -m jane@example.com -o x.asc
 pgp certify --kind full -n Jane -m jane@example.com -o {} --help
-exit
+quit
 ",
         marker.display()
     );
@@ -193,7 +193,7 @@ fn piped_upload_does_not_eat_lines() {
         "pgp upload -c {NO_CARD}
 yes
 pgp certify --kind full -o {}
-exit
+quit
 ",
         path.display()
     );
@@ -212,7 +212,7 @@ exit
 /// A piped session cannot replace a loaded seed with generate.
 #[test]
 fn piped_generate_cannot_replace_seed() {
-    let out = repl("generate\nexit\n", &["-s", TEST_PHRASE]);
+    let out = repl("generate\nquit\n", &["-s", TEST_PHRASE]);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
     assert!(out.status.success(), "session died: {:?}", out);
@@ -225,12 +225,12 @@ fn piped_generate_cannot_replace_seed() {
 /// The password verb is interactive-only and takes no arguments.
 #[test]
 fn password_verb_rejects_piped_and_args() {
-    let out = repl("password\nexit\n", &["-s", TEST_PHRASE]);
+    let out = repl("password\nquit\n", &["-s", TEST_PHRASE]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success());
     assert!(stderr.contains("never prompts"), "piped password verb not refused:\n{stderr}");
 
-    let out = repl("password now\nexit\n", &["-s", TEST_PHRASE]);
+    let out = repl("password now\nquit\n", &["-s", TEST_PHRASE]);
     assert!(out.status.success(), "session died on bad args: {:?}", out);
 }
 
@@ -244,7 +244,7 @@ fn set_stickies_apply_and_lines_win() {
         "set --date 2026-01-01
 piv certify --kind root -o {a}
 piv certify --kind root -d 2027-01-01 -o {b}
-exit
+quit
 ",
         a = a.display(),
         b = b.display()
@@ -255,6 +255,55 @@ exit
     let a = std::fs::read(&a).unwrap();
     let b = std::fs::read(&b).unwrap();
     assert_ne!(a, b, "the line's own --date did not override the stored default");
+}
+
+/// Without `--output`, the whole chain comes out as QR codes, one per certificate, each
+/// named: the same certificates a file would get.
+#[test]
+fn chain_without_output_is_one_code_per_certificate() {
+    let out = identity(&mut bin())
+        .args(["piv", "certify", "--kind", "chain"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(out.status.success(), "certify --kind chain failed: {:?}", out);
+    for name in [
+        "authentication slot 9A",
+        "signature slot 9C",
+        "key management slot 9D",
+    ] {
+        assert!(stdout.contains(name), "no code titled {name}:\n{stdout}");
+    }
+    assert!(stdout.contains("5 of 5: root CA"), "the root is not the last of five:\n{stdout}");
+}
+
+/// `unset` forgets a stored default: afterwards the session derives as if never `set`.
+#[test]
+fn unset_forgets_a_stored_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let [set, unset, plain] =
+        ["set.pem", "unset.pem", "plain.pem"].map(|name| dir.path().join(name));
+    let script = format!(
+        "set --date 2026-01-01
+piv certify --kind root -o {set}
+unset date
+piv certify --kind root -o {unset}
+quit
+",
+        set = set.display(),
+        unset = unset.display()
+    );
+    let out = repl(&script, &["-s", TEST_PHRASE, "-n", "Jane"]);
+    assert!(out.status.success(), "session died: {:?}", out);
+
+    let script = format!("piv certify --kind root -o {}\nquit\n", plain.display());
+    let out = repl(&script, &["-s", TEST_PHRASE, "-n", "Jane"]);
+    assert!(out.status.success(), "session died: {:?}", out);
+
+    let [set, unset, plain] = [set, unset, plain].map(|path| std::fs::read(path).unwrap());
+    assert_ne!(set, unset, "the stored date did not apply before unset");
+    assert_eq!(unset, plain, "unset did not restore the default");
 }
 
 /// `--algorithm` is accepted by both backends, from the line and from the environment, and
@@ -340,7 +389,7 @@ fn set_algorithm_sticks_in_session() {
 set --algorithm curve25519
 piv certify --kind root -o {b}
 piv certify --kind root --algorithm p256 -o {c}
-exit
+quit
 ",
         a = a.display(),
         b = b.display(),
@@ -359,7 +408,7 @@ exit
 /// The version verb prints name and version inside the session.
 #[test]
 fn version_verb_works_in_session() {
-    let out = repl("version\nexit\n", &[]);
+    let out = repl("version\nquit\n", &[]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success());
     assert!(
@@ -405,7 +454,7 @@ fn repl_set_identity_persists() {
     let script = format!(
         "set -n 'Jane Doe' -m jane@example.com
 pgp certify --kind uids -o {}
-exit
+quit
 ",
         path.display()
     );
@@ -503,7 +552,7 @@ fn repl_survives_unbalanced_quotes() {
     let script = format!(
         "pgp certify --kind full -o x \"half quoted
 pgp certify --kind full -o {} -n Jane -m jane@example.com
-exit
+quit
 ",
         path.display()
     );

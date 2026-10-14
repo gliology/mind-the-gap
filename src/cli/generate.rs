@@ -7,7 +7,7 @@ use crate::qr;
 
 use std::io::Write;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 
 /// Ignore SIGINT and SIGQUIT for a guard's lifetime, restoring the old handlers after
 ///
@@ -65,7 +65,12 @@ pub(super) fn generate(in_session: bool) -> Result<MnemonicSeed> {
         }
         writeln!(screen.tty)?;
 
-        prompt::read_ack("Press enter once it is written down... ")?;
+        // A way out that leaves nothing behind: Ctrl-C is ignored here, and the guards
+        // restore the screen on this exit path like on every other
+        let answer = prompt::read_public("Press enter once it is written down, or type abort: ")?;
+        if answer == "abort" {
+            bail!("Aborted; the phrase was not kept and nothing was derived from it");
+        }
 
         // Wipe before the quiz, so answers come from paper and not from the screen
         screen.wipe()?;

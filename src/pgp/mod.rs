@@ -42,10 +42,9 @@ pub use card::status;
 pub(crate) const P384_REFUSED: &str = "P-384 is a PIV-only curve: the OpenPGP backend derives on curve25519, p256 or rsa2048 to rsa4096";
 
 /// What a revocation covers
-#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RevocationKind {
     /// Retire the whole identity, primary key and all
-    #[default]
     Certificate,
     /// Retire only this card's subkeys, leaving the identity and every other card alone
     ///
@@ -126,17 +125,18 @@ pub type SharedKey = SubkeyRole;
 
 /// Command line mirror of `openpgp-card`'s [`TouchPolicy`], which is a foreign type.
 ///
-/// The `fixed` variants brick the setting on purpose: a card configured `fixed` or
-/// `cached-fixed` refuses to change that key's policy again until its key is re-imported,
-/// which is what makes the requirement tamper-evident.
+/// Spelled like PIV's touch policies, so both backends share one vocabulary. The `-fixed`
+/// variants brick the setting on purpose: a card configured `always-fixed` or `cached-fixed`
+/// refuses to change that key's policy again until its key is re-imported, which is what
+/// makes the requirement tamper-evident.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TouchPolicyArg {
     /// Never require a touch
-    Off,
+    Never,
     /// Require a touch for every operation
-    On,
+    Always,
     /// Require a touch for every operation, and lock this setting until the key is replaced
-    Fixed,
+    AlwaysFixed,
     /// Require a touch, valid for about 15 seconds of operations
     Cached,
     /// Like cached, and lock this setting until the key is replaced
@@ -146,9 +146,9 @@ pub enum TouchPolicyArg {
 impl From<TouchPolicyArg> for TouchPolicy {
     fn from(arg: TouchPolicyArg) -> Self {
         match arg {
-            TouchPolicyArg::Off => TouchPolicy::Off,
-            TouchPolicyArg::On => TouchPolicy::On,
-            TouchPolicyArg::Fixed => TouchPolicy::Fixed,
+            TouchPolicyArg::Never => TouchPolicy::Off,
+            TouchPolicyArg::Always => TouchPolicy::On,
+            TouchPolicyArg::AlwaysFixed => TouchPolicy::Fixed,
             TouchPolicyArg::Cached => TouchPolicy::Cached,
             TouchPolicyArg::CachedFixed => TouchPolicy::CachedFixed,
         }

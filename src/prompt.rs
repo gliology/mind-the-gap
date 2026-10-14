@@ -8,7 +8,7 @@
 //! meaning "none" where the secret is optional.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -88,25 +88,4 @@ pub fn tty() -> Result<File> {
         .write(true)
         .open("/dev/tty")
         .context("No controlling terminal to prompt on")
-}
-
-/// Wait for enter on the controlling terminal, with echo left as it is.
-///
-/// For acknowledgements rather than secrets -- anything typed before the newline is read and
-/// discarded.
-pub fn read_ack(prompt: &str) -> Result<()> {
-    let mut tty = tty()?;
-
-    tty.write_all(prompt.as_bytes())?;
-    tty.flush()?;
-
-    let mut byte = [0u8; 1];
-    loop {
-        if tty.read(&mut byte)? == 0 {
-            bail!("Terminal closed before the prompt was acknowledged");
-        }
-        if byte[0] == b'\n' || byte[0] == b'\r' {
-            return Ok(());
-        }
-    }
 }

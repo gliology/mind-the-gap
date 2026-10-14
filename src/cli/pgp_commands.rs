@@ -57,9 +57,10 @@ pub(super) enum PGPCommand {
 
         /// Touch policy per key, as `<key>=<policy>`
         ///
-        /// Keys are signing, decryption and authentication; policies are off, on, fixed,
-        /// cached and cached-fixed. The fixed variants lock the setting until the key is
-        /// replaced. Example: --touch signing=on,decryption=cached
+        /// Keys are signing, decryption and authentication; policies are never, always,
+        /// always-fixed, cached and cached-fixed, as for PIV.
+        /// The fixed variants lock the setting until the key is replaced.
+        /// Example: --touch signing=always,decryption=cached
         #[arg(long, value_name = "KEY=POLICY", value_delimiter = ',', value_parser = parse_touch)]
         touch: Vec<(pgp::SubkeyRole, pgp::TouchPolicyArg)>,
 
@@ -141,8 +142,10 @@ pub(super) enum PGPCommand {
         #[arg(short, long)]
         output: Option<PathBuf>,
 
-        /// What the revocation covers
-        #[arg(short = 't', long, value_enum, default_value_t)]
+        /// What the revocation covers: `subkeys` retires this card's keys, `certificate` the
+        /// whole identity and every card with it
+        // Required on purpose: the one choice here that cannot be taken back has no default
+        #[arg(short = 't', long, value_enum)]
         kind: pgp::RevocationKind,
 
         /// Revocation reason: 0 unspecified, 1 superseded, 2 compromised, 3 retired
@@ -180,7 +183,7 @@ fn parse_touch(s: &str) -> Result<(pgp::SubkeyRole, pgp::TouchPolicyArg), String
 
     let (key, policy) = s
         .split_once('=')
-        .ok_or_else(|| format!("'{s}' is not <key>=<policy>, e.g. signing=on"))?;
+        .ok_or_else(|| format!("'{s}' is not <key>=<policy>, e.g. signing=always"))?;
 
     Ok((pgp::SubkeyRole::from_str(key, true)?, pgp::TouchPolicyArg::from_str(policy, true)?))
 }
@@ -196,20 +199,21 @@ fn parse_lang(s: &str) -> Result<[u8; 2], String> {
 /// The options every `pgp` subcommand shares, given before the subcommand or after it
 #[derive(clap::Args, Clone, Default)]
 pub(super) struct PGPOptions {
-    /// Creation date of the primary key
-    #[arg(short, long, value_name = "YYYY-MM-DD", global = true, env = "MIND_THE_DATE", value_parser = parse_date)]
+    /// Creation date of the primary key (the unix epoch by default, so re-runs match)
+    #[arg(help_heading = "Certificate", short, long, value_name = "YYYY-MM-DD", global = true, env = "MIND_THE_DATE", value_parser = parse_date)]
     pub(super) date: Option<DateTime<Utc>>,
 
-    /// Creation date of the subkeys
-    #[arg(long, value_name = "YYYY-MM-DD", global = true, env = "MIND_THE_SUBDATE", value_parser = parse_date)]
+    /// Creation date of the subkeys (the primary's by default)
+    #[arg(help_heading = "Certificate", long, value_name = "YYYY-MM-DD", global = true, env = "MIND_THE_PGP_SUBDATE", value_parser = parse_date)]
     pub(super) subdate: Option<DateTime<Utc>>,
 
-    /// Validity duration of the subkeys
-    #[arg(short, long, value_name = "DURATION", global = true, env = "MIND_THE_VALIDITY", value_parser = parse_duration)]
+    /// Validity duration of the subkeys, e.g. 2y or 18months (unlimited by default)
+    #[arg(help_heading = "Certificate", short, long, value_name = "DURATION", global = true, env = "MIND_THE_VALIDITY", value_parser = parse_duration)]
     pub(super) validity: Option<Duration>,
 
     /// Subkeys to derive without the subkey id, so every card gets the same one
     #[arg(
+        help_heading = "Derivation",
         long,
         value_name = "KEYS",
         value_delimiter = ',',
@@ -219,11 +223,17 @@ pub(super) struct PGPOptions {
     pub(super) shared: Vec<pgp::SharedKey>,
 
     /// Use the original derivation labels, for cards provisioned before the scheme changed
-    #[arg(long, global = true, env = "MIND_THE_LEGACY")]
+    #[arg(help_heading = "Derivation", long, global = true, env = "MIND_THE_PGP_LEGACY")]
     pub(super) legacy: bool,
 
     /// Algorithm to derive every key with (Curve25519 by default; p384 is PIV-only)
-    #[arg(long, value_enum, global = true, env = "MIND_THE_ALGORITHM")]
+    #[arg(
+        help_heading = "Derivation",
+        long,
+        value_enum,
+        global = true,
+        env = "MIND_THE_ALGORITHM"
+    )]
     pub(super) algorithm: Option<Algorithm>,
 }
 

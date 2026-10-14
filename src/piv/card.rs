@@ -315,7 +315,7 @@ impl SeededSmartcard {
         if self.management_algorithm == ManagementKeyArg::Aes256 && version < FIRST_AES_MANAGEMENT {
             bail!(
                 "YubiKey firmware {firmware} takes 3DES management keys only (AES from 5.4); \
-                 use --management-key auto or tdes. The card was not touched"
+                 use --management-algorithm auto or tdes. The card was not touched"
             );
         }
         let cached = SlotRole::ALL

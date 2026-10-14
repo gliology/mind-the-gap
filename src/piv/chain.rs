@@ -201,6 +201,38 @@ impl CertChain {
         })
     }
 
+    /// What a certificate of this chain is, for whoever has to pick one out of several
+    ///
+    /// The person slots share a subject, so a leaf is named by its slot rather than by it.
+    pub fn name_of(&self, cert: &X509Certificate) -> String {
+        if std::ptr::eq(cert, &self.root) {
+            return "root CA".into();
+        }
+        if self
+            .intermediate
+            .as_ref()
+            .is_some_and(|issuer| std::ptr::eq(cert, issuer))
+        {
+            return "issuing CA".into();
+        }
+        let Some((slot, _)) = self
+            .leaves
+            .iter()
+            .find(|(_, leaf)| std::ptr::eq(leaf, cert))
+        else {
+            return cert.tbs_certificate().subject().to_string();
+        };
+        let role = match slot {
+            SlotId::Authentication => "authentication",
+            SlotId::Signature => "signature",
+            SlotId::KeyManagement => "key management",
+            SlotId::CardAuthentication => "card authentication",
+            SlotId::Retired(_) => "retired key management",
+            _ => "other",
+        };
+        format!("{role} slot {:02X}", u8::from(*slot))
+    }
+
     /// Concatenated PEM encoding of the requested subset
     pub fn to_pem(&self, kind: CertificateKind) -> Result<String> {
         let mut out = String::new();

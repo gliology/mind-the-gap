@@ -18,7 +18,8 @@ use chrono::{DateTime, Utc};
 
 use clap::Subcommand;
 
-use der::Encode;
+use der::pem::LineEnding;
+use der::{Encode, EncodePem};
 use sha2::{Digest, Sha256};
 
 use zeroize::Zeroizing;
@@ -69,11 +70,11 @@ pub(super) enum PIVCommand {
         #[arg(short, long)]
         yes: bool,
 
-        /// Certificate chain output path
+        /// Write the provisioned chain, the authorities and every slot certificate, to this file
         #[arg(short, long)]
         output: Option<PathBuf>,
 
-        /// Show the root certificate as a QR code
+        /// Show the provisioned chain as QR codes, one certificate after another
         #[arg(short, long)]
         qr: bool,
     },
@@ -83,19 +84,20 @@ pub(super) enum PIVCommand {
 #[derive(clap::Args, Clone, Default)]
 pub(super) struct PIVOptions {
     /// Creation date of certificates (unix epoch by default)
-    #[arg(short, long, value_name = "YYYY-MM-DD", global = true, env = "MIND_THE_DATE", value_parser = parse_date)]
+    #[arg(help_heading = "Certificate", short, long, value_name = "YYYY-MM-DD", global = true, env = "MIND_THE_DATE", value_parser = parse_date)]
     pub(super) date: Option<DateTime<Utc>>,
 
-    /// Validity duration of the slot certificates (infinite by default)
-    #[arg(short, long, value_name = "DURATION", global = true, env = "MIND_THE_VALIDITY", value_parser = parse_duration)]
+    /// Validity duration of the slot certificates, e.g. 5y (unlimited by default)
+    #[arg(help_heading = "Certificate", short, long, value_name = "DURATION", global = true, env = "MIND_THE_VALIDITY", value_parser = parse_duration)]
     pub(super) validity: Option<Duration>,
 
     /// Insert an intermediate issuing CA between the root and the slot certificates
-    #[arg(long, global = true, env = "MIND_THE_INTERMEDIATE")]
+    #[arg(help_heading = "Certificate", long, global = true, env = "MIND_THE_PIV_INTERMEDIATE")]
     pub(super) intermediate: bool,
 
     /// Slots to derive without the subkey id, so every card gets the same key
     #[arg(
+        help_heading = "Derivation",
         long,
         value_name = "SLOTS",
         value_delimiter = ',',
@@ -105,43 +107,92 @@ pub(super) struct PIVOptions {
     pub(super) shared: Vec<piv::SharedSlot>,
 
     /// Superseded subkey ids whose key management key to archive, newest first
-    #[arg(long = "retire", value_name = "SUBKEY", global = true, env = "MIND_THE_RETIRE")]
+    #[arg(
+        help_heading = "Derivation",
+        long = "retire",
+        value_name = "SUBKEY",
+        global = true,
+        env = "MIND_THE_PIV_RETIRE"
+    )]
     pub(super) retired: Vec<String>,
 
     /// Organization (O) to include in all certificate subjects
-    #[arg(long, value_name = "ORG", global = true, env = "MIND_THE_ORG")]
+    #[arg(
+        help_heading = "Certificate",
+        long,
+        value_name = "ORG",
+        global = true,
+        env = "MIND_THE_PIV_ORG"
+    )]
     pub(super) org: Option<String>,
 
     /// Organizational unit (OU) to include in all certificate subjects
-    #[arg(long, value_name = "UNIT", global = true, env = "MIND_THE_UNIT")]
+    #[arg(
+        help_heading = "Certificate",
+        long,
+        value_name = "UNIT",
+        global = true,
+        env = "MIND_THE_PIV_UNIT"
+    )]
     pub(super) unit: Option<String>,
 
     /// Two-letter ISO country code (C) to include in all certificate subjects
-    #[arg(long, value_name = "CC", global = true, env = "MIND_THE_COUNTRY")]
+    #[arg(
+        help_heading = "Certificate",
+        long,
+        value_name = "CC",
+        global = true,
+        env = "MIND_THE_PIV_COUNTRY"
+    )]
     pub(super) country: Option<String>,
 
     /// Override the per-slot pin policy (ignored for the card authentication slot)
-    #[arg(long, value_enum, global = true, env = "MIND_THE_PIN_POLICY")]
+    #[arg(help_heading = "Card", long, value_enum, global = true, env = "MIND_THE_PIV_PIN_POLICY")]
     pub(super) pin_policy: Option<piv::PinPolicyArg>,
 
     /// Override the per-slot touch policy (ignored for the card authentication slot)
-    #[arg(long, value_enum, global = true, env = "MIND_THE_TOUCH_POLICY")]
+    #[arg(
+        help_heading = "Card",
+        long,
+        value_enum,
+        global = true,
+        env = "MIND_THE_PIV_TOUCH_POLICY"
+    )]
     pub(super) touch_policy: Option<piv::TouchPolicyArg>,
 
     /// Do not store the certificate authorities in the card's msroots object
-    #[arg(long, global = true, env = "MIND_THE_NO_MSROOTS")]
+    #[arg(help_heading = "Card", long, global = true, env = "MIND_THE_PIV_NO_MSROOTS")]
     pub(super) no_msroots: bool,
 
     /// Algorithm to derive every key with, authorities included (P-256 by default)
-    #[arg(long, value_enum, global = true, env = "MIND_THE_ALGORITHM")]
+    #[arg(
+        help_heading = "Derivation",
+        long,
+        value_enum,
+        global = true,
+        env = "MIND_THE_ALGORITHM"
+    )]
     pub(super) algorithm: Option<Algorithm>,
 
     /// Algorithm of the management key upload installs (auto picks by firmware)
-    #[arg(long, value_enum, global = true, env = "MIND_THE_PIV_MANAGEMENT_KEY")]
+    #[arg(
+        help_heading = "Card",
+        long = "management-algorithm",
+        value_name = "ALGORITHM",
+        value_enum,
+        global = true,
+        env = "MIND_THE_PIV_MANAGEMENT_ALGORITHM"
+    )]
     pub(super) management_key: Option<piv::ManagementKeyArg>,
 
     /// Whether management access demands a touch after upload (always by default)
-    #[arg(long, value_enum, global = true, env = "MIND_THE_PIV_MANAGEMENT_KEY_TOUCH")]
+    #[arg(
+        help_heading = "Card",
+        long,
+        value_enum,
+        global = true,
+        env = "MIND_THE_PIV_MANAGEMENT_KEY_TOUCH"
+    )]
     pub(super) management_key_touch: Option<piv::ManagementTouchArg>,
 }
 
@@ -270,33 +321,19 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
             let chain = builder.certify(kind)?;
             let selected = chain.select(kind)?;
 
-            // The person slots share a subject, so a leaf is named by its slot
             for cert in selected.iter() {
-                let slot = chain
-                    .leaves
-                    .iter()
-                    .find(|(_, leaf)| std::ptr::eq(leaf, *cert));
-                let name = match slot {
-                    Some((slot, _)) => format!("{slot:?} slot"),
-                    None => cert.tbs_certificate().subject().to_string(),
-                };
+                let name = chain.name_of(cert);
                 log::info!("{name}: SHA-256 {:x}", Sha256::digest(cert.to_der()?));
             }
 
-            let encoded = chain.to_pem(kind)?;
-            if let Some(path) = output {
-                log::info!("Saving certificates to file: {}", path.display());
-                fs::write(path, encoded.as_bytes())?;
-            } else if selected.len() == 1 {
-                qr::show_qr(encoded.as_bytes(), false)?;
-            } else {
-                bail!(
-                    "Refusing to render {} certificates as a QR code, use --output or --kind root",
-                    selected.len()
-                )
+            match output {
+                Some(path) => {
+                    log::info!("Saving certificates to file: {}", path.display());
+                    fs::write(path, chain.to_pem(kind)?.as_bytes())?;
+                    Ok(())
+                }
+                None => show_chain(&chain, kind),
             }
-
-            Ok(())
         }
         PIVCommand::Check { pin, card } => {
             // A chain derived without emails carries no SANs; against a card that was
@@ -359,10 +396,25 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
                 fs::write(path, chain.to_pem(piv::CertificateKind::Chain)?.as_bytes())?;
             }
             if show_qr {
-                qr::show_qr(chain.to_pem(piv::CertificateKind::Root)?.as_bytes(), false)?;
+                show_chain(&chain, piv::CertificateKind::Chain)?;
             }
 
             Ok(())
         }
     }
+}
+
+/// Show the selected certificates as QR codes, one per certificate and each named: the
+/// codes carry what `--output` would write, in pieces a code can hold
+fn show_chain(chain: &piv::CertChain, kind: piv::CertificateKind) -> Result<()> {
+    let pems = chain
+        .select(kind)?
+        .into_iter()
+        .map(|cert| Ok((chain.name_of(cert), cert.to_pem(LineEnding::default())?)))
+        .collect::<Result<Vec<_>>>()?;
+    let pages: Vec<_> = pems
+        .iter()
+        .map(|(name, pem)| qr::QrPage { title: Some(name.clone()), data: pem.as_bytes() })
+        .collect();
+    qr::show_qr_pages(&pages, false)
 }

@@ -82,6 +82,28 @@ pub(super) struct Stickies {
     pub(super) management_key_touch: Option<piv::ManagementTouchArg>,
 }
 
+/// What `unset` can forget: the subkey id and every default `set` stores, spelled like
+/// `set`'s own flags
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub(super) enum Setting {
+    Subkey,
+    Date,
+    Validity,
+    SharedPgp,
+    SharedPiv,
+    Legacy,
+    Intermediate,
+    NoMsroots,
+    Org,
+    Unit,
+    Country,
+    PinPolicy,
+    TouchPolicy,
+    Algorithm,
+    ManagementAlgorithm,
+    ManagementKeyTouch,
+}
+
 /// Per-command overrides of the session's non-secret identity fields
 #[derive(Default)]
 pub(super) struct Overrides {
@@ -287,15 +309,15 @@ pub(super) enum ReplCommand {
         #[arg(long, value_name = "SLOTS", value_delimiter = ',')]
         shared_piv: Vec<piv::SharedSlot>,
 
-        /// Default to the original derivation labels (cannot be unset; restart to clear)
+        /// Default to the original derivation labels (`unset legacy` clears it)
         #[arg(long)]
         legacy: bool,
 
-        /// Default to an intermediate issuing CA (cannot be unset; restart to clear)
+        /// Default to an intermediate issuing CA (`unset intermediate` clears it)
         #[arg(long)]
         intermediate: bool,
 
-        /// Default to skipping the msroots object (cannot be unset; restart to clear)
+        /// Default to skipping the msroots object (`unset no-msroots` clears it)
         #[arg(long)]
         no_msroots: bool,
 
@@ -324,12 +346,19 @@ pub(super) enum ReplCommand {
         algorithm: Option<Algorithm>,
 
         /// Default management key algorithm for PIV uploads
-        #[arg(long, value_enum)]
+        #[arg(long = "management-algorithm", value_enum)]
         management_key: Option<piv::ManagementKeyArg>,
 
         /// Default management key touch requirement for PIV uploads
         #[arg(long, value_enum)]
         management_key_touch: Option<piv::ManagementTouchArg>,
+    },
+
+    /// Forget session settings that `set` stored, back to the command line's defaults
+    Unset {
+        /// The settings to forget
+        #[arg(value_enum, required = true)]
+        settings: Vec<Setting>,
     },
 
     /// Reopen the one-time password question; the derived identifiers change with it
@@ -339,14 +368,13 @@ pub(super) enum ReplCommand {
     Version,
 
     /// Leave the session
-    #[command(alias = "quit")]
-    Exit,
+    Quit,
 }
 
 /// Whether the session loop keeps going after a line
 pub(super) enum Flow {
     Continue,
-    Exit,
+    Quit,
 }
 
 /// Tokens that would name a secret on a session line
@@ -375,7 +403,7 @@ pub(super) fn repl(mut session: Session) -> Result<()> {
     // sessions and tests see nothing but their own output
     if !io::stdin().is_terminal() {
         for line in io::stdin().lock().lines() {
-            if let Flow::Exit = handle_line(&mut session, &line?)? {
+            if let Flow::Quit = handle_line(&mut session, &line?)? {
                 break;
             }
         }
@@ -387,7 +415,7 @@ pub(super) fn repl(mut session: Session) -> Result<()> {
     println!("mind-the-gap interactive session");
     println!("The first command that needs the seed phrase asks for it on a hidden prompt;");
     println!("it is kept only in memory and gone on exit.");
-    println!("Commands match the command line; `help` lists them, `exit` or Ctrl-D leaves.");
+    println!("Commands match the command line; `help` lists them, `quit` or Ctrl-D leaves.");
 
     let mut editor: rustyline::Editor<(), MemHistory> = rustyline::Editor::with_history(
         Config::builder().auto_add_history(false).build(),
@@ -407,13 +435,13 @@ pub(super) fn repl(mut session: Session) -> Result<()> {
                 {
                     let _ = editor.add_history_entry(&line);
                 }
-                if let Flow::Exit = handle_line(&mut session, &line)? {
+                if let Flow::Quit = handle_line(&mut session, &line)? {
                     return Ok(());
                 }
             }
             // Ctrl-C abandons the current line, not the session
             Err(ReadlineError::Interrupted) => continue,
-            // Ctrl-D leaves like `exit`
+            // Ctrl-D leaves like `quit`
             Err(ReadlineError::Eof) => return Ok(()),
             Err(err) => return Err(err.into()),
         }
@@ -595,7 +623,10 @@ pub(super) fn handle_line(session: &mut Session, line: &str) -> Result<Flow> {
     // values to both levels.
     if matches!(
         line.command,
-        ReplCommand::Session | ReplCommand::Exit | ReplCommand::Backend(Backend::Generate)
+        ReplCommand::Session
+            | ReplCommand::Quit
+            | ReplCommand::Unset { .. }
+            | ReplCommand::Backend(Backend::Generate)
     ) && (overrides.subkey.is_some() || overrides.name.is_some() || !overrides.emails.is_empty())
     {
         log::error!(
@@ -605,7 +636,7 @@ pub(super) fn handle_line(session: &mut Session, line: &str) -> Result<Flow> {
     }
 
     let result = match line.command {
-        ReplCommand::Exit => return Ok(Flow::Exit),
+        ReplCommand::Quit => return Ok(Flow::Quit),
         ReplCommand::Session => {
             let show = |label: &str, value: Option<&str>| {
                 println!("  {label}: {}", value.unwrap_or("(not set)"));
@@ -733,6 +764,30 @@ pub(super) fn handle_line(session: &mut Session, line: &str) -> Result<Flow> {
             d.algorithm = algorithm.or(d.algorithm);
             d.management_key = management_key.or(d.management_key);
             d.management_key_touch = management_key_touch.or(d.management_key_touch);
+            Ok(())
+        }
+        ReplCommand::Unset { settings } => {
+            let d = &mut session.defaults;
+            for setting in settings {
+                match setting {
+                    Setting::Subkey => session.subkey = None,
+                    Setting::Date => d.date = None,
+                    Setting::Validity => d.validity = None,
+                    Setting::SharedPgp => d.shared_pgp.clear(),
+                    Setting::SharedPiv => d.shared_piv.clear(),
+                    Setting::Legacy => d.legacy = false,
+                    Setting::Intermediate => d.intermediate = false,
+                    Setting::NoMsroots => d.no_msroots = false,
+                    Setting::Org => d.org = None,
+                    Setting::Unit => d.unit = None,
+                    Setting::Country => d.country = None,
+                    Setting::PinPolicy => d.pin_policy = None,
+                    Setting::TouchPolicy => d.touch_policy = None,
+                    Setting::Algorithm => d.algorithm = None,
+                    Setting::ManagementAlgorithm => d.management_key = None,
+                    Setting::ManagementKeyTouch => d.management_key_touch = None,
+                }
+            }
             Ok(())
         }
         ReplCommand::Password => ask_password_again(session),

@@ -45,7 +45,7 @@ pub struct CLI {
     /// own. Use `generate` to mint one, or run without any subcommand for an
     /// interactive session, which asks for the phrase once and keeps it off the
     /// command line entirely.
-    #[arg(short, long, global = true, env = "MIND_THE_SEED")]
+    #[arg(help_heading = "Identity", short, long, global = true, env = "MIND_THE_SEED")]
     seed: Option<Zeroizing<String>>,
 
     /// Optional password to use in root entropy derivation
@@ -54,22 +54,29 @@ pub struct CLI {
     /// interactive session asks for it right after the seed phrase, with an empty
     /// answer meaning none, and lets the derived identifiers be compared against a
     /// known card before anything is written.
-    #[arg(short, long, global = true, env = "MIND_THE_PASSWORD")]
+    #[arg(help_heading = "Identity", short, long, global = true, env = "MIND_THE_PASSWORD")]
     password: Option<Zeroizing<String>>,
 
     /// Optional identifier to include in subkey derivation.
     ///
     /// Public by design, it ends up in every certificate, so it is deliberately not
     /// treated as a secret anywhere.
-    #[arg(short = 'k', long, global = true, env = "MIND_THE_SUBKEY")]
+    #[arg(help_heading = "Identity", short = 'k', long, global = true, env = "MIND_THE_SUBKEY")]
     subkey: Option<String>,
 
     /// Common name to use on certs or smartcards
-    #[arg(short, long, global = true, env = "MIND_THE_NAME")]
+    #[arg(help_heading = "Identity", short, long, global = true, env = "MIND_THE_NAME")]
     name: Option<String>,
 
-    /// Email addresses to use on certs or smartcards
-    #[arg(short = 'm', long, value_delimiter = ',', global = true, env = "MIND_THE_EMAILS")]
+    /// Email addresses to use on certs or smartcards, comma separated
+    #[arg(
+        help_heading = "Identity",
+        short = 'm',
+        long,
+        value_delimiter = ',',
+        global = true,
+        env = "MIND_THE_EMAILS"
+    )]
     emails: Vec<String>,
 
     /// Logging filter, like MIND_THE_LOG_LEVEL (the flag wins)

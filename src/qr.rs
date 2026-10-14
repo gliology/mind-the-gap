@@ -39,22 +39,60 @@ fn render(data: &[u8]) -> Result<Zeroizing<String>> {
 
 /// Display the data as a QR code that leaves no trace, dismissed with Esc
 ///
-/// On a terminal the code takes over the alternate screen and is gone from scrollback
-/// the moment it is dismissed. The kernel console has no alternate screen, so there the
-/// screen is cleared before and after instead; equivalent in effect, since modern
-/// kernels keep no console scrollback at all.
+/// A single page of [`show_qr_pages`]; see there for where the code goes.
+pub fn show_qr(data: &[u8], sensitive: bool) -> Result<()> {
+    show_qr_pages(&[QrPage { title: None, data }], sensitive)
+}
+
+/// One code of a sequence: what it carries, and the bytes
+pub struct QrPage<'a> {
+    /// Shown above the code, so that whoever scans a sequence knows which one is which
+    pub title: Option<String>,
+    /// The payload, at most what one code carries
+    pub data: &'a [u8],
+}
+
+/// Display one QR code after another, each leaving no trace, Enter for the next and Esc
+/// to leave
+///
+/// On a terminal the codes take over the alternate screen and are gone from scrollback the
+/// moment they are dismissed. The kernel console has no alternate screen, so there the
+/// screen is cleared before and after instead; equivalent in effect, since modern kernels
+/// keep no console scrollback at all.
 ///
 /// A sensitive payload never reaches stdout or scrollback: redirected output is refused
 /// instead of writing key material to a file that skips `write_sensitive`'s permissions,
-/// and a code larger than the screen waits on the alternate screen until it fits. Public
-/// payloads simply print in both cases.
-pub fn show_qr(data: &[u8], sensitive: bool) -> Result<()> {
+/// and codes larger than the screen wait on the alternate screen until they fit. Public
+/// payloads simply print in both cases, each under its title.
+pub fn show_qr_pages(pages: &[QrPage<'_>], sensitive: bool) -> Result<()> {
     // The largest QR code carries 2953 bytes; say so up front instead of letting the
     // encoder's raw error surface, and name the way out
-    if data.len() > 2953 {
-        bail!("{} bytes exceed what one QR code can carry (2953), use --output", data.len());
+    if let Some(page) = pages.iter().find(|page| page.data.len() > 2953) {
+        bail!("{} bytes exceed what one QR code can carry (2953), use --output", page.data.len());
     }
-    let image = render(data)?;
+    let images = pages
+        .iter()
+        .map(|page| render(page.data))
+        .collect::<Result<Vec<_>>>()?;
+    let titles: Vec<Option<String>> = pages
+        .iter()
+        .enumerate()
+        .map(|(index, page)| match (&page.title, pages.len()) {
+            (Some(title), 1) => Some(title.clone()),
+            (Some(title), count) => Some(format!("{} of {count}: {title}", index + 1)),
+            (None, 1) => None,
+            (None, count) => Some(format!("{} of {count}", index + 1)),
+        })
+        .collect();
+
+    let print = || {
+        for (title, image) in titles.iter().zip(&images) {
+            if let Some(title) = title {
+                println!("{title}");
+            }
+            println!("{}", **image);
+        }
+    };
 
     if !io::stdout().is_terminal() {
         if sensitive {
@@ -63,20 +101,26 @@ pub fn show_qr(data: &[u8], sensitive: bool) -> Result<()> {
                  use --output for a protected file or run on a terminal"
             );
         }
-        println!("{}", *image);
+        print();
         return Ok(());
     }
 
-    let height = image.lines().count() as u16;
-    let width = image
-        .lines()
+    // Every page gets the same box, the largest code plus a title row and a hint row
+    let height = images
+        .iter()
+        .map(|image| image.lines().count())
+        .max()
+        .unwrap_or(0) as u16;
+    let width = images
+        .iter()
+        .flat_map(|image| image.lines())
         .map(|line| line.chars().count())
         .max()
         .unwrap_or(0) as u16;
+    let rows_needed = height + 2;
     let (cols, rows) = terminal::size()?;
-    // One extra row for the dismissal hint
-    if !sensitive && (width > cols || height + 1 > rows) {
-        println!("{}", *image);
+    if !sensitive && (width > cols || rows_needed > rows) {
+        print();
         log::warn!(
             "QR code larger than the screen; reduce the terminal font size \
              (often Ctrl+Minus, Ctrl+Alt+Minus on the console) to fit it on one screen"
@@ -85,39 +129,52 @@ pub fn show_qr(data: &[u8], sensitive: bool) -> Result<()> {
     }
 
     let mut screen = Screen::enter()?;
-    // A secret never leaves the alternate screen: until the code fits, the screen says how
+    // A secret never leaves the alternate screen: until the codes fit, the screen says how
     // to make room and waits for the terminal to grow
     let (cols, rows) = loop {
         let (cols, rows) = terminal::size()?;
-        if width <= cols && height < rows {
+        if width <= cols && rows_needed <= rows {
             break (cols, rows);
         }
         screen.wipe()?;
         write!(
             screen.tty,
-            "The code needs {width}x{} cells, the terminal has {cols}x{rows}.\r\n\
+            "The code needs {width}x{rows_needed} cells, the terminal has {cols}x{rows}.\r\n\
              Reduce the font size (often Ctrl+Minus, Ctrl+Alt+Minus on the console) \
-             and it appears.\r\nEsc cancels.",
-            height + 1
+             and it appears.\r\nEsc cancels."
         )?;
         screen.tty.flush()?;
         if pressed_within(&mut screen.tty.0, 250)? {
             bail!("QR code cancelled before it fit the screen; use --output for a protected file");
         }
     };
-    screen.wipe()?;
 
-    let top = (rows - height) / 2;
+    let top = (rows - rows_needed) / 2;
     let left = (cols - width) / 2;
-    for (i, line) in image.lines().enumerate() {
-        execute!(screen.tty, cursor::MoveTo(left, top + i as u16))?;
-        screen.tty.write_all(line.as_bytes())?;
-    }
-    execute!(screen.tty, cursor::MoveTo(left, top + height))?;
-    write!(screen.tty, "\x1b[2m[Esc to dismiss]\x1b[0m")?;
-    screen.tty.flush()?;
+    for (index, (title, image)) in titles.iter().zip(&images).enumerate() {
+        screen.wipe()?;
+        if let Some(title) = title {
+            execute!(screen.tty, cursor::MoveTo(left, top))?;
+            write!(screen.tty, "\x1b[1m{title}\x1b[0m")?;
+        }
+        for (i, line) in image.lines().enumerate() {
+            execute!(screen.tty, cursor::MoveTo(left, top + 1 + i as u16))?;
+            screen.tty.write_all(line.as_bytes())?;
+        }
+        let last = index + 1 == images.len();
+        let hint = if last {
+            "[Esc to dismiss]"
+        } else {
+            "[Enter for the next, Esc to dismiss]"
+        };
+        execute!(screen.tty, cursor::MoveTo(left, top + 1 + height))?;
+        write!(screen.tty, "\x1b[2m{hint}\x1b[0m")?;
+        screen.tty.flush()?;
 
-    wait_for_escape(&mut screen.tty.0)?;
+        if let Key::Dismiss = next_key(&mut screen.tty.0)? {
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -192,22 +249,31 @@ impl Drop for Screen {
     }
 }
 
-/// Block until a lone Esc (or Enter, q, or Ctrl-C) is pressed
+/// What a keypress asks of a sequence of codes
+enum Key {
+    /// Enter or space: the next code, or done after the last
+    Next,
+    /// Esc, q or Ctrl-C: leave
+    Dismiss,
+}
+
+/// Block until a key that moves on: Enter or space, or a lone Esc, q or Ctrl-C
 ///
-/// Arrow and function keys also start with the Esc byte; what distinguishes a bare Esc
-/// is silence afterwards. A short poll after each Esc byte settles it, and the rest of
-/// a sequence is drained so it cannot leak into the next prompt as stray input. Raw
-/// mode delivers Ctrl-C as a plain byte, so it dismisses too instead of killing the
-/// process with the secret still on screen.
-fn wait_for_escape(tty: &mut File) -> Result<()> {
+/// Arrow and function keys also start with the Esc byte; what distinguishes a bare Esc is
+/// silence afterwards. A short poll after each Esc byte settles it, and the rest of a
+/// sequence is drained so it cannot leak into the next prompt as stray input. Raw mode
+/// delivers Ctrl-C as a plain byte, so it dismisses too instead of killing the process with
+/// the secret still on screen.
+fn next_key(tty: &mut File) -> Result<Key> {
     let mut byte = [0u8; 1];
     loop {
         tty.read_exact(&mut byte)?;
         match byte[0] {
-            b'q' | b'\r' | b'\n' | 0x03 => return Ok(()),
+            b'\r' | b'\n' | b' ' => return Ok(Key::Next),
+            b'q' | 0x03 => return Ok(Key::Dismiss),
             0x1b => {
                 if !readable_within(tty, 50)? {
-                    return Ok(());
+                    return Ok(Key::Dismiss);
                 }
                 // An escape sequence: drain it (and anything queued behind it)
                 while readable_within(tty, 5)? {

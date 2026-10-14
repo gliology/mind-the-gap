@@ -307,7 +307,7 @@ fn provision_and_verify(subject: SeededSmartcard) {
         .configure(
             Some(ident.clone()),
             CardSettings {
-                touch: vec![(SubkeyRole::Authentication, TouchPolicyArg::On)],
+                touch: vec![(SubkeyRole::Authentication, TouchPolicyArg::Always)],
                 lang: vec![*b"en", *b"de"],
                 url: Some("https://example.com/alice.asc".to_string()),
                 login: Some("alice".to_string()),
