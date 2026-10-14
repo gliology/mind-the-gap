@@ -3,8 +3,10 @@
 use std::str::FromStr;
 
 use super::{
-    CertChain, ManagementKeyArg, SeededSmartcard, keys::NAME_CCC_ID, keys::NAME_CHUID_ID,
-    slots::DEFAULT_KEY_SLOTS,
+    CertChain, ManagementKeyArg, SeededSmartcard, SlotRole,
+    keys::NAME_CCC_ID,
+    keys::NAME_CHUID_ID,
+    slots::{FIRST_RETIRED_SLOT, LAST_RETIRED_SLOT},
 };
 use crate::common;
 use crate::seed::{Algorithm, Seed256Derive};
@@ -113,7 +115,7 @@ pub fn status() -> Result<()> {
         ]
         .into_iter()
         .chain(
-            (0x82..=0x95)
+            (FIRST_RETIRED_SLOT..=LAST_RETIRED_SLOT)
                 .filter_map(|byte| RetiredSlotId::try_from(byte).ok().map(SlotId::Retired)),
         );
 
@@ -124,7 +126,6 @@ pub fn status() -> Result<()> {
                 Err(_) => continue,
             };
 
-            // Fingerprint is SHA256 hash of certificate
             match cert.cert.to_der() {
                 Ok(der) => {
                     println!(
@@ -317,9 +318,9 @@ impl SeededSmartcard {
                  use --management-key auto or tdes. The card was not touched"
             );
         }
-        let cached = DEFAULT_KEY_SLOTS
+        let cached = SlotRole::ALL
             .iter()
-            .any(|(slot, ..)| self.policies_for(*slot).1 == TouchPolicy::Cached);
+            .any(|role| self.policies_for(role.slot()).1 == TouchPolicy::Cached);
         if cached && version < FIRST_CACHED_TOUCH {
             bail!(
                 "YubiKey firmware {firmware} has no cached touch policy (4.3 and later have); \
@@ -414,13 +415,12 @@ impl SeededSmartcard {
         }
         token.authenticate(&mgmt_key)?;
 
-        // Update pin
         if let Some(pin) = &self.pin {
-            token.change_pin(b"123456", pin.as_bytes())?;
+            token.change_pin(common::FACTORY_USER_PIN.as_bytes(), pin.as_bytes())?;
             token.verify_pin(pin.as_bytes())?;
         } else {
             // Warned about once at the command layer; here it only needs verifying
-            token.verify_pin(b"123456")?;
+            token.verify_pin(common::FACTORY_USER_PIN.as_bytes())?;
         }
 
         // Disable puk. Blocked by a bounded loop of our own first: `block_puk` retries any

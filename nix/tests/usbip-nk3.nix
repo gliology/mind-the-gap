@@ -11,6 +11,7 @@
   pkgs,
   nk3-usbip,
   piv-suite,
+  pgp-suite,
   ...
 }:
 
@@ -31,6 +32,7 @@
       environment.systemPackages = [
         pkgs.mind-the-gap
         piv-suite
+        pgp-suite
         pkgs.usbutils
         config.boot.kernelPackages.usbip
       ];
@@ -92,15 +94,25 @@
     machine.succeed(f"mind-the-gap {identity} piv check --pin 471120 {card}")
     machine.fail(f"mind-the-gap {identity} -k other piv check --pin 471120 {card}")
 
-    # The card-level half of the destructive suite: the card signs in 9A, 9C and 9E and
-    # agrees in 9D, each result compared with the same computation off the card
-    machine.succeed(
-        "MTG_HARDWARE_TEST_SERIAL=1592614637 piv-suite --ignored --exact "
-        "provision_and_verify_p256_card --nocapture > /tmp/suite.log 2>&1"
-    )
-    machine.succeed("grep -q 'test result: ok. 1 passed' /tmp/suite.log")
+    # The card-level half of the destructive suite on every algorithm: the card signs in
+    # 9A, 9C and 9E and agrees or decrypts in 9D, each result compared with the same
+    # computation off the card
+    for algorithm in ["p256", "p384", "curve25519", "rsa2048", "rsa3072", "rsa4096"]:
+        machine.succeed(
+            "MTG_HARDWARE_TEST_SERIAL=1592614637 piv-suite --ignored --exact "
+            f"provision_and_verify_{algorithm}_card --nocapture > /tmp/suite.log 2>&1 "
+            "|| { cat /tmp/suite.log; exit 1; }"
+        )
+        machine.succeed("grep -q 'test result: ok. 1 passed' /tmp/suite.log")
 
-    # OpenPGP on the same key, as in virtual-pgp: provisioned with the factory pins
+    # OpenPGP on a fresh key, as in virtual-pgp: provisioned with the factory pins. The PIV
+    # runs above leave four RSA-4096 keys behind, and the simulated flash, kept in RAM, is
+    # too small for OpenPGP's three on top; a restart of the runner empties it
+    machine.succeed("usbip detach -p 00")
+    machine.systemctl("restart nk3-usbip.service")
+    machine.wait_for_open_port(3240)
+    machine.wait_until_succeeds("usbip attach -r 127.0.0.1 -b 1-1", timeout=60)
+    machine.wait_until_succeeds("lsusb -d 20a0:42b2", timeout=60)
     machine.wait_until_succeeds(
         "mind-the-gap pgp status > /tmp/pgp-status && grep -q 'Card 000F:5EED5EED' /tmp/pgp-status",
         timeout=60,
@@ -111,5 +123,14 @@
     machine.succeed("grep -q 'BEGIN PGP PUBLIC KEY BLOCK' /tmp/cert.asc")
     machine.succeed(f"mind-the-gap {identity} pgp check {card}")
     machine.fail(f"mind-the-gap {identity} -k other pgp check {card}")
+
+    # Then the OpenPGP suite on every algorithm, as in virtual-pgp: provisioning, the card
+    # read back independently, every key at work on the card
+    machine.succeed(
+        "MTG_HARDWARE_TEST_CARD=000F:5EED5EED pgp-suite --exact "
+        "provision_and_verify_card provision_and_verify_p256_card provision_and_verify_rsa_cards "
+        "--nocapture > /tmp/pgp-suite.log 2>&1 || { cat /tmp/pgp-suite.log; exit 1; }"
+    )
+    machine.succeed("grep -q 'test result: ok. 3 passed' /tmp/pgp-suite.log")
   '';
 }

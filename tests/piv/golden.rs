@@ -11,6 +11,70 @@ use std::time::{Duration, SystemTime};
 
 use yubikey::piv::SlotId;
 
+/// The P-256 vectors, the algorithm a card gets when none is chosen
+const P256: [(Option<&str>, [Pinned; 5]); 2] = [
+    (
+        None,
+        [
+            (
+                "ab8c5adc194c66ed2163f08d4606a753133005840f5e5448f602a0af93bd6cf4",
+                "861b8296ec2ebe1cb370b18db1e0ade1bc55b4eeb7f117aee85e7260be782c08",
+                "CN=Alice PIV Root CA",
+            ),
+            (
+                "c55a30e8647a8912b07ba6f76d6abb6fcb4efad9dfaa0f7d691320d64c11d6ea",
+                "15c3cd1d34a5be9499f195b6f0a6daa0455b28f15f419335e0bc67a0a8a07c0f",
+                "CN=Alice",
+            ),
+            (
+                "ec7e41c73cd76ec8b7283332a0202a775dbf616096d05d18732ff0a211dfc0b1",
+                "f97b5ee9339aa13a79ff5fe962261c0e6fcff9760d5c96a0043410eb554c8de6",
+                "CN=Alice",
+            ),
+            (
+                "db4389e005f73edf3cfa500c81c9e28683c4beae122192c2ee21ebaedf2fdd00",
+                "6e764fe53fc1c906afc7cf2c215d9c07355fd7d84bdf6600ce91d993f54e38e4",
+                "CN=Alice",
+            ),
+            (
+                "93d0d7b044eb08ad6f62a20668e1f17b0838dc918c472a9cd7020d223f3970c3",
+                "5c2d5504506e5eafec3a6e1d86d6623ccbaca96f6e1d51ab3b89d3204d0c986b",
+                "CN=PIV Card mtg1:5D168619",
+            ),
+        ],
+    ),
+    (
+        Some("laptop"),
+        [
+            (
+                "ab8c5adc194c66ed2163f08d4606a753133005840f5e5448f602a0af93bd6cf4",
+                "861b8296ec2ebe1cb370b18db1e0ade1bc55b4eeb7f117aee85e7260be782c08",
+                "CN=Alice PIV Root CA",
+            ),
+            (
+                "5f22bc03848271a3b6e524b9e327eaceef0ae31b379ffa4bb3511bb3f189eda7",
+                "d004f480344e9ea8d889cffd004158c1027ba2def6d116a3c08fa6a291d594d1",
+                "CN=Alice,DNQUALIFIER=mtg1:laptop",
+            ),
+            (
+                "555ad0a77ef68e4eb556d49551d0a948685077c64956d61fc5bda926c7a751ab",
+                "2765c5a08e03db99b74fb7b82fbefbd564e54083bf669f36529e254c9b2cdf37",
+                "CN=Alice,DNQUALIFIER=mtg1:laptop",
+            ),
+            (
+                "e274fd327152f629470240f968efc8a42fe133a1b6816a920a03aedf422e0cd3",
+                "fbd4b7ffc16fb0622bdad2d2478976148346d3655cdadcb26ee5c9514b3abe2a",
+                "CN=Alice,DNQUALIFIER=mtg1:laptop",
+            ),
+            (
+                "d8498196b0d80ec125cc48549465624b0eb9d15f2f35c9d98cedbf434a124036",
+                "36f92866b4769436a85e775eeccf50c7f3b187756c92aac6dc75771e2614bd5e",
+                "CN=PIV Card mtg1:95BCA3CF",
+            ),
+        ],
+    ),
+];
+
 /// The current `mtg1` scheme is frozen.
 ///
 /// The 1.x versioning promise is that any release re-derives the very same keys -- and,
@@ -24,71 +88,19 @@ use yubikey::piv::SlotId;
 /// behind a new major.
 #[test]
 fn current_scheme_is_frozen() {
-    assert_current_scheme_frozen(
-        Algorithm::P256,
-        [
-            (
-                None,
-                [
-                    (
-                        "ab8c5adc194c66ed2163f08d4606a753133005840f5e5448f602a0af93bd6cf4",
-                        "861b8296ec2ebe1cb370b18db1e0ade1bc55b4eeb7f117aee85e7260be782c08",
-                        "CN=Alice PIV Root CA",
-                    ),
-                    (
-                        "c55a30e8647a8912b07ba6f76d6abb6fcb4efad9dfaa0f7d691320d64c11d6ea",
-                        "15c3cd1d34a5be9499f195b6f0a6daa0455b28f15f419335e0bc67a0a8a07c0f",
-                        "CN=Alice",
-                    ),
-                    (
-                        "ec7e41c73cd76ec8b7283332a0202a775dbf616096d05d18732ff0a211dfc0b1",
-                        "f97b5ee9339aa13a79ff5fe962261c0e6fcff9760d5c96a0043410eb554c8de6",
-                        "CN=Alice",
-                    ),
-                    (
-                        "db4389e005f73edf3cfa500c81c9e28683c4beae122192c2ee21ebaedf2fdd00",
-                        "6e764fe53fc1c906afc7cf2c215d9c07355fd7d84bdf6600ce91d993f54e38e4",
-                        "CN=Alice",
-                    ),
-                    (
-                        "93d0d7b044eb08ad6f62a20668e1f17b0838dc918c472a9cd7020d223f3970c3",
-                        "5c2d5504506e5eafec3a6e1d86d6623ccbaca96f6e1d51ab3b89d3204d0c986b",
-                        "CN=PIV Card mtg1:5D168619",
-                    ),
-                ],
-            ),
-            (
-                Some("laptop"),
-                [
-                    (
-                        "ab8c5adc194c66ed2163f08d4606a753133005840f5e5448f602a0af93bd6cf4",
-                        "861b8296ec2ebe1cb370b18db1e0ade1bc55b4eeb7f117aee85e7260be782c08",
-                        "CN=Alice PIV Root CA",
-                    ),
-                    (
-                        "5f22bc03848271a3b6e524b9e327eaceef0ae31b379ffa4bb3511bb3f189eda7",
-                        "d004f480344e9ea8d889cffd004158c1027ba2def6d116a3c08fa6a291d594d1",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "555ad0a77ef68e4eb556d49551d0a948685077c64956d61fc5bda926c7a751ab",
-                        "2765c5a08e03db99b74fb7b82fbefbd564e54083bf669f36529e254c9b2cdf37",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "e274fd327152f629470240f968efc8a42fe133a1b6816a920a03aedf422e0cd3",
-                        "fbd4b7ffc16fb0622bdad2d2478976148346d3655cdadcb26ee5c9514b3abe2a",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "d8498196b0d80ec125cc48549465624b0eb9d15f2f35c9d98cedbf434a124036",
-                        "36f92866b4769436a85e775eeccf50c7f3b187756c92aac6dc75771e2614bd5e",
-                        "CN=PIV Card mtg1:95BCA3CF",
-                    ),
-                ],
-            ),
-        ],
-    );
+    assert_current_scheme_frozen(Algorithm::P256, P256);
+}
+
+/// What a card gets when nothing is chosen is frozen with the rest.
+///
+/// The default algorithm decides every key and the default creation time lands in every
+/// certificate's validity, so a drifting default would fail `check` on every card
+/// provisioned without `--algorithm` or `--date` while each vector above, which sets both,
+/// kept passing. Built with neither set; this also keeps `certify` without `--date` byte
+/// reproducible, which it once was not, when the validity was anchored at the current time.
+#[test]
+fn defaults_are_frozen() {
+    assert_frozen(&P256, |id| SeededSmartcard::new(&SEED_A, id, "Alice".into()));
 }
 
 /// The Curve25519 half of the same promise: `--algorithm curve25519` is part of `mtg1` and
@@ -453,32 +465,51 @@ type Pinned = (&'static str, &'static str, &'static str);
 /// Assert that `algorithm` still derives exactly `vectors`: for each subkey id, the pins for
 /// the root and the four slots
 fn assert_current_scheme_frozen(algorithm: Algorithm, vectors: [(Option<&str>, [Pinned; 5]); 2]) {
+    assert_frozen(&vectors, |id| {
+        SeededSmartcard::new(&SEED_A, id, "Alice".into())
+            .with_algorithm(algorithm)
+            .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+    });
+}
+
+/// Assert that the chain `build` makes for each subkey id is still exactly `vectors`: the
+/// root first, then the issuing authority if there is one, then the slots in chain order
+fn assert_frozen<const N: usize>(
+    vectors: &[(Option<&str>, [Pinned; N])],
+    build: impl Fn(Option<String>) -> SeededSmartcard,
+) {
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
     for (id, expected) in vectors {
-        let chain = SeededSmartcard::new(&SEED_A, id.map(|v| v.to_string()), "Alice".into())
-            .with_algorithm(algorithm)
+        let chain = build(id.map(|v| v.to_string()))
             .add_email("alice@example.com")
             .unwrap()
-            .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
             .certify(CertificateKind::Chain)
             .unwrap();
 
-        let mut certs = vec![(&chain.root, "root")];
+        let mut certs = vec![(&chain.root, "root".to_string())];
+        certs.extend(
+            chain
+                .intermediate
+                .iter()
+                .map(|cert| (cert, "intermediate".into())),
+        );
         certs.extend(chain.leaves.iter().map(|(slot, cert)| {
             (
                 cert,
                 match slot {
-                    SlotId::Authentication => "9A",
-                    SlotId::Signature => "9C",
-                    SlotId::KeyManagement => "9D",
-                    SlotId::CardAuthentication => "9E",
+                    SlotId::Authentication => "9A".into(),
+                    SlotId::Signature => "9C".into(),
+                    SlotId::KeyManagement => "9D".into(),
+                    SlotId::CardAuthentication => "9E".into(),
+                    SlotId::Retired(retired) => format!("{:02X}", u8::from(*retired)),
                     other => panic!("unexpected slot {other:?}"),
                 },
             )
         }));
+        assert_eq!(certs.len(), N, "chain for {id:?} has the wrong number of certificates");
 
         for ((cert, slot), (spki, der, subject)) in certs.into_iter().zip(expected) {
             let got_spki = hex(&digest_bytes(
@@ -487,15 +518,15 @@ fn assert_current_scheme_frozen(algorithm: Algorithm, vectors: [(Option<&str>, [
                     .to_der()
                     .unwrap(),
             ));
-            assert_eq!(got_spki, spki, "{slot} KEY moved for {id:?} -- derivation broke");
+            assert_eq!(got_spki, *spki, "{slot} KEY moved for {id:?} -- derivation broke");
             assert_eq!(
                 hex(&digest(cert)),
-                der,
+                *der,
                 "{slot} certificate encoding moved for {id:?} -- check will fail on provisioned cards"
             );
             assert_eq!(
                 cert.tbs_certificate().subject().to_string(),
-                subject,
+                *subject,
                 "{slot} subject moved for {id:?}"
             );
         }
@@ -505,4 +536,63 @@ fn assert_current_scheme_frozen(algorithm: Algorithm, vectors: [(Option<&str>, [
         use sha2::{Digest, Sha256};
         Sha256::digest(der).to_vec()
     }
+}
+
+/// The optional parts of the chain are frozen too: the issuing authority `--intermediate`
+/// inserts, and the retired slot `--retire` archives an earlier generation's key in.
+///
+/// Both derive under labels of their own and change the chain around them -- the root's
+/// path length, every slot's issuer -- so the vectors above, which have neither, cannot
+/// see them move. Pinned on a card rotated to a second generation with the first archived,
+/// which is what `--retire` is for.
+#[test]
+fn intermediate_and_retired_slots_are_frozen() {
+    assert_frozen(
+        &[(
+            Some("gen1"),
+            [
+                (
+                    "ab8c5adc194c66ed2163f08d4606a753133005840f5e5448f602a0af93bd6cf4",
+                    "22d22fdc1b76a2ebfa9cdd57c82338eecab77898fdb24907aa15673a0909b7dc",
+                    "CN=Alice PIV Root CA",
+                ),
+                (
+                    "05f3dc628b1954524442d52f21fe505606eba6cb7c366b889b9be3e76208926c",
+                    "226793b19b61501d3597579280a07ae9af5ff1f891e5eff27b1e72e7b4c6e26a",
+                    "CN=Alice PIV Issuing CA gen1",
+                ),
+                (
+                    "ec4c228b0c390cb5743e494dccfb5a62743dc8ef8ebfb56e1fafd1821272ff14",
+                    "279b428985c8b7b451195cbb796434f05dbd50e74944240848d12dd73d8e1bf2",
+                    "CN=Alice,DNQUALIFIER=mtg1:gen1",
+                ),
+                (
+                    "42d11ccd87019c6d4862c267de60e237dd262545bff54be34f6d8282fbe54552",
+                    "98884c39d1c89e0ddcc0414ef8880515d9766495d558daf73af3cfbfe0904e79",
+                    "CN=Alice,DNQUALIFIER=mtg1:gen1",
+                ),
+                (
+                    "954e710c5ca02fde70b55055bc81f1607bcef455478fb4839e0190a5719589be",
+                    "9457466acc3e5ef5443ffa122722a99c1571779334d189252fe87a1511161be8",
+                    "CN=Alice,DNQUALIFIER=mtg1:gen1",
+                ),
+                (
+                    "424bdabce072ff74040aeea71b481480e8ed409bad9be8b26a8f8323e0b13660",
+                    "57253413dd091b15ac8c604a78065dc5068a1ca984c5dea361839f0983ac54f0",
+                    "CN=PIV Card mtg1:D4713663",
+                ),
+                (
+                    "cf27b43e8cf40709f836b7806333df9d166b130b764795f54b71d27ed6fdf90f",
+                    "d32527a33a2c748c2d341cdfadda7ab5efd09f6cab9109dc63429ec0bdf62b1e",
+                    "CN=Alice,DNQUALIFIER=mtg1:gen0",
+                ),
+            ],
+        )],
+        |id| {
+            SeededSmartcard::new(&SEED_A, id, "Alice".into())
+                .with_intermediate(true)
+                .with_retired(vec!["gen0".into()])
+                .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+        },
+    );
 }

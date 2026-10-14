@@ -22,7 +22,8 @@ build = "build.rs"
 #
 #     MTG_HARDWARE_TEST_SERIAL=<serial> cargo test --features destructive-hardware-tests --test piv_hardware
 #
-# Use a spare card. See docs/piv-hardware-tests.md.
+# The OpenPGP suite names its card by ident instead (MTG_HARDWARE_TEST_CARD=<ident>,
+# --test pgp_hardware). Use a spare card. See docs/piv-hardware-tests.md.
 destructive-hardware-tests = []
 
 # Safety interlock -- never enable this by hand.
@@ -36,23 +37,28 @@ no-destructive-hardware-tests = []
 [dependencies]
 # Command line interface
 clap = { version = "4.3", features = [ "derive", "cargo", "env" ]}
+# Shell completions and the man page, written by the mind-the-build binary at package time
 clap_complete = "4.4"
 clap_mangen = "0.3"
 
+# Logging: the facade the library and the card stacks log through, and its backend behind
+# the wrapper in src/main.rs that keeps card traffic out of the log
 log = "0.4"
 env_logger = "0.11"
 
 # Error handling
 anyhow = "1.0"
 
-# To parse dates and times
-chrono = "0.4"
+# To parse dates and times. Default features off: nothing reads the clock or the local
+# time zone (creation times are fixed or given), so `clock` and its tz tree stay out.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 humantime = "2.1"
 
 # Clear sensitive data
 zeroize = "1.1"
 
-# Restore default SIGPIPE handling, so piping into `head` does not panic
+# Process hardening in src/main.rs: default SIGPIPE handling, no core dumps, no ptrace,
+# memory locked against swap
 libc = "0.2"
 
 # No-echo terminal prompt for the seed phrase and password, see src/prompt.rs
@@ -76,8 +82,9 @@ crossterm = { version = "0.29", default-features = false }
 # already in crossterm's tree, used directly for its safe poll wrapper
 rustix = { version = "1", features = ["event"] }
 
-# OS entropy for minting seeds and sampling the transcription quiz; the lowest-level
-# interface to the kernel CSPRNG, and a version already shared with the card stacks
+# OS entropy for minting seeds, sampling the transcription quiz and the nonce of the PIV
+# signature challenge; the lowest-level interface to the kernel CSPRNG, and a version
+# already shared with the card stacks
 getrandom = "0.4"
 
 # Mnemonic handling. Default features off: the `rand` feature would pull a second,
@@ -94,6 +101,7 @@ tiny-bip39 = { version = "2.0", default-features = false }
 # flows through `hash_password_into` alone. `zeroize` wipes the 64 MiB of block memory and
 # the hashes every derivation leaves behind, from which its output could be recomputed.
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+# Pins and passwords are derived bytes in base64 (src/seed.rs), part of the same scheme
 base64 = "0.22"
 
 # RSA keys from a derived seed (src/rsa.rs). The stream the primes are read from, its
@@ -114,10 +122,14 @@ qrcode = { version = "0.14", default-features = false }
 #
 # Pinned by revision rather than by tag: a tag can be force-moved and `cargo update` would
 # follow it, and this fork's two-commit patch set is load-bearing for reproducibility (see
-# the security model in the README). The revision is tag openpgp/v2.2.0-mtg0.
-sequoia-openpgp = { version = "2", git = "https://gitlab.com/gli.al/sequoia.git", rev = "8ea683342764b6dedbf86e8d106d026266412e4d" }
+# the security model in docs/introduction.md). The revision is tag openpgp/v2.2.0-mtg0.
+# No `version` on purpose: a crates.io build would silently swap in stock sequoia, which
+# salts its signatures, so publishing has to fail instead. Default features off: the
+# compression algorithms are unused, nothing here compresses or reads compressed packets.
+sequoia-openpgp = { git = "https://gitlab.com/gli.al/sequoia.git", rev = "8ea683342764b6dedbf86e8d106d026266412e4d", default-features = false, features = ["crypto-nettle"] }
 openpgp-card = "0.7"
 card-backend-pcsc = "0.5"
+# openpgp-card takes pins as `SecretString`
 secrecy = "0.10"
 
 # Yubikey PIV module. 0.9.0-rc.0 is the first release whose transmit loops GET RESPONSE on
@@ -128,6 +140,7 @@ yubikey = "0.9.0-rc.0"
 # Time::INFINITY. They currently also arrive via yubikey's own dependency, but relying on
 # feature unification would break on a yubikey patch release.
 x509-cert = { version = "0.3", features = [ "builder", "hazmat", "pem" ]}
+# The chain's DER encoding, its OIDs and key usage flags, and the SPKIs that `check` compares
 der = { version = "0.8", features = [ "oid", "alloc", "flagset" ]}
 spki = { version = "0.8", features = [ "fingerprint", "alloc" ]}
 # Degenerate PKCS#7 (certs-only SignedData) for the YubiKey msroots object; still a
@@ -191,6 +204,6 @@ p384 = { version = "0.14", features = [ "ecdh" ] }
 # Until yubikey.rs releases its pending PRs: Yubico-compatible cards that are not
 # YubiKeys (#680, a Nitrokey 3 reports 6.6.6), the installed management key algorithm
 # (#681), Ed25519 certificates (#683) and RSA-4096 import. A revision of the fork's
-# mind-the-gap branch, upstream main plus those PRs from the generator in
-# ~/Gli.al/upstreaming/stacks; pinned by revision, see the sequoia note above.
+# mind-the-gap branch, upstream main plus those PRs, one commit each, rebuilt by the
+# maintainer's stack generator; pinned by revision, see the sequoia note above.
 yubikey = { git = "https://github.com/FlorianFranzen/yubikey.rs", rev = "143135395bc29b6cfe4f478ad29258b555af732a" }

@@ -32,8 +32,6 @@ allow = [
     "LGPL-3.0-or-later",
     "LGPL-3.0-only",
     "Unicode-3.0",
-    # Weird exceptions
-    "bzip2-1.0.6",
 ]
 
 [bans]
@@ -48,9 +46,10 @@ unknown-git = "deny"
 # Use official crate registry
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
-# yubikey.rs's pending PRs (the fork's mind-the-gap branch), until they are released
-allow-git = [ "https://github.com/FlorianFranzen/yubikey.rs" ]
-
-[sources.allow-org]
-# Allow use of custom forks
-gitlab = [ "gli.al" ]
+# One repository each, not whole organisations: a new git dependency has to be named here
+allow-git = [
+    # The sequoia fork without per-signature salts, see Cargo.toml
+    "https://gitlab.com/gli.al/sequoia.git",
+    # yubikey.rs's pending PRs (the fork's mind-the-gap branch), until they are released
+    "https://github.com/FlorianFranzen/yubikey.rs",
+]

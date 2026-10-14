@@ -3,7 +3,7 @@
 //! Secret-bearing arguments are `Zeroizing<String>`. A one-shot invocation takes them
 //! from flags or `MIND_THE_...` variables and fails when the seed is missing; only the
 //! interactive session prompts, once, so a script can never hang on a hidden prompt.
-//! The handlers wire the seed layer to the [`pgp`] and [`piv`] builders.
+//! The handlers wire the seed layer to the [`pgp`](crate::pgp) and [`piv`](crate::piv) builders.
 
 mod generate;
 mod pgp_commands;
@@ -17,18 +17,16 @@ use session::{Overrides, ReplLine, Session, Stickies, repl};
 
 use crate::common;
 use crate::mnemonic::MnemonicSeed;
-use crate::pgp;
-use crate::piv;
+use crate::prompt;
 use crate::seed::Algorithm;
 
-use std::time::Duration;
-
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::{fs, io};
 
-use anyhow::{Result, anyhow, bail};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use humantime::parse_duration;
 
-use chrono::{DateTime, Utc};
+use anyhow::{Result, anyhow, bail};
 
 use clap::{Command, CommandFactory, Parser, Subcommand};
 
@@ -101,102 +99,16 @@ enum Backend {
 
     /// Generate and export PGP keys and certs
     PGP {
-        /// Creation date of the primary key
-        #[arg(short, long, value_name = "YYYY-MM-DD", global = true, env = "MIND_THE_DATE", value_parser = common::parse_date)]
-        date: Option<DateTime<Utc>>,
-
-        /// Creation date of the subkeys
-        #[arg(long, value_name = "YYYY-MM-DD", global = true, env = "MIND_THE_SUBDATE", value_parser = common::parse_date)]
-        subdate: Option<DateTime<Utc>>,
-
-        /// Validity duration of the subkeys
-        #[arg(short, long, value_name = "DURATION", global = true, env = "MIND_THE_VALIDITY", value_parser = common::parse_duration)]
-        validity: Option<Duration>,
-
-        /// Subkeys to derive without the subkey id, so every card gets the same one
-        #[arg(
-            long,
-            value_name = "KEYS",
-            value_delimiter = ',',
-            global = true,
-            env = "MIND_THE_PGP_SHARED"
-        )]
-        shared: Vec<pgp::SharedKey>,
-
-        /// Use the original derivation labels, for cards provisioned before the scheme changed
-        #[arg(long, global = true, env = "MIND_THE_LEGACY")]
-        legacy: bool,
-
-        /// Algorithm to derive every key with (Curve25519 by default; p384 is PIV-only)
-        #[arg(long, value_enum, global = true, env = "MIND_THE_ALGORITHM")]
-        algorithm: Option<Algorithm>,
+        #[command(flatten)]
+        options: PGPOptions,
 
         #[command(subcommand)]
         command: PGPCommand,
     },
     /// Generate and export PIV keys and certs
     PIV {
-        /// Creation date of certificates (unix epoch by default)
-        #[arg(short, long, value_name = "YYYY-MM-DD", global = true, env = "MIND_THE_DATE", value_parser = common::parse_date)]
-        date: Option<DateTime<Utc>>,
-
-        /// Validity duration of the slot certificates (infinite by default)
-        #[arg(short, long, value_name = "DURATION", global = true, env = "MIND_THE_VALIDITY", value_parser = common::parse_duration)]
-        validity: Option<Duration>,
-
-        /// Insert an intermediate issuing CA between the root and the slot certificates
-        #[arg(long, global = true, env = "MIND_THE_INTERMEDIATE")]
-        intermediate: bool,
-
-        /// Slots to derive without the subkey id, so every card gets the same key
-        #[arg(
-            long,
-            value_name = "SLOTS",
-            value_delimiter = ',',
-            global = true,
-            env = "MIND_THE_PIV_SHARED"
-        )]
-        shared: Vec<piv::SharedSlot>,
-
-        /// Superseded subkey ids whose key management key to archive, newest first
-        #[arg(long = "retire", value_name = "SUBKEY", global = true, env = "MIND_THE_RETIRE")]
-        retired: Vec<String>,
-
-        /// Organization (O) to include in all certificate subjects
-        #[arg(long, value_name = "ORG", global = true, env = "MIND_THE_ORG")]
-        org: Option<String>,
-
-        /// Organizational unit (OU) to include in all certificate subjects
-        #[arg(long, value_name = "UNIT", global = true, env = "MIND_THE_UNIT")]
-        unit: Option<String>,
-
-        /// Two-letter ISO country code (C) to include in all certificate subjects
-        #[arg(long, value_name = "CC", global = true, env = "MIND_THE_COUNTRY")]
-        country: Option<String>,
-
-        /// Override the per-slot pin policy (ignored for the card authentication slot)
-        #[arg(long, value_enum, global = true, env = "MIND_THE_PIN_POLICY")]
-        pin_policy: Option<piv::PinPolicyArg>,
-
-        /// Override the per-slot touch policy (ignored for the card authentication slot)
-        #[arg(long, value_enum, global = true, env = "MIND_THE_TOUCH_POLICY")]
-        touch_policy: Option<piv::TouchPolicyArg>,
-
-        /// Do not store the certificate authorities in the card's msroots object
-        #[arg(long, global = true, env = "MIND_THE_NO_MSROOTS")]
-        no_msroots: bool,
-
-        /// Algorithm to derive every key with, authorities included (P-256 by default)
-        #[arg(long, value_enum, global = true, env = "MIND_THE_ALGORITHM")]
-        algorithm: Option<Algorithm>,
-
-        /// Algorithm of the management key upload installs (auto picks by firmware)
-        #[arg(long, value_enum, global = true, env = "MIND_THE_PIV_MANAGEMENT_KEY")]
-        management_key: Option<piv::ManagementKeyArg>,
-
-        /// Whether management access demands a touch after upload (always by default)
-        #[arg(long, value_enum, global = true, env = "MIND_THE_PIV_MANAGEMENT_KEY_TOUCH")]
-        management_key_touch: Option<piv::ManagementTouchArg>,
+        #[command(flatten)]
+        options: PIVOptions,
 
         #[command(subcommand)]
         command: PIVCommand,
@@ -260,35 +172,10 @@ fn confirm(application: &str, card: &str) -> Result<()> {
 /// is nobody to ask and --yes is the way to say it in advance.
 fn confirm_destruction(warning: &str) -> Result<()> {
     eprintln!("{warning}");
-
-    let stdin_is_tty = io::stdin().is_terminal();
-    let mut tty_in = if stdin_is_tty {
-        None
-    } else {
-        Some(std::io::BufReader::new(
-            fs::File::open("/dev/tty")
-                .map_err(|_| anyhow!("Refusing to continue without confirmation, use --yes"))?,
-        ))
-    };
-
-    // "yes" proceeds, "no" aborts, and anything else asks again: a typo should cost one
-    // more keystroke, not the whole invocation.
-    loop {
-        eprint!("Continue? [yes/no] ");
-
-        let mut input = String::new();
-        let read = match tty_in.as_mut() {
-            Some(reader) => std::io::BufRead::read_line(reader, &mut input)?,
-            None => io::stdin().read_line(&mut input)?,
-        };
-        if read == 0 {
-            bail!("Refusing to continue without confirmation, use --yes")
-        }
-        match input.trim() {
-            "yes" => return Ok(()),
-            "no" => bail!("Aborted, the card was not touched"),
-            _ => continue,
-        }
+    match prompt::confirm("Continue?") {
+        Ok(true) => Ok(()),
+        Ok(false) => bail!("Aborted, nothing was changed"),
+        Err(_) => bail!("Refusing to continue without confirmation, use --yes"),
     }
 }
 
@@ -346,49 +233,8 @@ fn dispatch(backend: Backend, identity: Identity) -> Result<()> {
         // The seed generation ceremony needs no other input; the one-shot path drops the
         // minted seed, which lives on paper now, while the session path adopts it
         Backend::Generate => generate(false).map(|_| ()),
-        // ... then command
-        Backend::PGP { date, subdate, validity, shared, legacy, algorithm, command } => run_pgp(
-            identity,
-            PGPOptions { date, subdate, validity, shared, legacy, algorithm },
-            command,
-        ),
-        // ... then command
-        Backend::PIV {
-            date,
-            validity,
-            intermediate,
-            shared,
-            retired,
-            org,
-            unit,
-            country,
-            pin_policy,
-            touch_policy,
-            no_msroots,
-            algorithm,
-            management_key,
-            management_key_touch,
-            command,
-        } => run_piv(
-            identity,
-            PIVOptions {
-                date,
-                validity,
-                intermediate,
-                shared,
-                retired,
-                org,
-                unit,
-                country,
-                pin_policy,
-                touch_policy,
-                no_msroots,
-                algorithm,
-                management_key,
-                management_key_touch,
-            },
-            command,
-        ),
+        Backend::PGP { options, command } => run_pgp(identity, options, command),
+        Backend::PIV { options, command } => run_piv(identity, options, command),
     }
 }
 
@@ -426,4 +272,27 @@ fn spelled<T: clap::ValueEnum>(value: &T) -> String {
 /// The command-line spelling of a list of values, as the flag takes it
 fn spelled_all<T: clap::ValueEnum>(values: &[T]) -> String {
     values.iter().map(spelled).collect::<Vec<_>>().join(",")
+}
+
+/// Parse a `--date`: midnight UTC of the given day
+///
+/// The date is read as midnight UTC, never local time: derivation inputs must not depend
+/// on the timezone of the machine they are typed on.
+fn parse_date(input: &str) -> Result<DateTime<Utc>> {
+    NaiveDate::parse_from_str(input, "%Y-%m-%d")
+        .map_err(|e| anyhow!(e))
+        .map(|date| Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).expect("Static valid values")))
+}
+
+/// Warn when a provisioned card keeps the well-known factory user pin
+///
+/// A warning rather than a refusal: scripts stay in charge of their own flags, and the
+/// interactive session asks for the pin before this is reached.
+fn warn_factory_pin(missing: bool) {
+    if missing {
+        log::warn!(
+            "No pin supplied: the card keeps the factory user pin ({}), usable by anyone who finds it; pass --pin to set one",
+            common::FACTORY_USER_PIN
+        );
+    }
 }

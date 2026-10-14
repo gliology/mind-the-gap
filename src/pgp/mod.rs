@@ -33,7 +33,7 @@ mod card;
 mod import;
 mod keys;
 
-pub use card::{DEFAULT_KEY_TYPES, status};
+pub use card::status;
 
 /// Why `--algorithm p384` stops at the OpenPGP backend
 ///
@@ -180,17 +180,6 @@ pub struct CardSettings {
     pub login: Option<String>,
     /// Whether one pin entry signs once or for the whole session
     pub sign_pin: Option<SignPinValidity>,
-}
-
-impl CardSettings {
-    /// Whether anything at all was asked for
-    pub fn is_empty(&self) -> bool {
-        self.touch.is_empty()
-            && self.lang.is_empty()
-            && self.url.is_none()
-            && self.login.is_none()
-            && self.sign_pin.is_none()
-    }
 }
 
 impl SubkeyRole {
@@ -440,11 +429,7 @@ impl SeededSmartcard {
     pub fn certify(&self, kind: CertificateKind) -> Result<Cert> {
         use CertificateKind::*;
 
-        let mut cert = if kind == Primary || kind == Full {
-            self.generate_signed_primary()?
-        } else {
-            self.generate_primary()?
-        };
+        let mut cert = self.primary_cert(kind == Primary || kind == Full)?;
 
         if kind == Generic || kind == Uids || kind == Full {
             cert = self.append_uids(cert)?;
@@ -461,7 +446,6 @@ impl SeededSmartcard {
     pub fn trust(&self, other: Cert, kind: VerificationKind) -> Result<Cert> {
         use VerificationKind::*;
 
-        // Match signature type to user input
         let kind = match kind {
             Generic => SignatureType::GenericCertification,
             Persona => SignatureType::PersonaCertification,
@@ -477,7 +461,7 @@ impl SeededSmartcard {
 
     /// Export all secret keys
     pub fn export(&self) -> Result<Cert> {
-        let mut cert = self.generate_primary()?;
+        let mut cert = self.primary_cert(false)?;
 
         cert = self.append_uids(cert)?;
         self.append_subkeys(cert)
@@ -492,7 +476,7 @@ impl SeededSmartcard {
     pub fn revoke(&self, kind: RevocationKind, code: u8, reason: &str) -> Result<Vec<u8>> {
         match kind {
             RevocationKind::Certificate => {
-                let mut cert = self.generate_primary()?;
+                let mut cert = self.primary_cert(false)?;
                 let revocation = self.generate_revcert(&mut cert, code, reason)?;
 
                 Ok(revocation.to_vec()?)

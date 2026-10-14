@@ -8,7 +8,7 @@
 //! meaning "none" where the secret is optional.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -43,17 +43,37 @@ pub fn read_optional_secret(prompt: &str) -> Result<Option<Zeroizing<String>>> {
 /// the terminal, and reading from `/dev/tty` keeps a piped session's script lines
 /// from being consumed as answers.
 pub fn read_public(prompt: &str) -> Result<String> {
-    use std::io::{BufRead, BufReader, Write};
-    let mut out = tty()?;
+    let mut out = tty().context("No terminal to prompt on, pass the value another way")?;
+    let mut input = BufReader::new(out.try_clone()?);
     write!(out, "{prompt}")?;
     out.flush()?;
-    let tty_in = std::fs::File::open("/dev/tty")
-        .context("No terminal to prompt on, pass the value another way")?;
     let mut line = String::new();
-    if BufReader::new(tty_in).read_line(&mut line)? == 0 {
+    if input.read_line(&mut line)? == 0 {
         bail!("Terminal closed before the prompt was answered");
     }
     Ok(line.trim().to_string())
+}
+
+/// Ask a yes or no question on the controlling terminal, until it is answered
+///
+/// "yes" and "no" answer, anything else asks again: a typo should cost one more line, not
+/// the whole invocation. Never read from stdin, so piped input cannot consent for the user.
+pub fn confirm(question: &str) -> Result<bool> {
+    let mut out = tty()?;
+    let mut input = BufReader::new(out.try_clone()?);
+    loop {
+        write!(out, "{question} [yes/no] ")?;
+        out.flush()?;
+        let mut line = String::new();
+        if input.read_line(&mut line)? == 0 {
+            bail!("Terminal closed before the question was answered");
+        }
+        match line.trim() {
+            "yes" => return Ok(true),
+            "no" => return Ok(false),
+            _ => continue,
+        }
+    }
 }
 
 /// The controlling terminal itself, for ceremony output.

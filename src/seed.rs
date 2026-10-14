@@ -38,10 +38,8 @@ pub fn argon2id_256(input: &[u8], salt: Option<&[u8]>) -> Zeroizing<Seed256> {
     // and part of the frozen mtg1 scheme (see above)
     let params = Params::new(64 * 1024, 3, 1, None).unwrap();
 
-    // Prepare salt value
     let salt = &[DERIVATION_CONTEXT, salt.unwrap_or(b"")].concat();
 
-    // Use latest hybrid variant
     let mut hash = Zeroizing::new([0u8; 32]);
     Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params)
         .hash_password_into(input, salt, hash.as_mut())

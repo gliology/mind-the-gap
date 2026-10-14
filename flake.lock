@@ -39,15 +39,16 @@
     "nitrokey-3-firmware": {
       "flake": false,
       "locked": {
-        "lastModified": 1791896753,
-        "narHash": "sha256-MFPgznlcndP0IJa3x3O9gGX5NTth+9mf7KzkZtIG8jk=",
-        "owner": "Nitrokey",
+        "lastModified": 1791985681,
+        "narHash": "sha256-0y1R+6ZskMhQKa1w3lM9nXr0xUyso9xHsPorwL81u2A=",
+        "owner": "FlorianFranzen",
         "repo": "nitrokey-3-firmware",
-        "rev": "4160df2916efa7b5bcc4be9ea25a0445e22b57ba",
+        "rev": "f3419f975553f5537e39bf544b917c843138e07f",
         "type": "github"
       },
       "original": {
-        "owner": "Nitrokey",
+        "owner": "FlorianFranzen",
+        "ref": "mind-the-gap",
         "repo": "nitrokey-3-firmware",
         "type": "github"
       }

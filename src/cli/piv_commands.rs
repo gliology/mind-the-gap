@@ -1,7 +1,9 @@
 //! The `piv` subcommands and their handler.
 
-use super::{Identity, confirm, spelled, spelled_all, warn_if_phrase_is_weaker};
-use crate::common;
+use super::{
+    Identity, confirm, parse_date, parse_duration, spelled, spelled_all, warn_factory_pin,
+    warn_if_phrase_is_weaker,
+};
 use crate::piv;
 use crate::qr;
 use crate::seed::Algorithm;
@@ -77,21 +79,69 @@ pub(super) enum PIVCommand {
     },
 }
 
-/// The PIV backend's certificate options, as parsed
+/// The options every `piv` subcommand shares, given before the subcommand or after it
+#[derive(clap::Args, Clone, Default)]
 pub(super) struct PIVOptions {
+    /// Creation date of certificates (unix epoch by default)
+    #[arg(short, long, value_name = "YYYY-MM-DD", global = true, env = "MIND_THE_DATE", value_parser = parse_date)]
     pub(super) date: Option<DateTime<Utc>>,
+
+    /// Validity duration of the slot certificates (infinite by default)
+    #[arg(short, long, value_name = "DURATION", global = true, env = "MIND_THE_VALIDITY", value_parser = parse_duration)]
     pub(super) validity: Option<Duration>,
+
+    /// Insert an intermediate issuing CA between the root and the slot certificates
+    #[arg(long, global = true, env = "MIND_THE_INTERMEDIATE")]
     pub(super) intermediate: bool,
+
+    /// Slots to derive without the subkey id, so every card gets the same key
+    #[arg(
+        long,
+        value_name = "SLOTS",
+        value_delimiter = ',',
+        global = true,
+        env = "MIND_THE_PIV_SHARED"
+    )]
     pub(super) shared: Vec<piv::SharedSlot>,
+
+    /// Superseded subkey ids whose key management key to archive, newest first
+    #[arg(long = "retire", value_name = "SUBKEY", global = true, env = "MIND_THE_RETIRE")]
     pub(super) retired: Vec<String>,
+
+    /// Organization (O) to include in all certificate subjects
+    #[arg(long, value_name = "ORG", global = true, env = "MIND_THE_ORG")]
     pub(super) org: Option<String>,
+
+    /// Organizational unit (OU) to include in all certificate subjects
+    #[arg(long, value_name = "UNIT", global = true, env = "MIND_THE_UNIT")]
     pub(super) unit: Option<String>,
+
+    /// Two-letter ISO country code (C) to include in all certificate subjects
+    #[arg(long, value_name = "CC", global = true, env = "MIND_THE_COUNTRY")]
     pub(super) country: Option<String>,
+
+    /// Override the per-slot pin policy (ignored for the card authentication slot)
+    #[arg(long, value_enum, global = true, env = "MIND_THE_PIN_POLICY")]
     pub(super) pin_policy: Option<piv::PinPolicyArg>,
+
+    /// Override the per-slot touch policy (ignored for the card authentication slot)
+    #[arg(long, value_enum, global = true, env = "MIND_THE_TOUCH_POLICY")]
     pub(super) touch_policy: Option<piv::TouchPolicyArg>,
+
+    /// Do not store the certificate authorities in the card's msroots object
+    #[arg(long, global = true, env = "MIND_THE_NO_MSROOTS")]
     pub(super) no_msroots: bool,
+
+    /// Algorithm to derive every key with, authorities included (P-256 by default)
+    #[arg(long, value_enum, global = true, env = "MIND_THE_ALGORITHM")]
     pub(super) algorithm: Option<Algorithm>,
+
+    /// Algorithm of the management key upload installs (auto picks by firmware)
+    #[arg(long, value_enum, global = true, env = "MIND_THE_PIV_MANAGEMENT_KEY")]
     pub(super) management_key: Option<piv::ManagementKeyArg>,
+
+    /// Whether management access demands a touch after upload (always by default)
+    #[arg(long, value_enum, global = true, env = "MIND_THE_PIV_MANAGEMENT_KEY_TOUCH")]
     pub(super) management_key_touch: Option<piv::ManagementTouchArg>,
 }
 
@@ -122,7 +172,6 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
         let name = name
             .ok_or_else(|| anyhow!("Missing --name (or MIND_THE_NAME); in a session, `set` it"))?;
 
-        // Configure and run backend
         log::info!("Generating PIV certificates for '{}'", name);
         let seed = seed
             .as_ref()
@@ -217,10 +266,9 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
         PIVCommand::Certify { kind, output } => {
             let builder = builder()?;
 
-            // Generate the chain and report what it contains
             log::info!("Generating the PIV certificates: {}", spelled(&kind));
-            let chain = builder.certify(kind.clone())?;
-            let selected = chain.select(kind.clone())?;
+            let chain = builder.certify(kind)?;
+            let selected = chain.select(kind)?;
 
             // The person slots share a subject, so a leaf is named by its slot
             for cert in selected.iter() {
@@ -235,7 +283,6 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
                 log::info!("{name}: SHA-256 {:x}", Sha256::digest(cert.to_der()?));
             }
 
-            // Export certificates in PEM format
             let encoded = chain.to_pem(kind)?;
             if let Some(path) = output {
                 log::info!("Saving certificates to file: {}", path.display());
@@ -268,7 +315,6 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
                 builder = builder.with_pin(pin.clone());
             }
 
-            // Show info about target card
             if let Some(serial) = card.as_ref() {
                 log::info!("Checking keys on smartcard: {}", serial);
             }
@@ -276,7 +322,7 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
             builder.check(card)
         }
         PIVCommand::Upload { pin, card, yes, output, qr: show_qr } => {
-            common::warn_factory_pin(pin.is_none());
+            warn_factory_pin(pin.is_none());
 
             // Verify user inputs further. Counted in characters, not bytes: the card takes
             // up to 8 bytes, but a multi-byte character miscounted here would produce an
@@ -302,7 +348,6 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
                 confirm("PIV", &target)?;
             }
 
-            // Generate, upload and save result
             let chain = builder.upload(card)?;
             log::info!(
                 "Uploaded PIV certificate chain under '{}'",

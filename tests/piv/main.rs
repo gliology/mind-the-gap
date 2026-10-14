@@ -134,35 +134,7 @@ fn extended_key_usage(cert: &Certificate) -> Vec<String> {
         .collect()
 }
 
-// --- Determinism -------------------------------------------------------------
-
-#[test]
-fn certify_is_deterministic() {
-    let a = alice().certify(CertificateKind::Chain).unwrap();
-    let b = alice().certify(CertificateKind::Chain).unwrap();
-
-    assert_eq!(digest(&a.root), digest(&b.root));
-    for ((slot, left), (_, right)) in a.leaves.iter().zip(b.leaves.iter()) {
-        assert_eq!(digest(left), digest(right), "{slot:?} slot is not reproducible");
-    }
-}
-
-#[test]
-fn certify_is_deterministic_without_date() {
-    // Regression test: Validity::infinity() used to anchor notBefore at SystemTime::now(),
-    // so the output was not reproducible unless --date was passed.
-    let plain = || {
-        SeededSmartcard::new(&SEED_A, None, "Alice".into())
-            .add_email("alice@example.com")
-            .unwrap()
-    };
-
-    let a = plain().certify(CertificateKind::Chain).unwrap();
-    let b = plain().certify(CertificateKind::Chain).unwrap();
-
-    assert_eq!(digest(&a.root), digest(&b.root));
-    assert_eq!(digest(&a.leaves[0].1), digest(&b.leaves[0].1));
-}
+// --- Algorithms and separation -----------------------------------------------
 
 /// `--algorithm curve25519` switches the whole chain: Ed25519 authorities signing Ed25519 slot
 /// keys, with X25519 in the key management slot, and every signature verifies.

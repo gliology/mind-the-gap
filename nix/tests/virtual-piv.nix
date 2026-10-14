@@ -9,8 +9,8 @@
 # virtual platform grants automatically -- what stays uncovered is real readers and a
 # human finger.
 #
-# `algorithm` picks the chain the card is provisioned with: P-256, Curve25519 for the
-# Ed25519 (0xE0) and X25519 (0xE1) import, or RSA-2048 through the Yubico import layout.
+# `algorithm` picks the chain the card is provisioned with: P-256, P-384, Curve25519 for
+# the Ed25519 (0xE0) and X25519 (0xE1) import, or RSA-2048 through the Yubico import layout.
 # After the command line round trip the card-level half of the destructive hardware suite
 # runs against the same card, which is what proves the keys *work* -- `piv check` only
 # reads them back.
@@ -106,8 +106,12 @@
     )
     machine.succeed(f"mind-the-gap {identity} {piv} check --pin 471120 {card}")
 
-    # A wrong subkey id derives a different management key and chain, and must fail
-    machine.fail(f"mind-the-gap {identity} -k other {piv} check --pin 471120 {card}")
+    # A wrong subkey id derives a different management key and chain, and must fail. As
+    # often as the card has pin retries, and the right pin still opens it afterwards: a
+    # mistyped subkey id costs nothing on the card.
+    for _ in range(3):
+        machine.fail(f"mind-the-gap {identity} -k other {piv} check --pin 471120 {card}")
+    machine.succeed(f"mind-the-gap {identity} {piv} check --pin 471120 {card}")
 
     # The card-level half of the destructive suite, against the same card: it provisions
     # its own identity, then has the card sign in 9A, 9C and 9E under their pin policies

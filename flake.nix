@@ -22,17 +22,19 @@
 
     # The trussed PIV implementation (Nitrokey 3), run as the virtual card in the
     # virtual-piv checks and inside the simulated Nitrokey 3. The fork's mind-the-gap
-    # branch is trussed-dev's main plus every pending PR, rebuilt by the generator in
-    # ~/Gli.al/upstreaming/stacks; `nix flake update piv-authenticator` follows it
+    # branch is trussed-dev's main plus every pending PR, one commit each, rebuilt by the
+    # maintainer's stack generator; `nix flake update piv-authenticator` follows it
     piv-authenticator = {
       url = "github:FlorianFranzen/piv-authenticator/mind-the-gap";
       flake = false;
     };
 
     # Nitrokey's firmware, built as its USB/IP runner for the usbip-nk3 check: a whole
-    # Nitrokey 3 as a host process, attached as a USB device; not a flake either
+    # Nitrokey 3 as a host process, attached as a USB device; not a flake either. The fork's
+    # mind-the-gap branch is Nitrokey's main plus the P-384 mechanism for PIV, one commit,
+    # rebuilt by the maintainer's stack generator like the piv-authenticator input
     nitrokey-3-firmware = {
-      url = "github:Nitrokey/nitrokey-3-firmware";
+      url = "github:FlorianFranzen/nitrokey-3-firmware/mind-the-gap";
       flake = false;
     };
 
@@ -132,11 +134,11 @@
         }
       );
 
-      # Shells used for development
       # `nix fmt`: nixfmt over the whole tree, through the treefmt wrapper nixpkgs ships
       # for exactly this, so it needs no file arguments
       formatter = forEachSystem (system: perSystem.${system}.pkgs.nixfmt-tree);
 
+      # Shells used for development
       devShells = forEachSystem (
         system: import ./nix/shells.nix { inherit (perSystem.${system}) pkgs toolchain; }
       );

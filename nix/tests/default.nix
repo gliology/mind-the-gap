@@ -30,10 +30,10 @@ let
     );
 
   virtualPivBuilder =
-    algorithm:
+    managementKey:
     vmTest (
       import ./virtual-piv-builder.nix {
-        inherit pkgs algorithm;
+        inherit pkgs managementKey;
         inherit (cards) piv-vpicc;
       }
     );
@@ -56,17 +56,22 @@ in
   virtual-piv = virtualPiv "p256";
   virtual-piv-curve25519 = virtualPiv "curve25519";
   virtual-piv-rsa2048 = virtualPiv "rsa2048";
+  virtual-piv-p384 = virtualPiv "p384";
+  virtual-piv-rsa3072 = virtualPiv "rsa3072";
+  virtual-piv-rsa4096 = virtualPiv "rsa4096";
 
   # The build server profile (docs/piv-build-server.md) on the same card: P-384, pin once,
   # touch never, management access without a touch, with the policies read back through
-  # yubikit. YubiKey 4 behaviour is covered on a real YubiKey 4, see docs/hardware-tests.md.
-  virtual-piv-builder = virtualPivBuilder "p384";
+  # yubikit. YubiKey 4 behaviour is covered on a real YubiKey 4, see docs/hardware-tests.md;
+  # its triple DES management key is forced onto the virtual card by the second variant.
+  virtual-piv-builder = virtualPivBuilder null;
+  virtual-piv-builder-tdes = virtualPivBuilder "tdes";
 
   # A whole simulated Nitrokey 3 attached over USB/IP: PIV and OpenPGP provisioned
   # through the kernel's USB stack, libccid and the firmware's own dispatcher
   usbip-nk3 = vmTest (
     import ./usbip-nk3.nix {
-      inherit pkgs piv-suite;
+      inherit pkgs piv-suite pgp-suite;
       inherit (cards) nk3-usbip;
     }
   );

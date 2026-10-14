@@ -8,6 +8,59 @@ use p256::{PublicKey, SecretKey};
 
 use x509_cert::Certificate;
 
+/// The OpenSC configuration every end-use tool runs under, once [`only_reader`] wrote it
+static OPENSC_CONF: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Hide every reader but the card's from OpenSC, for all the tools started below.
+///
+/// The PKCS#11 URIs name no token, and the test identity is the same on every card, so with
+/// a second PIV card attached the steps would run against whichever OpenSC lists first and
+/// could even pass there. OpenSC only offers a list of readers to ignore, so this lists all
+/// the others; a test host keeps several cards plugged in at once.
+pub(super) fn only_reader(dir: &std::path::Path, reader: &str) {
+    let mut context = yubikey::reader::Context::open().expect("cannot open a PC/SC context");
+    let others: Vec<String> = context
+        .iter()
+        .expect("cannot list PC/SC readers")
+        .map(|other| other.name().into_owned())
+        .filter(|other| other != reader)
+        .collect();
+    for other in &others {
+        // OpenSC matches substrings and has no quoting
+        assert!(
+            !reader.contains(other.as_str()) && !other.contains('"'),
+            "cannot hide reader {other:?} from OpenSC without hiding {reader:?} too"
+        );
+    }
+    let ignored = others
+        .iter()
+        .map(|other| format!("\"{other}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let conf = if others.is_empty() {
+        "app default {\n}\n".to_string()
+    } else {
+        format!("app default {{\n\tignored_readers = {ignored};\n}}\n")
+    };
+    let path = dir.join("opensc.conf");
+    std::fs::write(&path, conf).expect("cannot write opensc.conf");
+    OPENSC_CONF
+        .set(path)
+        .expect("the end-use steps run against one card per test run");
+}
+
+/// A command for an end-use tool, with OpenSC restricted to the card under test
+fn tool(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command.env(
+        "OPENSC_CONF",
+        OPENSC_CONF
+            .get()
+            .expect("only_reader runs before any end-use step"),
+    );
+    command
+}
+
 /// The OpenSC PKCS#11 module and OpenSSL's pkcs11 provider, exported by the dev shell.
 pub(super) fn pkcs11_paths() -> (String, String) {
     let module = std::env::var("PKCS11_MODULE")
@@ -71,7 +124,7 @@ pub(super) fn openssl_conf(
 
 /// Run openssl under the pkcs11-enabled config.
 fn openssl_pkcs11(conf: &std::path::Path, args: &[&str]) -> std::process::Output {
-    std::process::Command::new("openssl")
+    tool("openssl")
         .args(args)
         .env("OPENSSL_CONF", conf)
         .output()
@@ -86,7 +139,7 @@ fn openssl_pkcs11(conf: &std::path::Path, args: &[&str]) -> std::process::Output
 /// to be answered on stdin. 9A and 9D are `PIN once`, so their URI pin is enough.
 fn openssl_pkcs11_pin(conf: &std::path::Path, pin: &str, args: &[&str]) -> std::process::Output {
     use std::io::Write;
-    let mut child = std::process::Command::new("openssl")
+    let mut child = tool("openssl")
         .args(args)
         .env("OPENSSL_CONF", conf)
         .stdin(std::process::Stdio::piped())
@@ -112,12 +165,12 @@ pub(super) fn tls_client_authenticates(
     root: &std::path::Path,
     nine_a: &std::path::Path,
 ) {
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     // Self-signed server identity; the assertion is about the *client* certificate
     let server_key = dir.join("server.key");
     let server_cert = dir.join("server.pem");
-    let generated = Command::new("openssl")
+    let generated = tool("openssl")
         .args([
             "req",
             "-x509",
@@ -134,7 +187,7 @@ pub(super) fn tls_client_authenticates(
     assert!(generated.status.success(), "cannot mint a server certificate");
 
     let port = 14000 + (std::process::id() % 2000);
-    let mut server = Command::new("openssl")
+    let mut server = tool("openssl")
         // -www, not interactive: an interactive s_server multiplexes its own stdin into
         // the accept loop and never completes the handshake when stdin is not a tty (as
         // here), so it must serve a page and move on instead. -4 because it otherwise
@@ -264,8 +317,6 @@ pub(super) fn smime_signs(
     root: &std::path::Path,
     nine_c: &std::path::Path,
 ) {
-    use std::process::Command;
-
     let message = dir.join("msg.txt");
     std::fs::write(&message, b"mind the gap\n").unwrap();
     let signed = dir.join("msg.p7s");
@@ -290,7 +341,7 @@ pub(super) fn smime_signs(
     );
     assert!(sign.status.success(), "9C signing failed:\n{}", String::from_utf8_lossy(&sign.stderr),);
 
-    let verify = Command::new("openssl")
+    let verify = tool("openssl")
         .args(["cms", "-verify", "-in", signed.to_str().unwrap()])
         .args(["-CAfile", root.to_str().unwrap()])
         // See the TLS step: the epoch-derived fixture certs are "expired" in real time
@@ -313,7 +364,7 @@ pub(super) fn smime_signs(
     //
     //   let enveloped = dir.join("msg.p7m");
     //   let recovered = dir.join("msg.out");
-    //   let encrypt = Command::new("openssl")
+    //   let encrypt = tool("openssl")
     //       .args(["cms", "-encrypt", "-aes256"])
     //       .args(["-in", message.to_str().unwrap()])
     //       .args(["-out", enveloped.to_str().unwrap()])
@@ -354,7 +405,7 @@ pub(super) fn key_agreement_through_pkcs11(
     std::fs::write(&peer_spki, peer_public.to_public_key_der().unwrap().as_bytes()).unwrap();
 
     let derived = dir.join("p11.secret");
-    let out = std::process::Command::new("pkcs11-tool")
+    let out = tool("pkcs11-tool")
         .args(["--module", module, "--login", "--pin", TEST_PIN])
         .args(["--derive", "--id", "03", "--mechanism", "ECDH1-DERIVE"])
         .args(["--input-file", peer_spki.to_str().unwrap()])
@@ -408,9 +459,9 @@ fn which(program: &str) -> Option<std::path::PathBuf> {
 /// `C_Sign failed: 257` (`CKR_USER_NOT_LOGGED_IN`), the same symptom as the `check` step.
 pub(super) fn ssh_authenticates(dir: &std::path::Path, module: &str) {
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
-    let keys = Command::new("ssh-keygen")
+    let keys = tool("ssh-keygen")
         .args(["-D", module])
         .output()
         .expect("cannot run ssh-keygen; enter the dev shell (nix develop)");
@@ -440,7 +491,7 @@ pub(super) fn ssh_authenticates(dir: &std::path::Path, module: &str) {
 
     let host_key = dir.join("host_key");
     assert!(
-        Command::new("ssh-keygen")
+        tool("ssh-keygen")
             .args(["-q", "-t", "ed25519", "-N", "", "-f"])
             .arg(&host_key)
             .status()
@@ -487,7 +538,7 @@ pub(super) fn ssh_authenticates(dir: &std::path::Path, module: &str) {
 
     // -D keeps sshd in the foreground, so the spawned child is the listener and can be
     // killed directly rather than chasing the daemonised process
-    let mut sshd = Command::new(&sshd_path)
+    let mut sshd = tool(&sshd_path)
         .arg("-D")
         .arg("-f")
         .arg(&config)
@@ -503,7 +554,7 @@ pub(super) fn ssh_authenticates(dir: &std::path::Path, module: &str) {
     }
 
     let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
-    let client = Command::new("ssh")
+    let client = tool("ssh")
         .args(["-F", "/dev/null"])
         .args(["-o", "StrictHostKeyChecking=no"])
         .args(["-o", "UserKnownHostsFile=/dev/null"])
@@ -549,11 +600,9 @@ pub(super) fn ssh_authenticates(dir: &std::path::Path, module: &str) {
 /// usage validation is covered offline in `tests/piv/external.rs` (against non-expiring certs, since
 /// this fixture's 10-year window is long past).
 pub(super) fn nss_recognises_card(dir: &std::path::Path, module: &str, root: &std::path::Path) {
-    use std::process::Command;
-
     let db = format!("sql:{}", dir.display());
     let run = |program: &str, args: &[&str]| {
-        Command::new(program)
+        tool(program)
             .args(args)
             .output()
             .unwrap_or_else(|e| panic!("cannot run {program}: {e}"))

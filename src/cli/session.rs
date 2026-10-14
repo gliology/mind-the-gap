@@ -2,10 +2,12 @@
 //! for once.
 
 use super::{
-    Backend, Identity, confirm_destruction, dispatch, generate::generate, pgp_commands::PGPCommand,
-    piv_commands::PIVCommand,
+    Backend, Identity, confirm_destruction, dispatch,
+    generate::generate,
+    parse_date, parse_duration,
+    pgp_commands::{PGPCommand, PGPOptions},
+    piv_commands::{PIVCommand, PIVOptions},
 };
-use crate::common;
 use crate::mnemonic::{self, MnemonicSeed};
 use crate::pgp;
 use crate::piv;
@@ -270,11 +272,11 @@ pub(super) enum ReplCommand {
         emails: Vec<String>,
 
         /// Default creation date for both backends
-        #[arg(short, long, value_name = "YYYY-MM-DD", value_parser = common::parse_date)]
+        #[arg(short, long, value_name = "YYYY-MM-DD", value_parser = parse_date)]
         date: Option<DateTime<Utc>>,
 
         /// Default validity duration for both backends
-        #[arg(short, long, value_name = "DURATION", value_parser = common::parse_duration)]
+        #[arg(short, long, value_name = "DURATION", value_parser = parse_duration)]
         validity: Option<Duration>,
 
         /// Default PGP keys to derive without the subkey id
@@ -461,7 +463,10 @@ fn ask_password_again(session: &mut Session) -> Result<()> {
 /// A line's own value always wins; the stored default only covers what was left out.
 fn merge_defaults(backend: &mut Backend, d: &Stickies) {
     match backend {
-        Backend::PGP { date, validity, shared, legacy, algorithm, .. } => {
+        Backend::PGP {
+            options: PGPOptions { date, validity, shared, legacy, algorithm, .. },
+            ..
+        } => {
             *date = date.or(d.date);
             *validity = validity.or(d.validity);
             if shared.is_empty() {
@@ -472,19 +477,23 @@ fn merge_defaults(backend: &mut Backend, d: &Stickies) {
             *algorithm = algorithm.or(d.algorithm.filter(|sticky| *sticky != Algorithm::P384));
         }
         Backend::PIV {
-            date,
-            validity,
-            intermediate,
-            shared,
-            org,
-            unit,
-            country,
-            pin_policy,
-            touch_policy,
-            no_msroots,
-            algorithm,
-            management_key,
-            management_key_touch,
+            options:
+                PIVOptions {
+                    date,
+                    validity,
+                    intermediate,
+                    shared,
+                    org,
+                    unit,
+                    country,
+                    pin_policy,
+                    touch_policy,
+                    no_msroots,
+                    algorithm,
+                    management_key,
+                    management_key_touch,
+                    ..
+                },
             ..
         } => {
             *date = date.or(d.date);
@@ -528,15 +537,7 @@ fn ask_identity(session: &mut Session, backend: &Backend) -> Result<()> {
             session.name = Some(name);
         }
     }
-    let wants_emails = matches!(
-        backend,
-        Backend::PGP {
-            command: PGPCommand::Certify { .. }
-                | PGPCommand::Upload { .. }
-                | PGPCommand::Export { .. },
-            ..
-        }
-    );
+    let wants_emails = matches!(backend, Backend::PGP { command, .. } if command.mints_uids());
     if wants_emails && session.emails.is_empty() {
         let emails = prompt::read_public("Emails (comma separated): ")?;
         if !emails.is_empty() {

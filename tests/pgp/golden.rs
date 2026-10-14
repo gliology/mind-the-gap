@@ -74,20 +74,22 @@ type FrozenKeys = (Option<&'static str>, &'static str, &'static str, &'static st
 
 /// Assert that `algorithm` still derives exactly `vectors` under the current scheme
 fn assert_current_scheme_frozen(algorithm: Algorithm, vectors: [FrozenKeys; 2]) {
+    assert_frozen(vectors, |id| {
+        SeededSmartcard::with_scheme(&SEED_A, id, "Alice".into(), Scheme::Current)
+            .with_algorithm(algorithm)
+            .unwrap()
+            .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+    });
+}
+
+/// Assert that the card `build` makes for each subkey id still certifies exactly `vectors`
+fn assert_frozen(vectors: [FrozenKeys; 2], build: impl Fn(Option<String>) -> SeededSmartcard) {
     for (id, primary, signing, decryption, authentication) in vectors {
-        let cert = SeededSmartcard::with_scheme(
-            &SEED_A,
-            id.map(|value| value.to_string()),
-            "Alice".into(),
-            Scheme::Current,
-        )
-        .with_algorithm(algorithm)
-        .unwrap()
-        .add_email("alice@example.com")
-        .unwrap()
-        .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
-        .certify(CertificateKind::default())
-        .unwrap();
+        let cert = build(id.map(|value| value.to_string()))
+            .add_email("alice@example.com")
+            .unwrap()
+            .certify(CertificateKind::default())
+            .unwrap();
 
         assert_eq!(cert.fingerprint().to_hex(), primary, "primary key moved for {id:?}");
 
@@ -109,6 +111,24 @@ fn assert_current_scheme_frozen(algorithm: Algorithm, vectors: [FrozenKeys; 2]) 
     }
 }
 
+/// The Curve25519 vectors, the algorithm a card gets when none is chosen
+const CURVE25519: [FrozenKeys; 2] = [
+    (
+        None,
+        "88430F06B9F752ED2C341C36DE2AF5541838E809",
+        "AB00BE7F835649188EAB5EE4A17BD588482B384C",
+        "C97628A82FD1E82E546A625AB99670FFA38B11E6",
+        "32C45264B695C2207EEF47559E0C7978DE44E988",
+    ),
+    (
+        Some("laptop"),
+        "88430F06B9F752ED2C341C36DE2AF5541838E809",
+        "309AB6A06915C4E882C6DC068E0E96A1737672E3",
+        "43F267E09AA430865C2231C467BB656C575DEC64",
+        "15FFADF10464C79DA450A4F0FC71E4523479F307",
+    ),
+];
+
 /// The current `mtg1` scheme is frozen.
 ///
 /// The 1.x versioning promise is that any release re-derives the very same keys from a
@@ -119,25 +139,17 @@ fn assert_current_scheme_frozen(algorithm: Algorithm, vectors: [FrozenKeys; 2]) 
 /// a derivation change ships as `mtg2` behind a new major.
 #[test]
 fn current_scheme_is_frozen() {
-    assert_current_scheme_frozen(
-        Algorithm::Curve25519,
-        [
-            (
-                None,
-                "88430F06B9F752ED2C341C36DE2AF5541838E809",
-                "AB00BE7F835649188EAB5EE4A17BD588482B384C",
-                "C97628A82FD1E82E546A625AB99670FFA38B11E6",
-                "32C45264B695C2207EEF47559E0C7978DE44E988",
-            ),
-            (
-                Some("laptop"),
-                "88430F06B9F752ED2C341C36DE2AF5541838E809",
-                "309AB6A06915C4E882C6DC068E0E96A1737672E3",
-                "43F267E09AA430865C2231C467BB656C575DEC64",
-                "15FFADF10464C79DA450A4F0FC71E4523479F307",
-            ),
-        ],
-    );
+    assert_current_scheme_frozen(Algorithm::Curve25519, CURVE25519);
+}
+
+/// What a card gets when nothing is chosen is frozen with the rest.
+///
+/// The default scheme, algorithm and creation time are inputs to every fingerprint, so a
+/// drifting default would move every key provisioned without `--algorithm` or `--date`
+/// while each vector above, which sets all three, kept passing. Built with none of them set.
+#[test]
+fn defaults_are_frozen() {
+    assert_frozen(CURVE25519, |id| SeededSmartcard::new(&SEED_A, id, "Alice".into()));
 }
 
 /// The P-256 half of the same promise: `--algorithm p256` is part of `mtg1` and frozen with it.

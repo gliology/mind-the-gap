@@ -6,7 +6,7 @@
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
-use super::{CertificateKind, SeededSmartcard, SlotRole, slots::DEFAULT_KEY_SLOTS};
+use super::{CertificateKind, SeededSmartcard, SlotRole};
 use crate::seed::{self, Algorithm, Seed256, Seed256Derive};
 
 use anyhow::{Result, anyhow};
@@ -54,7 +54,7 @@ pub(super) const ID_MS_SMARTCARD_LOGON: ObjectIdentifier =
 
 /// Distinguished name attributes shared by every tier of the chain
 #[derive(Clone, Debug, Default)]
-pub struct Identity {
+pub(super) struct SubjectName {
     /// Common name base, e.g. the cardholder's name
     pub name: String,
     /// Organization (`O`)
@@ -90,7 +90,7 @@ fn escape_rdn(value: &str) -> String {
     escaped
 }
 
-impl Identity {
+impl SubjectName {
     /// Build `CN=<cn>[,OU=..][,O=..][,C=..]`.
     ///
     /// `RdnSequence::from_str` reverses the sequence, so writing the attributes in RFC 4514
@@ -544,9 +544,9 @@ impl SeededSmartcard {
         let validity = self.validity()?;
 
         // Live slots, then the archived generations behind them
-        let live = DEFAULT_KEY_SLOTS
-            .iter()
-            .map(|(slot, role, ..)| (*slot, *role, None));
+        let live = SlotRole::ALL
+            .into_iter()
+            .map(|role| (role.slot(), role, None));
         let archived = self
             .retired_slots()?
             .into_iter()

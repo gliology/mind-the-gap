@@ -3,10 +3,7 @@
 //! Part of the frozen `mtg1` derivation: the golden vectors in `tests/piv/golden.rs` pin every
 //! label used here.
 
-use super::{
-    SeededSmartcard, SharedSlot, SlotRole, slots::FIRST_RETIRED_SLOT, slots::slot_name,
-    slots::slot_role,
-};
+use super::{SeededSmartcard, SharedSlot, SlotRole, slots::FIRST_RETIRED_SLOT};
 use crate::seed::{self, Algorithm, Seed256, Seed256Derive};
 
 use anyhow::{Result, anyhow, bail};
@@ -185,7 +182,7 @@ impl SeededSmartcard {
     /// that generation's subseed under the very same label the live 9D key uses. Deriving it
     /// by role rather than by slot is what lets an archived key be re-derived at all.
     fn key_source(&self, slot: SlotId) -> Result<(Zeroizing<Seed256>, Vec<u8>)> {
-        let segment = slot_role(slot).algorithm_segment(self.algorithm);
+        let segment = SlotRole::of(slot).algorithm_segment(self.algorithm);
 
         if let SlotId::Retired(retired) = slot {
             let index = usize::from(u8::from(retired).saturating_sub(FIRST_RETIRED_SLOT));
@@ -201,13 +198,16 @@ impl SeededSmartcard {
         }
 
         // A deliberate copy of the slot's parent seed, wiped when the caller is done with it
-        Ok((Zeroizing::new(*self.seed_for(slot)), seed::algorithm_label(slot_name(slot), segment)))
+        Ok((
+            Zeroizing::new(*self.seed_for(slot)),
+            seed::algorithm_label(SlotRole::of(slot).name(), segment),
+        ))
     }
 
     /// The private key a slot holds, derived the same way whether it is certified or imported
     pub(super) fn slot_key(&self, slot: SlotId) -> Result<SlotKey> {
         let (seed, label) = self.key_source(slot)?;
-        SlotKey::derive(&seed, &label, slot_role(slot), self.algorithm)
+        SlotKey::derive(&seed, &label, SlotRole::of(slot), self.algorithm)
     }
 
     /// Slot each archived generation is written to, newest first from 0x82
@@ -288,5 +288,70 @@ impl SeededSmartcard {
             .collect();
 
         seed::stamp(&derived)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use sha2::{Digest, Sha256};
+
+    use yubikey::CardId;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn card(id: Option<&str>) -> SeededSmartcard {
+        SeededSmartcard::new(&[1u8; 32], id.map(String::from), "Alice".into())
+    }
+
+    /// The management keys are frozen with the slot keys, in both algorithms.
+    ///
+    /// They are what `check` and a re-upload authenticate with, so a key that moved would
+    /// lock this tool out of every card it provisioned while the chain vectors, which never
+    /// see it, kept passing. Pinned by digest, which says as much as the key itself would
+    /// without putting key material in the source.
+    #[test]
+    fn management_keys_are_frozen() {
+        for (id, aes, tdes) in [
+            (
+                None,
+                "3927d45938c9de2c4771b497081cb018e010591ecd0d1c5bedbdb5e1a362f3d1",
+                "2229662597d2ad0da01a67244d8eb26d1396dc1f23a3cdb6de2ba39b00508120",
+            ),
+            (
+                Some("laptop"),
+                "e414ee36e34a924b06c3824cd43f800cb2ce77d82fa554efeccae5c4e8834dbf",
+                "19c18e8759c18c6ba240111e6f85be38e09bd25976a7b35447a4106ff5da5ffc",
+            ),
+        ] {
+            let digest = |algorithm| {
+                hex(&Sha256::digest(card(id).management_key(algorithm).unwrap().as_ref()))
+            };
+            assert_eq!(digest(MgmAlgorithmId::Aes256), aes, "AES-256 key moved for {id:?}");
+            assert_eq!(digest(MgmAlgorithmId::ThreeDes), tdes, "3DES key moved for {id:?}");
+        }
+    }
+
+    /// The CHUID and CCC identifiers are frozen too, at the widths `upload` writes them in.
+    ///
+    /// Middleware caches a card by them, so an identifier that moved would make a
+    /// re-provisioned card look like a stranger. Published on the card, so pinned as is.
+    #[test]
+    fn card_identifiers_are_frozen() {
+        for (id, chuid, ccc) in [
+            (None, "7948e1b285064a006e78113c79e3ad0b", "7b941484fd2661967139968c0e82"),
+            (Some("laptop"), "ff9d6c3b6ca2ef20200ed103429c9a56", "8308caa682cc0b5cbdb426c06166"),
+        ] {
+            let card = card(id);
+            assert_eq!(hex(&card.subseed.id(NAME_CHUID_ID, 16)), chuid, "CHUID moved for {id:?}");
+            assert_eq!(
+                hex(&card.subseed.id(NAME_CCC_ID, CardId::BYTE_SIZE)),
+                ccc,
+                "CCC card identifier moved for {id:?}"
+            );
+        }
     }
 }

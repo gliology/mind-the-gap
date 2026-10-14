@@ -31,11 +31,12 @@ mod keys;
 mod slots;
 
 pub use card::status;
-pub use chain::{CertChain, Identity};
+pub use chain::CertChain;
+use chain::SubjectName;
 pub use slots::SlotRole;
 
 /// Which part of the certificate chain to export
-#[derive(clap::ValueEnum, Clone, Debug, Default, PartialEq)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq)]
 pub enum CertificateKind {
     /// The certificate authorities plus all four slot certificates
     #[default]
@@ -173,7 +174,7 @@ pub struct SeededSmartcard {
     retired: Vec<String>,
 
     /// Distinguished name attributes for every tier of the chain
-    identity: Identity,
+    identity: SubjectName,
 
     /// Alternative names, e.g. emails addresses, to use in the leaf certificates
     alternatives: Vec<GeneralName>,
@@ -227,7 +228,7 @@ impl SeededSmartcard {
             retired: vec![],
             shared: vec![],
             subkey,
-            identity: Identity { name, ..Default::default() },
+            identity: SubjectName { name, ..Default::default() },
             alternatives: vec![],
             creation_time: None,
             validity_duration: None,
@@ -356,7 +357,6 @@ impl SeededSmartcard {
 
 #[cfg(test)]
 mod tests {
-    use super::keys::{NAME_MANAGEMENT, SEGMENT_TDES};
     use super::*;
     use crate::seed;
     use yubikey::MgmAlgorithmId;
@@ -417,7 +417,8 @@ mod tests {
     }
 
     /// The 3DES management key: 24 bytes, reproducible, not weak, and sharing nothing with
-    /// the AES-256 key of the same card.
+    /// the AES-256 key of the same card. The values of both are pinned with the other card
+    /// access secrets, in `keys.rs`.
     #[test]
     fn tdes_management_key_is_independent_of_aes() {
         let tdes = card().management_key(MgmAlgorithmId::ThreeDes).unwrap();
@@ -436,13 +437,6 @@ mod tests {
         for window in tdes.as_ref().windows(8) {
             assert!(!aes.as_ref().windows(8).any(|other| other == window));
         }
-
-        // The documented label, and the AES key's unchanged one
-        let label = seed::algorithm_label(NAME_MANAGEMENT, SEGMENT_TDES);
-        assert_eq!(label, b"key:management:tdes");
-        let subseed = card().subseed;
-        assert_eq!(aes.as_ref(), &subseed.key(NAME_MANAGEMENT)[..]);
-        assert_eq!(tdes.as_ref(), &subseed.derive(Some(&label))[..24]);
 
         // A different card gets a different key
         let other = SeededSmartcard::new(&[3u8; 32], Some("other".into()), "Builder".into())

@@ -5,11 +5,12 @@
   name = "mind-the-test";
 
   nodes.machine = { self, pkgs, ... }: {
-    # Install additional shells to check completions
+    # Install additional shells to check completions. Zsh through its module, which is what
+    # puts the vendor completion directory the package installs to on `fpath`.
     environment.systemPackages = with pkgs; [
       fish
-      zsh
     ];
+    programs.zsh.enable = true;
 
     # Link additional completion files
     environment.pathsToLink = [
@@ -112,11 +113,11 @@
     # Test that bash completion is functional
     machine.succeed("bash -c 'source ${pkgs.bash-completion}/share/bash-completion/bash_completion; _comp_load mind-the-gap && complete -p mind-the-gap'")
 
-    # Test that fish completion is functional
-    machine.succeed("fish -c 'complete -c mind-the-gap'")
-
-    # Test that zsh completion is functional
-    machine.succeed("zsh -c 'compctl -p mind-the-gap'")
+    # Fish and zsh find the completions on their own and offer the subcommands. Asked of the
+    # shells' completion machinery rather than by listing a definition, which either shell
+    # accepts for a command it knows nothing about.
+    machine.succeed("fish -c \"complete -C'mind-the-gap ' | grep -q piv\"")
+    machine.succeed("zsh -c 'autoload -U compinit && compinit -u && (( $+_comps[mind-the-gap] ))'")
 
     # The point of the live image is deriving keys on an air-gapped machine, so check that it
     # actually can. A fixed test mnemonic, never a real one: this seed is in the repository.

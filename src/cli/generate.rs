@@ -14,10 +14,8 @@ use anyhow::{Result, anyhow};
 /// Death by signal skips every `Drop`, so a Ctrl-C while a secret is on the alternate
 /// screen would strand the terminal with the secret still showing. During a ceremony
 /// the keys simply do nothing; leaving is what the prompts are for.
-#[cfg(unix)]
 pub(super) struct IgnoreInterrupts(libc::sighandler_t, libc::sighandler_t);
 
-#[cfg(unix)]
 impl IgnoreInterrupts {
     fn install() -> Self {
         unsafe {
@@ -29,7 +27,6 @@ impl IgnoreInterrupts {
     }
 }
 
-#[cfg(unix)]
 impl Drop for IgnoreInterrupts {
     fn drop(&mut self) {
         unsafe {
@@ -52,7 +49,6 @@ pub(super) fn generate(in_session: bool) -> Result<MnemonicSeed> {
     // the main screen it would survive in scrollback. The RAII guard restores a clean
     // display on every exit path, errors included, and Ctrl-C is ignored throughout
     // because a signal death would skip that restoration.
-    #[cfg(unix)]
     let _guard = IgnoreInterrupts::install();
     let mut screen = qr::Screen::enter_cooked()?;
 

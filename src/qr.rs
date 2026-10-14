@@ -14,8 +14,8 @@ use std::os::fd::AsFd;
 use anyhow::{Result, anyhow, bail};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
-use qrcode::{EcLevel, QrCode};
 use qrcode::render::unicode;
+use qrcode::{EcLevel, QrCode};
 use zeroize::Zeroizing;
 
 use crate::prompt;

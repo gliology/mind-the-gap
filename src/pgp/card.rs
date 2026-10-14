@@ -7,14 +7,12 @@ use super::{
 use crate::common;
 use crate::seed::Algorithm;
 
-use std::convert::TryFrom;
 use std::time::SystemTime;
 
 use anyhow::{Result, anyhow, bail};
 
 use zeroize::Zeroizing;
 
-use openpgp::Result as PGPResult;
 use openpgp::cert::Cert;
 use openpgp::crypto::mpi;
 use openpgp::fmt::hex;
@@ -35,13 +33,6 @@ use openpgp_card::ocard::data::{
     Fingerprint as CardFingerprint, KeyGenerationTime, TouchPolicy, UserInteractionFlag,
 };
 use openpgp_card::state::{Open, Transaction};
-
-/// Subkeys to export
-pub const DEFAULT_KEY_TYPES: [KeyType; 3] = [
-    KeyType::Signing,
-    KeyType::Decryption,
-    KeyType::Authentication,
-];
 
 /// Print list of currently available OpenPGP cards
 pub fn status() -> Result<()> {
@@ -67,7 +58,7 @@ pub fn status() -> Result<()> {
             println!("   Cardholder: {}", common::printable(&name));
         }
 
-        for kt in DEFAULT_KEY_TYPES {
+        for kt in SubkeyRole::ALL.map(SubkeyRole::key_type) {
             if let Ok(Some(fp)) = transaction.fingerprint(kt) {
                 println!("   {:?} key: {}", kt, fp.to_spaced_hex());
             }
@@ -123,6 +114,19 @@ fn open_card(target: Option<String>) -> Result<Card<Open>> {
     };
 
     Ok(card)
+}
+
+/// Report the card's touch policies, informational only
+fn report_touch_policies(transaction: &mut Card<Transaction<'_>>) {
+    for (label, key_type) in [
+        ("signing", KeyType::Signing),
+        ("decryption", KeyType::Decryption),
+        ("authentication", KeyType::Authentication),
+    ] {
+        if let Ok(Some(uif)) = transaction.user_interaction_flag(key_type) {
+            log::info!("Touch policy for {label}: {:?}", uif.touch_policy());
+        }
+    }
 }
 
 /// Refuse to spend the last try of the admin pin
@@ -187,42 +191,25 @@ impl SeededSmartcard {
         // standard policy, and a bare primary key packet carries no binding signature at all,
         // so an unsigned one fails with "No binding signature" before any card is consulted.
         // The direct key signature does not affect the subkey fingerprints being compared.
-        let mut cert = self.generate_signed_primary()?;
+        let mut cert = self.primary_cert(true)?;
         cert = self.append_subkeys(cert)?;
-        self.check_subkeys(&cert, target.clone())?;
+
+        let mut card = open_card(target)?;
+        let mut transaction = card.transaction()?;
+        log::info!("Connected to {}", describe(&transaction)?);
+        self.check_subkeys(&cert, &mut transaction)?;
 
         // Only now check that the card is managed by the derived admin pin
-        self.check_admin_pin(target.clone())?;
+        self.check_admin_pin(&mut transaction)?;
 
         // And that the supplied user pin, if any, actually opens the card
-        if self.pin.is_some() {
-            self.check_user_pin(target.clone())?;
-        }
+        self.check_user_pin(&mut transaction)?;
 
         // Advisory, like PIV's policy lines: say what the card's touch policies are,
         // since upload and config both shape them and nothing else surfaces them
-        self.report_touch_policies(target);
+        report_touch_policies(&mut transaction);
 
         Ok(())
-    }
-
-    /// Report the card's touch policies, informational only
-    fn report_touch_policies(&self, target: Option<String>) {
-        let Ok(mut card) = open_card(target) else {
-            return;
-        };
-        let Ok(mut transaction) = card.transaction() else {
-            return;
-        };
-        for (label, key_type) in [
-            ("signing", KeyType::Signing),
-            ("decryption", KeyType::Decryption),
-            ("authentication", KeyType::Authentication),
-        ] {
-            if let Ok(Some(uif)) = transaction.user_interaction_flag(key_type) {
-                log::info!("Touch policy for {label}: {:?}", uif.touch_policy());
-            }
-        }
     }
 
     /// Adjust a provisioned card's settings under the derived admin pin.
@@ -233,13 +220,13 @@ impl SeededSmartcard {
     /// seed, subkey id or scheme fails here without spending one of the card's three admin
     /// attempts.
     pub fn configure(&self, target: Option<String>, settings: CardSettings) -> Result<()> {
-        let mut cert = self.generate_signed_primary()?;
+        let mut cert = self.primary_cert(true)?;
         cert = self.append_subkeys(cert)?;
-        self.check_subkeys(&cert, target.clone())?;
 
         let mut card = open_card(target)?;
         let mut transaction = card.transaction()?;
         log::info!("Connected to {}", describe(&transaction)?);
+        self.check_subkeys(&cert, &mut transaction)?;
         guard_admin_tries(&mut transaction)?;
 
         let admin_pin = self.admin_pin();
@@ -289,7 +276,7 @@ impl SeededSmartcard {
 
     /// Upload secret subkeys
     pub fn upload(&self, target: Option<String>) -> Result<Cert> {
-        let mut cert = self.generate_primary()?;
+        let mut cert = self.primary_cert(false)?;
 
         cert = self.append_uids(cert)?;
         cert = self.append_subkeys(cert)?;
@@ -397,16 +384,8 @@ impl SeededSmartcard {
     }
 
     /// Check that smartcard can be accessed with derived admin pin
-    pub fn check_admin_pin(&self, target: Option<String>) -> Result<()> {
-        // Determine smartcard to which to connect
-        let mut card = open_card(target)?;
-
-        // Establish connection and receive metadata
-        let mut transaction = card.transaction()?;
-        log::info!("Connected to {}", describe(&transaction)?);
-
-        // Verify admin pin derived from subseed
-        guard_admin_tries(&mut transaction)?;
+    fn check_admin_pin(&self, transaction: &mut Card<Transaction<'_>>) -> Result<()> {
+        guard_admin_tries(transaction)?;
         let admin_pin = self.admin_pin();
         transaction.verify_admin_pin(SecretString::from(admin_pin.as_str().to_owned()))?;
 
@@ -414,15 +393,10 @@ impl SeededSmartcard {
     }
 
     /// Check that the supplied user pin opens the smartcard
-    pub fn check_user_pin(&self, target: Option<String>) -> Result<()> {
-        let pin = match self.pin.as_ref() {
-            Some(pin) => pin,
-            None => return Ok(()),
+    fn check_user_pin(&self, transaction: &mut Card<Transaction<'_>>) -> Result<()> {
+        let Some(pin) = self.pin.as_ref() else {
+            return Ok(());
         };
-
-        // Determine smartcard to which to connect
-        let mut card = open_card(target)?;
-        let mut transaction = card.transaction()?;
 
         // A valid UTF-8 pin borrows through `from_utf8_lossy`, and the `String` moves into
         // `SecretString`, which zeroizes it -- no unwiped copy is left behind
@@ -435,15 +409,7 @@ impl SeededSmartcard {
     }
 
     /// Check that subkey fingerprints of certificate matches those on smartcard
-    pub fn check_subkeys(&self, cert: &Cert, target: Option<String>) -> Result<()> {
-        // Determine smartcard to which to connect
-        let mut card = open_card(target)?;
-
-        // Establish connection and receive metadata
-        let mut transaction = card.transaction()?;
-        log::info!("Connected to {}", describe(&transaction)?);
-
-        // Get the certificate subkeys
+    fn check_subkeys(&self, cert: &Cert, transaction: &mut Card<Transaction<'_>>) -> Result<()> {
         let policy = &StandardPolicy::new();
         let valid_cert = cert.with_policy(policy, None)?;
 
@@ -485,29 +451,25 @@ impl SeededSmartcard {
             }
         }
 
-        crate::common::report_mismatches("certificate", mismatches)
+        crate::common::report_mismatches("certificate", &mismatches)
     }
 
     /// Upload subkeys to a smartcard and reset and lock smartcard in the process
-    fn upload_subkeys(&self, cert: &Cert, target: Option<String>) -> PGPResult<()> {
-        // Determine smartcard to which to connect
+    fn upload_subkeys(&self, cert: &Cert, target: Option<String>) -> Result<()> {
         let mut card = open_card(target)?;
 
-        // Establish connection and receive metadata
         let mut transaction = card.transaction()?;
         log::info!("Connected to {}", describe(&transaction)?);
 
         self.refuse_unfit(&mut transaction)?;
 
-        // Factory reset smartcard
         transaction.factory_reset()?;
 
-        // Change user pin if it was specified
         if let Some(pin) = self.pin.as_ref() {
             let new_pin: Zeroizing<String> =
                 pin.map(|p| String::from_utf8_lossy(p).to_string()).into();
             transaction.change_user_pin(
-                SecretString::from("123456".to_string()),
+                SecretString::from(common::FACTORY_USER_PIN.to_string()),
                 SecretString::from(AsRef::<str>::as_ref(&*new_pin).to_owned()),
             )?;
         }
@@ -516,7 +478,7 @@ impl SeededSmartcard {
         // Set new admin pin derived from subseed
         let admin_pin = self.admin_pin();
         transaction.change_admin_pin(
-            SecretString::from("12345678".to_string()),
+            SecretString::from(common::FACTORY_ADMIN_PIN.to_string()),
             SecretString::from(admin_pin.as_str().to_owned()),
         )?;
 
@@ -542,7 +504,6 @@ impl SeededSmartcard {
                 .find(|k| k.key_flags().is_some_and(|flags| role.matches(&flags)))
                 .ok_or_else(|| anyhow!("{:?} key not found in cert", kt))?;
 
-            // Extract fingerprint as 20-byte array
             let fp_bytes: [u8; 20] = subkey
                 .key()
                 .fingerprint()
@@ -550,13 +511,15 @@ impl SeededSmartcard {
                 .try_into()
                 .map_err(|_| anyhow!("Unexpected fingerprint length"))?;
 
-            // Extract creation timestamp
             let ts = subkey
                 .key()
                 .creation_time()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_err(|e| anyhow!("Key creation time error: {}", e))?
-                .as_secs() as u32;
+                .as_secs();
+            // OpenPGP stores creation times in 32 bits, which run out in 2106
+            let ts = u32::try_from(ts)
+                .map_err(|_| anyhow!("Key creation time lies beyond what OpenPGP can store"))?;
 
             // Re-derive the raw private key bytes, exactly as they went into the certificate
             let agreement = role.is_encryption();

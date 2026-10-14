@@ -6,16 +6,31 @@
 # slots, and management access without a touch. yubikit then reads back what the card
 # reports, so the policies are seen on the card rather than taken from our own log.
 #
-# `algorithm` is the profile's key algorithm, P-384 unless a variant asks for another one.
+# `managementKey` is what `--management-key` asks `upload` for, or null for the automatic
+# choice, which is AES-256 on this card. The triple DES variant is what a YubiKey 4 or a
+# YubiKey 5 before 5.4 takes, forced onto a card that would take either.
 {
   pkgs,
   piv-vpicc,
-  algorithm ? "p384",
+  managementKey ? null,
   ...
 }:
 
 let
-  variant = "builder" + (if algorithm == "p384" then "" else "-${algorithm}");
+  variant = if managementKey == null then "builder" else "builder-${managementKey}";
+
+  # The management key the card has to report, as yubikit and as our upload log name it
+  management =
+    if managementKey == "tdes" then
+      {
+        yubikit = "TDES";
+        log = "ThreeDes";
+      }
+    else
+      {
+        yubikit = "AES256";
+        log = "Aes256";
+      };
 
   # What the card reports: its PIV version, then through GET METADATA one line per slot plus
   # the management key, for the test script to grep. ykman's own `piv info` leaves the slot
@@ -30,7 +45,6 @@ let
       }
       ''
         from ykman.pcsc import list_devices
-        from yubikit.core import NotSupportedError
         from yubikit.core.smartcard import SmartCardConnection
         from yubikit.piv import PivSession, SLOT
 
@@ -38,11 +52,6 @@ let
         with device.open_connection(SmartCardConnection) as connection:
             piv = PivSession(connection)
             print(f"VERSION {piv.version}")
-            try:
-                piv.get_slot_metadata(SLOT.AUTHENTICATION)
-            except NotSupportedError:
-                print("NO METADATA")
-                raise SystemExit(0)
             for slot in (SLOT.AUTHENTICATION, SLOT.SIGNATURE,
                          SLOT.KEY_MANAGEMENT, SLOT.CARD_AUTH):
                 data = piv.get_slot_metadata(slot)
@@ -111,8 +120,10 @@ in
     builder = f"{identity} -k pavlov-1"
     # The build server profile from docs/piv-build-server.md
     piv = (
-        "piv --algorithm ${algorithm} --pin-policy once --touch-policy never "
-        "--management-key-touch never"
+        "piv --algorithm p384 --pin-policy once --touch-policy never "
+        "--management-key-touch never${
+          if managementKey == null then "" else " --management-key ${managementKey}"
+        }"
     )
     card = "-c 5437251"
     pin = "--pin 471120"
@@ -127,17 +138,17 @@ in
     policies = machine.succeed("piv-policies")
     print(policies)
 
-    machine.succeed("grep -q 'derived Aes256 management key' /tmp/upload.log")
+    machine.succeed("grep -q 'derived ${management.log} management key' /tmp/upload.log")
     info = machine.succeed("ykman --reader 'Virtual PCD 00 00' piv info 2>&1")
     print(info)
     assert "PIV version:              6.6.6" in info, info
-    assert "Management key algorithm: AES256" in info, info
+    assert "Management key algorithm: ${management.yubikit}" in info, info
     for line in (
         "AUTHENTICATION ECCP384 pin=ONCE touch=NEVER",
         "SIGNATURE ECCP384 pin=ONCE touch=NEVER",
         "KEY_MANAGEMENT ECCP384 pin=ONCE touch=NEVER",
         "CARD_AUTH ECCP384 pin=NEVER touch=NEVER",
-        "MANAGEMENT AES256 touch=NEVER default=False",
+        "MANAGEMENT ${management.yubikit} touch=NEVER default=False",
     ):
         assert line in policies, f"{line!r} missing from:\n{policies}"
 

@@ -7,13 +7,13 @@ use super::{P384_REFUSED, Scheme, SeededSmartcard, SubkeyRole};
 use crate::common;
 use crate::seed::{self, Algorithm, Seed256, Seed256Derive};
 
-use std::convert::TryFrom;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Result, anyhow, bail};
 
 use zeroize::Zeroizing;
 
+use openpgp::Packet;
 use openpgp::cert::{Cert, CertRevocationBuilder, SubkeyRevocationBuilder};
 use openpgp::crypto::mpi::{MPI, ProtectedMPI, SecretKeyMaterial};
 use openpgp::crypto::{KeyPair, mpi};
@@ -26,13 +26,11 @@ use openpgp::types::{
     Curve as PgpCurve, Features, HashAlgorithm, PublicKeyAlgorithm, ReasonForRevocation,
     SignatureType, SymmetricAlgorithm,
 };
-use openpgp::{Packet, Result as PGPResult};
 use sequoia_openpgp as openpgp;
 
 use rsa::RsaPrivateKey;
 use rsa::traits::PrivateKeyParts;
 
-// Some use type shorthands
 pub(super) type SecretPrimaryKey = Key<key::SecretParts, key::PrimaryRole>;
 pub(super) type SecretSubKey = Key<key::SecretParts, key::SubordinateRole>;
 
@@ -87,7 +85,7 @@ impl SeededSmartcard {
         parent: &Seed256,
         label: Option<&[u8]>,
         agreement: bool,
-    ) -> PGPResult<Zeroizing<Seed256>> {
+    ) -> Result<Zeroizing<Seed256>> {
         match self.algorithm {
             Algorithm::P256 => seed::derive_p256_scalar(parent, label),
             Algorithm::P384 => bail!(P384_REFUSED),
@@ -112,7 +110,7 @@ impl SeededSmartcard {
         bytes: &Seed256,
         agreement: bool,
         time: SystemTime,
-    ) -> PGPResult<Key4<key::SecretParts, R>> {
+    ) -> Result<Key4<key::SecretParts, R>> {
         match (self.algorithm, agreement) {
             (Algorithm::Curve25519, true) => Key4::import_secret_cv25519(bytes, None, None, time),
             (Algorithm::Curve25519, false) => Key4::import_secret_ed25519(bytes, time),
@@ -175,7 +173,7 @@ impl SeededSmartcard {
     }
 
     /// The primary key, re-derived from its raw secret
-    fn primary_key(&self) -> PGPResult<SecretPrimaryKey> {
+    fn primary_key(&self) -> Result<SecretPrimaryKey> {
         Ok(self
             .secret_key(&self.seed, false, self.creation_time())?
             .into())
@@ -205,7 +203,7 @@ impl SeededSmartcard {
     }
 
     /// Helper to create primary key-based signature builder including metadata.
-    fn new_primary_sbuilder(&self, stype: SignatureType) -> PGPResult<SignatureBuilder> {
+    fn new_primary_sbuilder(&self, stype: SignatureType) -> Result<SignatureBuilder> {
         SignatureBuilder::new(stype)
             .set_features(Features::sequoia())?
             .set_hash_algo(HashAlgorithm::SHA512)
@@ -219,65 +217,40 @@ impl SeededSmartcard {
     }
 
     /// Helper to create primary key-based signer
-    fn new_primary_signer(&self) -> PGPResult<KeyPair> {
-        // Generate primary key.
-        let primary = self.primary_key()?;
-
-        let signer = primary
-            .clone()
-            .into_keypair()
-            .expect("key generated above has a secret");
-
-        Ok(signer)
+    fn new_primary_signer(&self) -> Result<KeyPair> {
+        self.primary_key()?.into_keypair()
     }
 
-    /// Generate a primary certificate
-    pub(super) fn generate_primary(&self) -> PGPResult<Cert> {
-        // Generate and self-sign primary key.
+    /// The primary key as a certificate of its own, its secret encrypted under the pin if
+    /// there is one
+    ///
+    /// `signed` adds the direct key signature that policy evaluation needs (check, upload);
+    /// the exported certificates leave it out, the user ids carry the self-signatures there.
+    pub(super) fn primary_cert(&self, signed: bool) -> Result<Cert> {
         let primary = self.primary_key()?;
 
-        // Optionally encrypt the primary key copy for the certificate
         let mut primary_enc = primary.clone();
         if let Some(pin) = self.pin.as_ref() {
             primary_enc
                 .secret_mut()
                 .encrypt_in_place(primary.parts_as_public(), pin)?;
         }
+        let mut packets = vec![Packet::SecretKey(primary_enc)];
 
-        let cert = Cert::try_from(vec![Packet::SecretKey(primary_enc)])?;
-
-        Ok(cert)
-    }
-
-    /// Generate a self-signed primary certificate
-    pub(super) fn generate_signed_primary(&self) -> PGPResult<Cert> {
-        // Generate and self-sign primary key.
-        let primary = self.primary_key()?;
-
-        let mut signer = primary
-            .clone()
-            .into_keypair()
-            .expect("key generated above has a secret");
-
-        let sig = self.new_primary_sbuilder(SignatureType::DirectKey)?;
-        let sig = sig.sign_direct_key(&mut signer, primary.parts_as_public())?;
-
-        // Optionally encrypt the primary key copy for the certificate
-        let mut primary_enc = primary.clone();
-        if let Some(pin) = self.pin.as_ref() {
-            primary_enc
-                .secret_mut()
-                .encrypt_in_place(primary.parts_as_public(), pin)?;
+        if signed {
+            let mut signer = primary.clone().into_keypair()?;
+            let sig = self.new_primary_sbuilder(SignatureType::DirectKey)?;
+            packets.push(
+                sig.sign_direct_key(&mut signer, primary.parts_as_public())?
+                    .into(),
+            );
         }
 
-        let cert = Cert::try_from(vec![Packet::SecretKey(primary_enc), sig.into()])?;
-
-        Ok(cert)
+        Cert::try_from(packets)
     }
 
     /// Append self-signed user ids to a primary certificate
-    pub(super) fn append_uids(&self, mut cert: Cert) -> PGPResult<Cert> {
-        // Generate, self-sign and append all subkeys.
+    pub(super) fn append_uids(&self, mut cert: Cert) -> Result<Cert> {
         let mut signer = self.new_primary_signer()?;
 
         for (i, uid) in self.userids.iter().enumerate() {
@@ -297,16 +270,10 @@ impl SeededSmartcard {
     }
 
     /// Append self-signed subkeys to a primary certificate
-    pub(super) fn append_subkeys(&self, mut cert: Cert) -> PGPResult<Cert> {
-        // Generate primary key and signer
+    pub(super) fn append_subkeys(&self, mut cert: Cert) -> Result<Cert> {
         let primary = self.primary_key()?;
+        let mut signer = primary.clone().into_keypair()?;
 
-        let mut signer = primary
-            .clone()
-            .into_keypair()
-            .expect("key generated above has a secret");
-
-        // Create and sign subkeys
         let subkey_creation_time = self.subkey_creation_time.unwrap_or(self.creation_time());
 
         for role in SubkeyRole::ALL {
@@ -320,7 +287,6 @@ impl SeededSmartcard {
                 .secret_key(&seed, agreement, subkey_creation_time)?
                 .into();
 
-            // Sign subkey with primary
             let mut builder = SignatureBuilder::new(SignatureType::SubkeyBinding)
                 .set_hash_algo(HashAlgorithm::SHA512)
                 .set_signature_creation_time(subkey_creation_time)?
@@ -361,7 +327,6 @@ impl SeededSmartcard {
                     .encrypt_in_place(subkey_pub.parts_as_public(), pin)?;
             }
 
-            // Add everything to certificate
             cert = cert
                 .insert_packets(vec![Packet::SecretSubkey(subkey), signature.into()])
                 .map(|(c, _)| c)?;
@@ -376,8 +341,7 @@ impl SeededSmartcard {
         mut cert: Cert,
         other: Cert,
         kind: SignatureType,
-    ) -> PGPResult<Cert> {
-        // Generate and self-sign primary key.
+    ) -> Result<Cert> {
         let mut signer = self.new_primary_signer()?;
 
         let policy = &StandardPolicy::new();
@@ -408,18 +372,11 @@ impl SeededSmartcard {
         cert: &mut Cert,
         code: u8,
         reason_text: &str,
-    ) -> PGPResult<Packet> {
+    ) -> Result<Packet> {
         let creation_time = self.creation_time();
 
-        // Derive signing key
-        let primary = self.primary_key()?;
+        let mut signer = self.new_primary_signer()?;
 
-        let mut signer = primary
-            .clone()
-            .into_keypair()
-            .expect("key generated above has a secret");
-
-        // Sign revocation certificate
         let revocation: Packet = CertRevocationBuilder::new()
             .set_signature_creation_time(creation_time)?
             .set_reason_for_revocation(reason(code), reason_text.as_bytes())?
@@ -435,16 +392,12 @@ impl SeededSmartcard {
         cert: &Cert,
         code: u8,
         reason_text: &str,
-    ) -> PGPResult<Vec<Packet>> {
+    ) -> Result<Vec<Packet>> {
         let creation_time = self.creation_time();
 
         // A subkey is revoked by its *primary*, which is what makes this possible at all: the
         // primary is re-derivable from the seed, so a card can be retired without it present
-        let primary = self.primary_key()?;
-        let mut signer = primary
-            .clone()
-            .into_keypair()
-            .expect("key generated above has a secret");
+        let mut signer = self.new_primary_signer()?;
 
         let policy = StandardPolicy::new();
         let valid = cert.with_policy(&policy, None)?;
@@ -476,5 +429,56 @@ impl SeededSmartcard {
                     .into())
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use sha2::{Digest, Sha256};
+
+    /// The admin pin is frozen with the keys, under both schemes.
+    ///
+    /// It is what `check`, `config` and a re-upload authenticate with, so a pin that moved
+    /// would lock this tool out of every card it provisioned while the key vectors, which
+    /// never see the pin, kept passing. Pinned by digest, which says as much as the pin
+    /// itself would without putting pin-shaped strings in the source.
+    #[test]
+    fn admin_pin_is_frozen() {
+        for (scheme, id, expected) in [
+            (
+                Scheme::Current,
+                None,
+                "19a58d9c66d0408cf679afcb41a11bbc5f48e41ff556b0f2227424613b614abd",
+            ),
+            (
+                Scheme::Current,
+                Some("laptop"),
+                "0d136d8ffafe653a3dac721c99bfb8d2c729798a0c21dc7b01df789a3b44bfff",
+            ),
+            (
+                Scheme::Legacy,
+                None,
+                "5b3916a728ab1dbf54ce29c93a56347937a96029bfb5e3a17157f1121a52862d",
+            ),
+            (
+                Scheme::Legacy,
+                Some("laptop"),
+                "0097d54a537a4ee1db421ce4d817420f2807f248124939cb1049bad59ef12cab",
+            ),
+        ] {
+            let card = SeededSmartcard::with_scheme(
+                &[1u8; 32],
+                id.map(String::from),
+                "Alice".into(),
+                scheme,
+            );
+            let digest: String = Sha256::digest(card.admin_pin().as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(digest, expected, "{scheme:?} admin pin moved for {id:?}");
+        }
     }
 }

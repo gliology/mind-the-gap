@@ -54,8 +54,8 @@ use x509_cert::Certificate;
 use x509_cert::der::Encode;
 use x509_cert::der::EncodePem;
 
-use yubikey::piv::{self, AlgorithmId, SlotId};
-use yubikey::{CccId, ChuId, MsRoots, PinPolicy, Serial, TouchPolicy, YubiKey};
+use yubikey::piv::{self, AlgorithmId, ManagementSlotId, SlotAlgorithmId, SlotId};
+use yubikey::{CccId, ChuId, MgmAlgorithmId, MsRoots, PinPolicy, Serial, TouchPolicy, YubiKey};
 
 use zeroize::Zeroizing;
 
@@ -65,13 +65,9 @@ use std::time::{Duration, SystemTime};
 mod end_use;
 
 use end_use::{
-    key_agreement_through_pkcs11, nss_recognises_card, openssl_conf, pkcs11_paths, smime_signs,
-    ssh_authenticates, tls_client_authenticates,
+    key_agreement_through_pkcs11, nss_recognises_card, only_reader, openssl_conf, pkcs11_paths,
+    smime_signs, ssh_authenticates, tls_client_authenticates,
 };
-
-/// Seed for the provisioned test identity. Any fixed value works; it must not be a seed
-/// anyone would use for real, since this card is wiped and re-provisioned at will.
-const TEST_SEED: Seed256 = [0x5au8; 32];
 
 const TEST_PIN: &str = "471120";
 
@@ -106,8 +102,23 @@ fn target() -> String {
     }
 }
 
+/// Seed for the provisioned test identity, from the serial of the card under test.
+///
+/// It must not be a seed anyone would use for real, since this card is wiped and
+/// re-provisioned at will. It differs per card because the PKCS#11 stack and gpg-agent find
+/// keys by their public half: with one identity on several attached cards, as on a test
+/// host, a step could run on another card and pass there.
+fn test_seed() -> Seed256 {
+    use sha2::{Digest, Sha256};
+    Sha256::new()
+        .chain_update([0x5a])
+        .chain_update(target())
+        .finalize()
+        .into()
+}
+
 fn subject() -> SeededSmartcard {
-    SeededSmartcard::new(&TEST_SEED, None, "Hardware Test".into())
+    SeededSmartcard::new(&test_seed(), None, "Hardware Test".into())
         .add_email("hardware-test@example.com")
         .unwrap()
         .with_pin(Zeroizing::new(TEST_PIN.to_string()))
@@ -239,10 +250,12 @@ fn provision_and_verify_card() {
     // below is exactly a browser's client-certificate authentication, and the CMS round
     // trip is the S/MIME mechanics without a mail account. The card is released first --
     // the PKCS#11 stack opens its own sessions through pcscd.
+    let reader = token.name().to_string();
     drop(token);
 
     let (module, provider) = pkcs11_paths();
     let dir = tempfile::tempdir().expect("cannot create scratch directory");
+    only_reader(dir.path(), &reader);
     let conf = openssl_conf(dir.path(), &provider, &module);
     let pem = |name: &str, cert: &Certificate| -> std::path::PathBuf {
         let path = dir.path().join(name);
@@ -333,10 +346,9 @@ fn provision_and_verify_rsa3072_card() {
     provision_and_verify(&subject, &serial, 7);
 }
 
-/// The same on RSA-4096, from firmware 5.7 on as well. Also needs a yubikey crate that
-/// fits the larger key into its import command, which the pinned revision does not yet.
+/// The same on RSA-4096, from firmware 5.7 on as well.
 #[test]
-#[ignore = "needs RSA-4096 PIV import, YubiKey firmware 5.7 or later and a yubikey crate with room for it"]
+#[ignore = "needs a card that imports RSA-4096 PIV keys, YubiKey firmware 5.7 or later"]
 fn provision_and_verify_rsa4096_card() {
     let subject = subject().with_algorithm(Algorithm::Rsa4096);
     let serial = target();
@@ -414,6 +426,29 @@ fn provision_and_verify(
             on_card.cert.to_der().expect("card cert does not encode"),
             leaf(&offline, slot).to_der().expect("leaf does not encode"),
             "{slot:?} certificate on card differs from the derived one",
+        );
+    }
+
+    // The management key, in the algorithm `upload` picks for this firmware and demanding a
+    // touch, which none of the subjects here opts out of. `check` only warns about either.
+    if has_metadata {
+        let metadata = piv::metadata(&mut token, SlotId::Management(ManagementSlotId::Management))
+            .unwrap_or_else(|e| panic!("cannot read management key metadata: {e}"));
+        let algorithm = if (version.major, version.minor) >= (5, 4) {
+            MgmAlgorithmId::Aes256
+        } else {
+            MgmAlgorithmId::ThreeDes
+        };
+
+        assert_eq!(
+            metadata.algorithm,
+            SlotAlgorithmId::Management(algorithm),
+            "management key is not {algorithm:?} on firmware {version}",
+        );
+        assert_eq!(
+            metadata.policy.map(|(_, touch)| touch),
+            Some(TouchPolicy::Always),
+            "management key does not demand a touch",
         );
     }
 

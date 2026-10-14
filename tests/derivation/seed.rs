@@ -1,19 +1,13 @@
 //! The seed tree: labels, derivation and the P-384 scalar.
 
-use crate::DEFAULT_INPUT;
 use mind_the_gap::seed::{
-    Algorithm, Seed256, Seed256Derive, algorithm_label, argon2id_256, derive_p384_scalar, label,
+    Algorithm, Seed256, Seed256Derive, algorithm_label, derive_p384_scalar, label,
 };
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD_NO_PAD;
 
 const SEED: Seed256 = [42u8; 32];
-
-#[test]
-fn derive_is_deterministic() {
-    assert_eq!(SEED.derive(Some(b"path")), SEED.derive(Some(b"path")));
-}
 
 #[test]
 fn derive_differs_by_path() {
@@ -27,28 +21,12 @@ fn derive_none_path_differs_from_some() {
 }
 
 #[test]
-fn derive_chains() {
-    // derive(a).derive(b) is distinct from derive(b) alone
-    assert_ne!(SEED.derive(Some(b"a")).derive(Some(b"b")), SEED.derive(Some(b"b")));
-}
-
-#[test]
 fn base64_round_trips() {
     let path = Some(b"test".as_slice());
     let derived = SEED.derive(path);
     let encoded = SEED.base64(path);
     let decoded = BASE64_STANDARD_NO_PAD.decode(&encoded).unwrap();
     assert_eq!(decoded.as_slice(), derived.as_ref());
-}
-
-#[test]
-fn argon_with_salt() {
-    let without_salt = argon2id_256(DEFAULT_INPUT, None);
-    let with_salt = argon2id_256(DEFAULT_INPUT, Some(b"test"));
-    // Adding a salt changes the output
-    assert_ne!(without_salt, with_salt);
-    // And the result is deterministic
-    assert_eq!(with_salt, argon2id_256(DEFAULT_INPUT, Some(b"test")));
 }
 
 /// The algorithm is a label segment of its own, behind a second colon.

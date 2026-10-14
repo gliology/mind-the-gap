@@ -67,8 +67,9 @@ touch requirement, the user pin, four imported P-256 keys with their pin and tou
 policies read back through metadata, the byte-for-byte certificate comparison, and the
 certificate authorities in msroots -- the check asserts that none of the advisory
 comparisons warn. The check runs once per algorithm: `virtual-piv` provisions the P-256
-chain, `virtual-piv-curve25519` the Ed25519 and X25519 one, and `virtual-piv-rsa2048` an
-RSA-2048 chain imported in the Yubico layout. Each then runs the
+chain, `virtual-piv-p384` the P-384 one, `virtual-piv-curve25519` the Ed25519 and X25519
+one, and `virtual-piv-rsa2048` an RSA-2048 chain imported in the Yubico layout. Each then
+runs the
 card-level half of the destructive PIV suite (`tests/piv_hardware/`, built as the
 `piv-suite` binary) against the same card: its own provisioning, the policy and
 certificate read-back, msroots and the card identifiers, and then the card signing in
@@ -91,7 +92,8 @@ follows it, and the flake input pin says exactly which revision the claims hold 
 One more variant provisions the [build server profile](piv-build-server.md) on the same
 card: P-384 throughout, pin once and touch never on 9A, 9C and 9D, and management access
 without a touch. `virtual-piv-builder` reads the result back through yubikit, slot policies
-and management key metadata included. The virtual card is only ever the app as it is: other
+and management key metadata included, and `virtual-piv-builder-tdes` does the same with
+the triple DES management key a YubiKey 4 needs forced onto the card. The virtual card is only ever the app as it is: other
 firmware is tested on the real thing, and a YubiKey 4 on firmware 4.3.7 has gone through the
 same provisioning and check, see [the build server chapter](piv-build-server.md#yubikey-4).
 

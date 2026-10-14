@@ -1,8 +1,8 @@
 //! Comparing a card with the derived chain, by metadata or by a signature challenge.
 
-use super::{ManagementKeyArg, SeededSmartcard, card::open_token, slots::slot_role};
+use super::{ManagementKeyArg, SeededSmartcard, SlotRole, card::open_token};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 
 use yubikey::piv::{self, AlgorithmId, ManagementSlotId, SlotId};
 use yubikey::{
@@ -40,6 +40,65 @@ fn pkcs1_sha256_block(digest: &[u8], size: usize) -> Vec<u8> {
     block[size - tail..size - digest.len()].copy_from_slice(&DIGEST_INFO);
     block[size - digest.len()..].copy_from_slice(digest);
     block
+}
+
+/// The RSA public key behind a derived SPKI
+fn rsa_public_key(spki: &SubjectPublicKeyInfoOwned) -> Result<rsa::RsaPublicKey> {
+    rsa::RsaPublicKey::from_public_key_der(&spki.to_der()?)
+        .map_err(|err| anyhow!("Derived RSA key is malformed: {err}"))
+}
+
+/// What the card is handed to sign for the challenge `digest`
+///
+/// The curves sign the digest as it is. The card applies the raw RSA private key
+/// operation, so for RSA the padding is ours.
+fn challenge_input(
+    algorithm: AlgorithmId,
+    spki: &SubjectPublicKeyInfoOwned,
+    digest: &[u8],
+) -> Result<Vec<u8>> {
+    Ok(match algorithm {
+        AlgorithmId::Rsa2048 | AlgorithmId::Rsa3072 | AlgorithmId::Rsa4096 => {
+            pkcs1_sha256_block(digest, rsa_public_key(spki)?.size())
+        }
+        _ => digest.to_vec(),
+    })
+}
+
+/// Whether `signature`, the card's answer to the challenge `digest`, verifies under the
+/// derived public key `spki`
+///
+/// Apart from the card, so the verification can be tested against signatures made in
+/// software. A derived key that does not parse is an error, a fault on this side; a
+/// signature that does not parse or does not verify is the card disagreeing, and `false`.
+fn verify_challenge(
+    algorithm: AlgorithmId,
+    spki: &SubjectPublicKeyInfoOwned,
+    digest: &[u8],
+    signature: &[u8],
+) -> Result<bool> {
+    let point = spki.subject_public_key.raw_bytes();
+    Ok(match algorithm {
+        AlgorithmId::Rsa2048 | AlgorithmId::Rsa3072 | AlgorithmId::Rsa4096 => {
+            use rsa::signature::hazmat::PrehashVerifier as _;
+            let key = rsa::pkcs1v15::VerifyingKey::<RsaSha256>::new(rsa_public_key(spki)?);
+            RsaSignature::try_from(signature)
+                .is_ok_and(|signature| key.verify_prehash(digest, &signature).is_ok())
+        }
+        AlgorithmId::EccP256 => {
+            let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(point)
+                .map_err(|err| anyhow!("Derived P-256 key is malformed: {err}"))?;
+            DerSignature::from_bytes(signature)
+                .is_ok_and(|signature| key.verify_prehash(digest, &signature).is_ok())
+        }
+        AlgorithmId::EccP384 => {
+            let key = p384::ecdsa::VerifyingKey::from_sec1_bytes(point)
+                .map_err(|err| anyhow!("Derived P-384 key is malformed: {err}"))?;
+            p384::ecdsa::DerSignature::from_bytes(signature)
+                .is_ok_and(|signature| key.verify_prehash(digest, &signature).is_ok())
+        }
+        other => bail!("{other:?} keys are not proven by a signature challenge"),
+    })
 }
 
 impl SeededSmartcard {
@@ -209,7 +268,7 @@ impl SeededSmartcard {
             log::warn!("Could not deauthenticate management key: {err}");
         }
 
-        crate::common::report_mismatches("chain", mismatches)
+        crate::common::report_mismatches("chain", &mismatches)
     }
 
     /// Prove that `slot` holds the key behind `spki` on a card that cannot report it
@@ -228,7 +287,7 @@ impl SeededSmartcard {
         spki: &SubjectPublicKeyInfoOwned,
         pin_warned: &mut bool,
     ) -> Result<Option<String>> {
-        let algorithm = slot_role(slot).card_algorithm(self.algorithm);
+        let algorithm = SlotRole::of(slot).card_algorithm(self.algorithm);
         let width = match algorithm {
             // RSA signs a SHA-256 digest, padded below
             AlgorithmId::EccP256
@@ -273,15 +332,7 @@ impl SeededSmartcard {
         if touch_policy != TouchPolicy::Never {
             eprintln!("[Please touch device to prove the {slot:?} key!]");
         }
-        // The card applies the raw RSA private key operation, so the padding is ours
-        let input = match algorithm {
-            AlgorithmId::Rsa2048 | AlgorithmId::Rsa3072 | AlgorithmId::Rsa4096 => {
-                let key = rsa::RsaPublicKey::from_public_key_der(&spki.to_der()?)
-                    .map_err(|err| anyhow!("Derived RSA key is malformed: {err}"))?;
-                pkcs1_sha256_block(&digest, key.size())
-            }
-            _ => digest.clone(),
-        };
+        let input = challenge_input(algorithm, spki, &digest)?;
         let signature = match piv::sign_data(token, &input, algorithm, slot) {
             Ok(signature) => signature,
             Err(err) => {
@@ -289,31 +340,7 @@ impl SeededSmartcard {
             }
         };
 
-        let point = spki.subject_public_key.raw_bytes();
-        let verified = match algorithm {
-            AlgorithmId::Rsa2048 | AlgorithmId::Rsa3072 | AlgorithmId::Rsa4096 => {
-                use rsa::signature::hazmat::PrehashVerifier as _;
-                let key = rsa::RsaPublicKey::from_public_key_der(&spki.to_der()?)
-                    .map_err(|err| anyhow!("Derived RSA key is malformed: {err}"))?;
-                let key = rsa::pkcs1v15::VerifyingKey::<RsaSha256>::new(key);
-                RsaSignature::try_from(&signature[..])
-                    .is_ok_and(|signature| key.verify_prehash(&digest, &signature).is_ok())
-            }
-            AlgorithmId::EccP256 => {
-                let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(point)
-                    .map_err(|err| anyhow!("Derived P-256 key is malformed: {err}"))?;
-                DerSignature::from_bytes(&signature)
-                    .is_ok_and(|signature| key.verify_prehash(&digest, &signature).is_ok())
-            }
-            _ => {
-                let key = p384::ecdsa::VerifyingKey::from_sec1_bytes(point)
-                    .map_err(|err| anyhow!("Derived P-384 key is malformed: {err}"))?;
-                p384::ecdsa::DerSignature::from_bytes(&signature)
-                    .is_ok_and(|signature| key.verify_prehash(&digest, &signature).is_ok())
-            }
-        };
-
-        if !verified {
+        if !verify_challenge(algorithm, spki, &digest, &signature)? {
             return Ok(Some(format!(
                 "{slot:?} slot: public key is not the derived one (signature challenge)"
             )));
@@ -321,5 +348,111 @@ impl SeededSmartcard {
 
         log::info!("{slot:?} slot key proven by a signature challenge");
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::seed::{self, Seed256};
+
+    use p256::ecdsa::signature::hazmat::PrehashSigner;
+
+    use crypto_bigint::BoxedUint;
+    use crypto_bigint::modular::BoxedMontyForm;
+
+    const SEED: Seed256 = [5u8; 32];
+
+    fn p256_key(label: &[u8]) -> p256::ecdsa::SigningKey {
+        let scalar = seed::derive_p256_scalar(&SEED, Some(label)).unwrap();
+        p256::ecdsa::SigningKey::from_slice(&scalar[..]).unwrap()
+    }
+
+    fn p384_key(label: &[u8]) -> p384::ecdsa::SigningKey {
+        let scalar = seed::derive_p384_scalar(&SEED, Some(label)).unwrap();
+        p384::ecdsa::SigningKey::from_slice(&scalar).unwrap()
+    }
+
+    /// The raw RSA private key operation a card applies to whatever block it is handed
+    fn rsa_raw_sign(key: &rsa::RsaPrivateKey, block: &[u8]) -> Vec<u8> {
+        use rsa::traits::PrivateKeyParts;
+
+        let precision = key.n().bits_precision();
+        let block = BoxedUint::from_be_slice(block, precision).unwrap();
+        BoxedMontyForm::new(block, key.n_params())
+            .pow(key.d())
+            .retrieve()
+            .to_be_bytes()
+            .to_vec()
+    }
+
+    /// Run one challenge against a card emulated in software: `sign` gets the input the
+    /// card would be handed, and whether to answer with the derived key or another one
+    fn assert_challenge_verifies(
+        algorithm: AlgorithmId,
+        width: usize,
+        spki: &SubjectPublicKeyInfoOwned,
+        sign: impl Fn(&[u8], bool) -> Vec<u8>,
+    ) {
+        let digest = vec![0x5a; width];
+        let input = challenge_input(algorithm, spki, &digest).unwrap();
+
+        assert!(
+            verify_challenge(algorithm, spki, &digest, &sign(&input, true)).unwrap(),
+            "{algorithm:?}: the derived key's answer was refused"
+        );
+        assert!(
+            !verify_challenge(algorithm, spki, &digest, &sign(&input, false)).unwrap(),
+            "{algorithm:?}: another key's answer was accepted"
+        );
+        assert!(
+            !verify_challenge(algorithm, spki, &digest, b"not a signature").unwrap(),
+            "{algorithm:?}: garbage was accepted as an answer"
+        );
+
+        // An answer to a different challenge proves nothing either
+        let mut other = digest.clone();
+        other[0] ^= 1;
+        assert!(
+            !verify_challenge(algorithm, spki, &other, &sign(&input, true)).unwrap(),
+            "{algorithm:?}: an answer to another challenge was accepted"
+        );
+    }
+
+    #[test]
+    fn p256_challenge_verifies() {
+        let (key, other) = (p256_key(b"key:a"), p256_key(b"key:b"));
+        let spki = SubjectPublicKeyInfoOwned::from_key(key.verifying_key()).unwrap();
+
+        assert_challenge_verifies(AlgorithmId::EccP256, 32, &spki, |input, derived| {
+            let signer = if derived { &key } else { &other };
+            let signature: p256::ecdsa::Signature = signer.sign_prehash(input).unwrap();
+            signature.to_der().as_bytes().to_vec()
+        });
+    }
+
+    #[test]
+    fn p384_challenge_verifies() {
+        let (key, other) = (p384_key(b"key:a"), p384_key(b"key:b"));
+        let spki = SubjectPublicKeyInfoOwned::from_key(key.verifying_key()).unwrap();
+
+        assert_challenge_verifies(AlgorithmId::EccP384, 48, &spki, |input, derived| {
+            let signer = if derived { &key } else { &other };
+            let signature: p384::ecdsa::Signature = signer.sign_prehash(input).unwrap();
+            signature.to_der().as_bytes().to_vec()
+        });
+    }
+
+    /// The RSA card is handed a padded block rather than the digest, so this also proves
+    /// the block is the one PKCS#1 v1.5 verification expects.
+    #[test]
+    fn rsa2048_challenge_verifies() {
+        let key = crate::rsa::derive_key(&SEED, 2048).unwrap();
+        let other = crate::rsa::derive_key(&[6u8; 32], 2048).unwrap();
+        let spki = SubjectPublicKeyInfoOwned::from_key(key.as_public_key()).unwrap();
+
+        assert_challenge_verifies(AlgorithmId::Rsa2048, 32, &spki, |input, derived| {
+            rsa_raw_sign(if derived { &key } else { &other }, input)
+        });
     }
 }

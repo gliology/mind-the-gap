@@ -16,59 +16,11 @@ use der::flagset::FlagSet;
 
 use spki::ObjectIdentifier;
 
-/// Configuration of key slots to be generated and uploaded.
-///
-/// Slot numbering follows NIST SP 800-73-4; note that `0x9b` is the management key slot and
-/// therefore deliberately absent. PIN and touch policies are the per-slot defaults required
-/// (9E) or recommended (the rest) by the same document -- see [`SeededSmartcard::policies_for`].
-pub(super) const DEFAULT_KEY_SLOTS: [(SlotId, SlotRole, PinPolicy, TouchPolicy); 4] = [
-    // One PIN verification unlocks a series of authentication operations (SSH, TLS, logon).
-    (SlotId::Authentication, SlotRole::Authentication, PinPolicy::Once, TouchPolicy::Cached),
-    // Non-repudiable signing: PIN and touch immediately before every single signature.
-    (SlotId::Signature, SlotRole::Signature, PinPolicy::Always, TouchPolicy::Always),
-    (SlotId::KeyManagement, SlotRole::KeyManagement, PinPolicy::Once, TouchPolicy::Cached),
-    // The card authentication key MUST be usable without cardholder verification.
-    (
-        SlotId::CardAuthentication,
-        SlotRole::CardAuthentication,
-        PinPolicy::Never,
-        TouchPolicy::Never,
-    ),
-];
-
 /// First retired key management slot, per SP 800-73; twenty follow, up to 0x95
 pub(super) const FIRST_RETIRED_SLOT: u8 = 0x82;
 
-/// Role a slot plays, by which its key is derived and its algorithm chosen
-///
-/// A retired slot holds a superseded key management key, so it plays that role.
-pub(super) fn slot_role(slot: SlotId) -> SlotRole {
-    match slot {
-        SlotId::Retired(_) => SlotRole::KeyManagement,
-        other => {
-            DEFAULT_KEY_SLOTS
-                .iter()
-                .find(|(candidate, ..)| *candidate == other)
-                .expect("slot is one of DEFAULT_KEY_SLOTS")
-                .1
-        }
-    }
-}
-
-/// Derivation name for a slot's key, by the *role* it plays rather than where it sits
-///
-/// Positional names (`slot-9d`) would tie a key to one slot, but the retired slots hold
-/// superseded key management keys: the same key has to derive identically whether it lives in
-/// 9D or in 0x82, or an archived generation could never be re-derived.
-pub(super) fn slot_name(slot: SlotId) -> &'static str {
-    match slot {
-        SlotId::Authentication => "authentication",
-        SlotId::Signature => "signature",
-        SlotId::KeyManagement => NAME_KEY_MANAGEMENT,
-        SlotId::CardAuthentication => "card-authentication",
-        other => unreachable!("{other:?} is not one of DEFAULT_KEY_SLOTS"),
-    }
-}
+/// Last retired key management slot
+pub(super) const LAST_RETIRED_SLOT: u8 = 0x95;
 
 /// Role a certificate plays, mapped one-to-one onto a NIST PIV key slot
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +36,67 @@ pub enum SlotRole {
 }
 
 impl SlotRole {
+    /// Every role, in the order of their slots; `0x9b` is the management key and therefore
+    /// deliberately absent
+    pub const ALL: [SlotRole; 4] = [
+        SlotRole::Authentication,
+        SlotRole::Signature,
+        SlotRole::KeyManagement,
+        SlotRole::CardAuthentication,
+    ];
+
+    /// The slot holding this role's live key, numbered per NIST SP 800-73-4
+    pub fn slot(self) -> SlotId {
+        match self {
+            SlotRole::Authentication => SlotId::Authentication,
+            SlotRole::Signature => SlotId::Signature,
+            SlotRole::KeyManagement => SlotId::KeyManagement,
+            SlotRole::CardAuthentication => SlotId::CardAuthentication,
+        }
+    }
+
+    /// The role a slot plays, by which its key is derived and its algorithm chosen
+    ///
+    /// A retired slot holds a superseded key management key, so it plays that role.
+    pub(super) fn of(slot: SlotId) -> SlotRole {
+        match slot {
+            SlotId::Authentication => SlotRole::Authentication,
+            SlotId::Signature => SlotRole::Signature,
+            SlotId::KeyManagement | SlotId::Retired(_) => SlotRole::KeyManagement,
+            SlotId::CardAuthentication => SlotRole::CardAuthentication,
+            other => unreachable!("{other:?} holds no derived key"),
+        }
+    }
+
+    /// Derivation name for the role's key, by the *role* rather than where it sits
+    ///
+    /// Positional names (`slot-9d`) would tie a key to one slot, but the retired slots hold
+    /// superseded key management keys: the same key has to derive identically whether it lives
+    /// in 9D or in 0x82, or an archived generation could never be re-derived.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            SlotRole::Authentication => "authentication",
+            SlotRole::Signature => "signature",
+            SlotRole::KeyManagement => NAME_KEY_MANAGEMENT,
+            SlotRole::CardAuthentication => "card-authentication",
+        }
+    }
+
+    /// Pin and touch policy by default, as NIST SP 800-73-4 requires (9E) or recommends (the
+    /// rest); see [`SeededSmartcard::policies_for`] for the overrides
+    pub(super) fn default_policies(self) -> (PinPolicy, TouchPolicy) {
+        match self {
+            // One PIN verification unlocks a series of authentication operations (SSH, TLS,
+            // logon)
+            SlotRole::Authentication => (PinPolicy::Once, TouchPolicy::Cached),
+            // Non-repudiable signing: PIN and touch immediately before every single signature
+            SlotRole::Signature => (PinPolicy::Always, TouchPolicy::Always),
+            SlotRole::KeyManagement => (PinPolicy::Once, TouchPolicy::Cached),
+            // The card authentication key MUST be usable without cardholder verification
+            SlotRole::CardAuthentication => (PinPolicy::Never, TouchPolicy::Never),
+        }
+    }
+
     /// Key usage bits appropriate for this role, for an RSA key if `rsa`
     pub(super) fn key_usage(&self, rsa: bool) -> FlagSet<KeyUsages> {
         match self {
@@ -148,10 +161,7 @@ impl SeededSmartcard {
             other => other,
         };
 
-        let (_, _, pin, touch) = DEFAULT_KEY_SLOTS
-            .iter()
-            .find(|(candidate, ..)| *candidate == slot)
-            .expect("slot is one of DEFAULT_KEY_SLOTS");
+        let (pin, touch) = SlotRole::of(slot).default_policies();
 
         // Slot 9E must stay pin-less and touch-less to remain spec compliant, so overrides
         // deliberately do not apply to it.
@@ -159,9 +169,9 @@ impl SeededSmartcard {
             if self.pin_policy.is_some() || self.touch_policy.is_some() {
                 log::warn!("Ignoring policy override for the card authentication slot");
             }
-            return (*pin, *touch);
+            return (pin, touch);
         }
 
-        (self.pin_policy.unwrap_or(*pin), self.touch_policy.unwrap_or(*touch))
+        (self.pin_policy.unwrap_or(pin), self.touch_policy.unwrap_or(touch))
     }
 }

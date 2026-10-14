@@ -2,7 +2,7 @@
 /book
 
 # Build symlink and direnv state
-/result
+/result*
 /.direnv
 /.envrc
 

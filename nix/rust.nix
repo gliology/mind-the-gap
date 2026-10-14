@@ -31,6 +31,15 @@ let
     ];
   };
 
+  # The external tools the interoperability tests drive; build.rs looks for them while the
+  # tests compile, so every check that builds the tests needs them
+  testTools = with pkgs; [
+    sequoia-sq
+    gnupg
+    openssl
+    nss.tools
+  ];
+
   # Dependencies compiled once, reused by the package build, clippy and the tests
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
@@ -123,14 +132,7 @@ in
         inherit cargoArtifacts;
         cargoClippyExtraArgs = "--all-targets -- --deny warnings";
 
-        nativeBuildInputs =
-          commonArgs.nativeBuildInputs
-          ++ (with pkgs; [
-            sequoia-sq
-            gnupg
-            openssl
-            nss.tools
-          ]);
+        nativeBuildInputs = commonArgs.nativeBuildInputs ++ testTools;
       }
     );
 
@@ -143,14 +145,7 @@ in
       // {
         inherit cargoArtifacts;
 
-        nativeBuildInputs =
-          commonArgs.nativeBuildInputs
-          ++ (with pkgs; [
-            sequoia-sq
-            gnupg
-            openssl
-            nss.tools
-          ]);
+        nativeBuildInputs = commonArgs.nativeBuildInputs ++ testTools;
 
         # Expose shared libraries so the test binaries can load them at runtime
         LD_LIBRARY_PATH = libPath;
@@ -173,13 +168,7 @@ in
         cargoExtraArgs = "--features destructive-hardware-tests";
         cargoTestExtraArgs = "--no-run";
 
-        nativeBuildInputs =
-          commonArgs.nativeBuildInputs
-          ++ (with pkgs; [
-            sequoia-sq
-            gnupg
-            openssl
-          ]);
+        nativeBuildInputs = commonArgs.nativeBuildInputs ++ testTools;
       }
     );
   };

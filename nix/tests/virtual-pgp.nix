@@ -89,8 +89,11 @@
         f"mind-the-gap {identity} pgp config {card} --lang en,de --url https://example.com/virt.asc"
     )
 
-    # A wrong subkey id must be detected before any pin is spent
-    machine.fail(f"mind-the-gap {identity} -k other pgp check {card}")
+    # A wrong subkey id must be detected before any pin is spent: as often as the card has
+    # admin pin retries, and the derived admin pin still opens it afterwards
+    for _ in range(3):
+        machine.fail(f"mind-the-gap {identity} -k other pgp check {card}")
+    machine.succeed(f"mind-the-gap {identity} pgp config {card} --lang de,en")
 
     # The same card takes a P-256 certificate: ECDSA signing and authentication keys and
     # an ECDH decryption key, which opcard imports on every slot. A re-upload factory
@@ -116,7 +119,7 @@
     # authenticating or decrypting with the result checked off the card, and gpg
     # signing and decrypting through it end to end
     machine.succeed(
-        "MTG_HARDWARE_TEST_CARD=0000:00000000 pgp-suite --test-threads 1 --exact "
+        "MTG_HARDWARE_TEST_CARD=0000:00000000 pgp-suite --exact "
         "provision_and_verify_card provision_and_verify_p256_card provision_and_verify_rsa_cards "
         "--nocapture > /tmp/suite.log 2>&1 || { cat /tmp/suite.log; exit 1; }"
     )

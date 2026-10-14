@@ -44,11 +44,8 @@ use sequoia_openpgp::types::Curve as PgpCurve;
 
 use zeroize::Zeroizing;
 
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
-
-/// Seed for the provisioned test identity. Deliberately different from the PIV suite's, so a
-/// crossed wire between the two backends cannot pass by coincidence.
-const TEST_SEED: Seed256 = [0xa7u8; 32];
 
 const TEST_PIN: &str = "471120";
 const TEST_NAME: &str = "Hardware Test";
@@ -73,8 +70,23 @@ fn target() -> String {
     }
 }
 
+/// Seed for the provisioned test identity, from the identifier of the card under test.
+///
+/// Deliberately different from the PIV suite's, so a crossed wire between the two backends
+/// cannot pass by coincidence, and different per card: gpg-agent signs on whichever attached
+/// card holds the key it looks up, so with one identity on several cards, as on a test host,
+/// it can sign on another card and wait there for a touch.
+fn test_seed() -> Seed256 {
+    use sha2::{Digest, Sha256};
+    Sha256::new()
+        .chain_update([0xa7])
+        .chain_update(target().to_ascii_uppercase())
+        .finalize()
+        .into()
+}
+
 fn subject() -> SeededSmartcard {
-    SeededSmartcard::new(&TEST_SEED, None, TEST_NAME.into())
+    SeededSmartcard::new(&test_seed(), None, TEST_NAME.into())
         .add_email(TEST_EMAIL)
         .unwrap()
         .with_pin(Zeroizing::new(TEST_PIN.to_string()))
@@ -82,11 +94,12 @@ fn subject() -> SeededSmartcard {
         .with_subkey_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
 }
 
-/// Open the card under test directly, bypassing the crate.
+/// Open the card under test directly, bypassing the crate, with the serial number gpg knows
+/// it by (its application identifier).
 ///
 /// The assertions below have to be independent of the code they are checking, so they read the
 /// card through `openpgp-card` rather than through `SeededSmartcard::check`.
-fn open() -> Card<openpgp_card::state::Open> {
+fn open() -> (Card<openpgp_card::state::Open>, String) {
     let ident = target();
     let backends: Vec<PcscBackend> = PcscBackend::cards(None)
         .expect("cannot enumerate PC/SC cards")
@@ -95,15 +108,14 @@ fn open() -> Card<openpgp_card::state::Open> {
 
     for backend in backends {
         let mut card = Card::new(backend).expect("cannot open card");
-        let matches = {
+        let aid = {
             let tx = card.transaction().expect("cannot start card transaction");
             tx.application_identifier()
                 .expect("cannot read application identifier")
-                .ident()
-                .eq_ignore_ascii_case(&ident)
         };
-        if matches {
-            return card;
+        if aid.ident().eq_ignore_ascii_case(&ident) {
+            let serialno = aid.to_string().replace(' ', "");
+            return (card, serialno);
         }
     }
 
@@ -158,19 +170,33 @@ impl Drop for ScdaemonGuard {
     }
 }
 
+/// The one card every test here factory-resets, held for each test's whole run
+///
+/// The harness runs tests in parallel, and two of them provisioning the same card at once
+/// interleave their commands: on hardware that showed as protocol errors and as keys wiped
+/// halfway through another test's checks. Each run resets the applet first, so the order
+/// the tests take the card in is immaterial.
+static CARD: Mutex<()> = Mutex::new(());
+
+/// Take the card for the calling test
+///
+/// A test that failed while holding it poisons the lock, but leaves nothing the next
+/// test's own factory reset does not clear, so the poison is ignored rather than spread.
+fn exclusive_card() -> MutexGuard<'static, ()> {
+    CARD.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[test]
 fn provision_and_verify_card() {
+    let _card = exclusive_card();
     provision_and_verify(subject());
 }
 
 /// The same checklist with `--algorithm p256`: ECDSA signing and authentication keys and an
 /// ECDH decryption key, which a YubiKey 5 imports as readily as Curve25519 ones.
-///
-/// Shares the card with the run above, so the two must not interleave: run this suite
-/// with `--test-threads 1`. Each run factory-resets the applet first, so their order is
-/// immaterial.
 #[test]
 fn provision_and_verify_p256_card() {
+    let _card = exclusive_card();
     provision_and_verify(
         subject()
             .with_algorithm(Algorithm::P256)
@@ -180,9 +206,10 @@ fn provision_and_verify_p256_card() {
 
 /// The same checklist with RSA keys, at each size: every YubiKey 5 imports RSA up to 4096
 /// bits into its OpenPGP applet, and the larger keys are the ones whose import needs more
-/// than one short APDU. Same `--test-threads 1` caveat as above.
+/// than one short APDU.
 #[test]
 fn provision_and_verify_rsa_cards() {
+    let _card = exclusive_card();
     for algorithm in [Algorithm::Rsa2048, Algorithm::Rsa3072, Algorithm::Rsa4096] {
         eprintln!("--- {algorithm:?}");
         provision_and_verify(
@@ -225,7 +252,7 @@ fn provision_and_verify(subject: SeededSmartcard) {
     eprintln!("[4/7] asserting card contents independently");
     let expected = derived_fingerprints(&offline);
 
-    let mut card = open();
+    let (mut card, serialno) = open();
     let mut transaction = card.transaction().expect("cannot start card transaction");
 
     for (kind, want) in &expected {
@@ -247,6 +274,12 @@ fn provision_and_verify(subject: SeededSmartcard) {
     transaction
         .verify_user_pin(secrecy::SecretString::from(TEST_PIN.to_string()))
         .expect("card rejected the pin we provisioned it with");
+    assert!(
+        transaction
+            .verify_user_pin(secrecy::SecretString::from("123456".to_string()))
+            .is_err(),
+        "card still accepts the factory user pin",
+    );
 
     // -- Every key works on the card ------------------------------------------------------
     //
@@ -263,7 +296,7 @@ fn provision_and_verify(subject: SeededSmartcard) {
     drop(card);
 
     eprintln!("[6/7] gpg sees the card and uses its keys -- TOUCH if the card blinks");
-    gpg_sees_the_keys(&expected, &offline);
+    gpg_sees_the_keys(&expected, &offline, &serialno);
 
     // -- Post-provisioning configuration ---------------------------------------------------
     //
@@ -284,7 +317,7 @@ fn provision_and_verify(subject: SeededSmartcard) {
         .expect("configure failed against the provisioned card");
 
     // Read back independently of the crate
-    let mut card = open();
+    let (mut card, _) = open();
     let mut transaction = card.transaction().expect("cannot start card transaction");
     assert_eq!(
         transaction.url().expect("cannot read url"),
@@ -298,11 +331,6 @@ fn provision_and_verify(subject: SeededSmartcard) {
     );
 }
 
-/// Confirm gpg itself finds the three keys, and clean up the scdaemon that costs.
-///
-/// Uses a throwaway GNUPGHOME so the caller's keyring and agent are untouched, and forces
-/// scdaemon through PC/SC -- its internal CCID driver claims the USB interface directly and
-/// fails with "No such device" whenever pcscd already holds the reader.
 /// A subkey's public key material, as the certificate carries it
 fn public_mpis(cert: &Cert, role: SubkeyRole) -> mpi::PublicKey {
     let policy = StandardPolicy::new();
@@ -481,8 +509,17 @@ fn keys_work_on_card(transaction: &mut Card<Transaction<'_>>, cert: &Cert) {
     }
 }
 
+/// Confirm gpg itself finds the three keys, and clean up the scdaemon that costs.
+///
+/// Uses a throwaway GNUPGHOME so the caller's keyring and agent are untouched, and forces
+/// scdaemon through PC/SC -- its internal CCID driver claims the USB interface directly and
+/// fails with "No such device" whenever pcscd already holds the reader.
+///
+/// The card is named by its serial number throughout, because scdaemon otherwise takes
+/// whichever OpenPGP card it likes when several are attached, as on a test host, and the
+/// test identity is the same on all of them.
 #[cfg(has_gpg)]
-fn gpg_sees_the_keys(expected: &[(KeyType, [u8; 20])], cert: &Cert) {
+fn gpg_sees_the_keys(expected: &[(KeyType, [u8; 20])], cert: &Cert, serialno: &str) {
     // tempfile gives an unpredictable path, so nothing can pre-place a directory or
     // symlink there; into_path hands ownership to the ScdaemonGuard below
     let home = tempfile::tempdir()
@@ -502,16 +539,35 @@ fn gpg_sees_the_keys(expected: &[(KeyType, [u8; 20])], cert: &Cert) {
     // Armed before gpg runs, so the daemon is stopped even if an assertion below panics
     let _guard = ScdaemonGuard { home: home.clone() };
 
-    let output = std::process::Command::new("gpg")
+    // Make the card current and have the agent learn its keys: the key stubs it writes record
+    // this serial number, so the signing and decryption below go to this card and no other
+    let learned = std::process::Command::new("gpg-connect-agent")
         .env("GNUPGHOME", &home)
-        .arg("--card-status")
+        .args([
+            &format!("scd switchcard {serialno}"),
+            "learn --force",
+            "/bye",
+        ])
         .output()
-        .expect("cannot run gpg");
+        .expect("cannot run gpg-connect-agent");
+    let replies = String::from_utf8_lossy(&learned.stdout);
+    assert!(
+        learned.status.success() && !replies.lines().any(|line| line.starts_with("ERR")),
+        "gpg-agent cannot learn card {serialno}:\n{replies}\n{}",
+        String::from_utf8_lossy(&learned.stderr),
+    );
+
+    // `gpg --card-status` asks for no card in particular; gpg-card lists the one named
+    let output = std::process::Command::new("gpg-card")
+        .env("GNUPGHOME", &home)
+        .args(["--no-history", "list", serialno])
+        .output()
+        .expect("cannot run gpg-card");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
-        "gpg --card-status failed:\n{}\n{}",
+        "gpg-card list failed:\n{}\n{}",
         stdout,
         String::from_utf8_lossy(&output.stderr),
     );
@@ -600,7 +656,7 @@ fn gpg_uses_the_keys(home: &std::path::Path, cert: &Cert) {
 }
 
 #[cfg(not(has_gpg))]
-fn gpg_sees_the_keys(_expected: &[(KeyType, [u8; 20])], _cert: &Cert) {
+fn gpg_sees_the_keys(_expected: &[(KeyType, [u8; 20])], _cert: &Cert, _serialno: &str) {
     // A destructive run that cannot finish its last assertion must say so in the result,
     // not in a line of buffered output: a pass with a skipped step is not a pass. The card
     // itself is fine -- provisioning succeeded before this step.

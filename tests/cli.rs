@@ -1,9 +1,9 @@
 //! Tests that drive the real binary, covering the interactive guard rails.
 //!
 //! Everything here runs the compiled `mind-the-gap` with a fixed test seed on the command
-//! line and asserts on exit status and stderr. None of these invocations may ever reach a
-//! card: each one is expected to stop at a validation or confirmation step that comes
-//! before any hardware is opened.
+//! line and asserts on exit status and stderr. None of these invocations may ever change a
+//! card: each one is expected to stop at a validation or confirmation step, or at a card
+//! that cannot exist, before any hardware is written to.
 
 use mind_the_gap::cli::{command, repl_command};
 
@@ -14,10 +14,21 @@ const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon aband
                            abandon abandon abandon abandon abandon abandon abandon abandon \
                            abandon abandon abandon abandon abandon abandon abandon art";
 
+/// Card serial for commands that must fail to find their card
+///
+/// Passed wherever a test runs a command that would otherwise pick the one card attached:
+/// should a regression ever carry such a run past its guard rails, it finds no card to
+/// reset rather than the developer's. It parses as a PIV serial, and as an OpenPGP
+/// identifier it matches nothing, those always carrying a colon.
+const NO_CARD: &str = "4294967295";
+
 /// The compiled binary with a hermetic environment.
 ///
 /// `MIND_THE_...` variables from the calling shell must not leak in -- a developer's
-/// exported seed or defaults would otherwise change what these tests exercise.
+/// exported seed or defaults would otherwise change what these tests exercise. Nor may the
+/// developer's terminal: what a closed stdin cannot answer is asked on the controlling
+/// terminal instead, so every run starts a session of its own, without one, and a prompt
+/// fails where it would otherwise wait on that terminal, or be answered from it.
 fn bin() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mind-the-gap"));
     for (name, _) in std::env::vars_os() {
@@ -27,6 +38,19 @@ fn bin() -> Command {
         }
     }
     cmd.stdin(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe and touches no state of the parent
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
     cmd
 }
 
@@ -156,15 +180,17 @@ exit
     );
 }
 
-/// A piped upload without --yes refuses without eating the next script line.
+/// A failed piped upload leaves the script lines after it alone.
+///
+/// The card is opened before the confirmation, so without one the upload stops there; the
+/// "yes" line then has to run as a (rejected) command of its own rather than vanish into a
+/// prompt, and the certify line after it still has to run.
 #[test]
-fn piped_confirm_does_not_eat_lines() {
+fn piped_upload_does_not_eat_lines() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cert.asc");
-    // If confirm() consumed stdin, the "yes" fed here would answer it and the certify
-    // line after it would be swallowed as a stray answer
     let script = format!(
-        "pgp upload
+        "pgp upload -c {NO_CARD}
 yes
 pgp certify --kind full -o {}
 exit
@@ -176,7 +202,10 @@ exit
     let stderr = String::from_utf8_lossy(&out.stderr);
 
     assert!(out.status.success(), "session died: {:?}", out);
-    assert!(stderr.contains("--yes"), "upload did not point at --yes:\n{stderr}");
+    assert!(
+        stderr.contains("unrecognized subcommand 'yes'"),
+        "the line after the upload did not run as a command of its own:\n{stderr}"
+    );
     assert!(path.exists(), "a later script line was consumed as a confirmation answer");
 }
 
@@ -343,7 +372,16 @@ fn version_verb_works_in_session() {
 #[test]
 fn pgp_check_needs_no_emails() {
     let out = bin()
-        .args(["-s", TEST_PHRASE, "-n", "Alice", "pgp", "check"])
+        .args([
+            "-s",
+            TEST_PHRASE,
+            "-n",
+            "Alice",
+            "pgp",
+            "check",
+            "-c",
+            NO_CARD,
+        ])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -383,14 +421,14 @@ exit
 fn factory_pin_warns() {
     for backend in ["pgp", "piv"] {
         let out = identity(&mut bin())
-            .args([backend, "upload"])
+            .args([backend, "upload", "-c", NO_CARD])
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
 
-        // The run still dies at the confirmation prompt (stdin is closed), but the
-        // factory pin warning must already be on record by then
-        assert!(!out.status.success(), "{backend} upload with a closed stdin exited zero");
+        // The run still dies, at the missing card or at the unanswerable confirmation,
+        // but the factory pin warning must already be on record by then
+        assert!(!out.status.success(), "{backend} upload without a card exited zero");
         assert!(
             stderr.contains("factory user pin"),
             "{backend} upload does not warn about the factory pin:\n{stderr}",
@@ -427,25 +465,12 @@ fn weak_phrase_warns_for_strong_algorithms() {
     }
 }
 
-/// The confirmation prompt treats a closed stdin as "no", before any card is opened.
-#[test]
-fn confirm_prompt_aborts_on_eof() {
-    let out = identity(&mut bin())
-        .args(["pgp", "upload"])
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-
-    assert!(!out.status.success(), "upload with a closed stdin exited zero");
-    assert!(stderr.contains("confirmation"), "the EOF abort does not explain itself:\n{stderr}",);
-}
-
 /// The PIV pin is validated for length before anything else happens.
 #[test]
 fn piv_pin_length_is_validated() {
     for pin in ["123", "123456789"] {
         let out = identity(&mut bin())
-            .args(["piv", "upload", "-i", pin])
+            .args(["piv", "upload", "-c", NO_CARD, "-i", pin])
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -600,22 +625,7 @@ fn unprotected_export_warns_and_restricts_the_file() {
 #[test]
 #[cfg(unix)]
 fn generate_refuses_without_a_terminal() {
-    use std::os::unix::process::CommandExt;
-
-    let mut cmd = bin();
-    cmd.arg("generate")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // A fresh session has no controlling terminal, so /dev/tty cannot resolve to the
-    // developer's own -- without this the test would prompt (and hang) locally
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-
-    let out = cmd.output().unwrap();
+    let out = bin().arg("generate").output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
@@ -625,28 +635,113 @@ fn generate_refuses_without_a_terminal() {
 }
 
 #[test]
-fn test_man_page_generation() {
-    // Build command line interface
+fn man_page_generation() {
     let mut cmd = command();
     cmd.build();
 
-    // Verify that we can properly generate a manpage
-    // This tests that the manpage generation works without errors
     let man = clap_mangen::Man::new(cmd);
     let mut output = Vec::new();
     man.render(&mut output).unwrap();
 
-    // Check that output is generated (manpage content should exist)
     assert!(!output.is_empty());
 }
 
+/// Each shell the package installs completions for gets a script that offers the
+/// subcommands, not merely one that generates without an error.
 #[test]
-fn test_shell_completion_exists() {
-    // This test verifies that we can get a command and that it can
-    // be used to generate shell completions without errors
-    let mut cmd = command();
-    cmd.build();
+fn shell_completions_offer_the_subcommands() {
+    use clap_complete::Shell;
 
-    // This ensures that CLI can be constructed and used properly
-    assert!(cmd.get_name() == "mind-the-gap");
+    for shell in [Shell::Bash, Shell::Fish, Shell::Zsh] {
+        let mut output = Vec::new();
+        clap_complete::generate(shell, &mut command(), "mind-the-gap", &mut output);
+        let script = String::from_utf8(output).unwrap();
+
+        for subcommand in ["piv", "pgp", "certify", "generate"] {
+            assert!(script.contains(subcommand), "{shell} completions do not offer {subcommand}");
+        }
+    }
+}
+
+/// The command line's own defaults are frozen with the scheme.
+///
+/// The shortest command a user can type -- the phrase, a name and an address, nothing
+/// else -- runs through the phrase step, each backend's default algorithm and the default
+/// date at once, so these two values pin all three as a user gets them. Like the vectors
+/// in the library suites, they do not change within a major version.
+#[test]
+fn shortest_commands_are_frozen() {
+    use sequoia_openpgp::parse::Parse;
+    use sha2::{Digest, Sha256};
+    use x509_cert::der::{DecodePem, Encode};
+
+    let dir = tempfile::tempdir().unwrap();
+    let certify = |backend: &str, kind: &str, name: &str| {
+        let path = dir.path().join(name);
+        let out = identity(&mut bin())
+            .args([
+                backend,
+                "certify",
+                "--kind",
+                kind,
+                "-o",
+                path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{backend} certify failed: {:?}", out);
+        std::fs::read(path).unwrap()
+    };
+
+    let cert = sequoia_openpgp::Cert::from_bytes(&certify("pgp", "full", "cert.asc")).unwrap();
+    assert_eq!(
+        cert.fingerprint().to_hex(),
+        "38BAAB2F9DE7D459C34A80B3AF859A5F33253C3A",
+        "the default OpenPGP certificate moved"
+    );
+
+    let root = x509_cert::Certificate::from_pem(certify("piv", "root", "root.pem")).unwrap();
+    let digest: String = Sha256::digest(root.to_der().unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        digest, "5ca6abbbeb3e19ce32159cb2a32746caac500d8080c5ea99199489986e31f811",
+        "the default PIV root certificate moved"
+    );
+}
+
+/// `--date` is midnight UTC wherever the command runs: the timezone of the machine it is
+/// typed on must not reach a derivation input. Kiritimati is as far ahead of UTC as any
+/// zone gets, and the far western end is spelled the POSIX way, which needs no zone
+/// database, so the test cannot pass vacuously on a machine without one.
+#[test]
+fn date_ignores_the_timezone() {
+    use x509_cert::der::DecodePem;
+
+    let dir = tempfile::tempdir().unwrap();
+    let certify = |tz: &str, name: &str| {
+        let path = dir.path().join(name);
+        let out = identity(&mut bin())
+            .env("TZ", tz)
+            .args(["piv", "-d", "2026-01-01", "certify", "--kind", "root"])
+            .args(["-o", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "certify under TZ={tz} failed: {:?}", out);
+        std::fs::read(path).unwrap()
+    };
+
+    let utc = certify("UTC", "utc.pem");
+    for (index, tz) in ["Pacific/Kiritimati", "<-12>12"].into_iter().enumerate() {
+        assert_eq!(certify(tz, &format!("{index}.pem")), utc, "TZ={tz} moved the date");
+    }
+
+    let root = x509_cert::Certificate::from_pem(utc).unwrap();
+    let not_before = root
+        .tbs_certificate()
+        .validity()
+        .not_before
+        .to_unix_duration();
+    assert_eq!(not_before.as_secs(), 1_767_225_600, "--date is not midnight UTC");
 }

@@ -8,7 +8,6 @@ fn main() -> ExitCode {
     // Die quietly when stdout closes early: Rust ignores SIGPIPE by default, so a plain
     // `mind-the-gap pgp status | head` would end in a println! panic instead of the
     // silent exit every other unix tool gives. Nothing here relies on surviving EPIPE.
-    #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
@@ -17,7 +16,6 @@ fn main() -> ExitCode {
     // be readable through ptrace or /proc/<pid>/mem by anything else running as the
     // same user; both matter doubly on the live image, which autologins one user with
     // passwordless sudo.
-    #[cfg(unix)]
     unsafe {
         libc::setrlimit(libc::RLIMIT_CORE, &libc::rlimit { rlim_cur: 0, rlim_max: 0 });
         libc::prctl(libc::PR_SET_DUMPABLE, 0);

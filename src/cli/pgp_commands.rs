@@ -1,7 +1,9 @@
 //! The `pgp` subcommands and their handler.
 
-use super::{Identity, confirm, spelled, spelled_all, warn_if_phrase_is_weaker, write_sensitive};
-use crate::common;
+use super::{
+    Identity, confirm, parse_date, parse_duration, spelled, spelled_all, warn_factory_pin,
+    warn_if_phrase_is_weaker, write_sensitive,
+};
 use crate::pgp::{self, CertificateKind, VerificationKind};
 use crate::qr;
 use crate::seed::Algorithm;
@@ -191,14 +193,48 @@ fn parse_lang(s: &str) -> Result<[u8; 2], String> {
     }
 }
 
-/// The PGP backend's certificate options, as parsed
+/// The options every `pgp` subcommand shares, given before the subcommand or after it
+#[derive(clap::Args, Clone, Default)]
 pub(super) struct PGPOptions {
+    /// Creation date of the primary key
+    #[arg(short, long, value_name = "YYYY-MM-DD", global = true, env = "MIND_THE_DATE", value_parser = parse_date)]
     pub(super) date: Option<DateTime<Utc>>,
+
+    /// Creation date of the subkeys
+    #[arg(long, value_name = "YYYY-MM-DD", global = true, env = "MIND_THE_SUBDATE", value_parser = parse_date)]
     pub(super) subdate: Option<DateTime<Utc>>,
+
+    /// Validity duration of the subkeys
+    #[arg(short, long, value_name = "DURATION", global = true, env = "MIND_THE_VALIDITY", value_parser = parse_duration)]
     pub(super) validity: Option<Duration>,
+
+    /// Subkeys to derive without the subkey id, so every card gets the same one
+    #[arg(
+        long,
+        value_name = "KEYS",
+        value_delimiter = ',',
+        global = true,
+        env = "MIND_THE_PGP_SHARED"
+    )]
     pub(super) shared: Vec<pgp::SharedKey>,
+
+    /// Use the original derivation labels, for cards provisioned before the scheme changed
+    #[arg(long, global = true, env = "MIND_THE_LEGACY")]
     pub(super) legacy: bool,
+
+    /// Algorithm to derive every key with (Curve25519 by default; p384 is PIV-only)
+    #[arg(long, value_enum, global = true, env = "MIND_THE_ALGORITHM")]
     pub(super) algorithm: Option<Algorithm>,
+}
+
+impl PGPCommand {
+    /// Whether the command builds user ids, and so needs a name and emails
+    pub(super) fn mints_uids(&self) -> bool {
+        matches!(
+            self,
+            PGPCommand::Certify { .. } | PGPCommand::Upload { .. } | PGPCommand::Export { .. }
+        )
+    }
 }
 
 /// Run one PGP subcommand, assembling the certificate builder on demand
@@ -220,10 +256,7 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
     // simply never calls it; the closure moves the identity in and can run at most once
     // Only the commands that mint user ids need emails; check compares keys, revoke
     // retires them, config touches card data -- none of them builds a uid
-    let needs_emails = matches!(
-        command,
-        PGPCommand::Certify { .. } | PGPCommand::Upload { .. } | PGPCommand::Export { .. }
-    );
+    let needs_emails = command.mints_uids();
 
     let builder = move || -> Result<pgp::SeededSmartcard> {
         // Everything missing at once, so a script is fixed in one round
@@ -239,7 +272,6 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
         }
         let name = name.expect("checked above");
 
-        // Prepare pgp cert
         log::info!("Initializing PGP certificate for '{}'", name);
 
         let scheme = if legacy {
@@ -261,13 +293,11 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
             builder = builder.with_algorithm(algorithm)?;
         }
 
-        // Add user identities
         for address in emails.into_iter() {
             log::info!("Adding userid for email: {}", address);
             builder = builder.add_email(&address)?;
         }
 
-        // Set creation date
         if let Some(date) = date {
             log::info!("Setting certificate creation time: {}", date.format("%Y-%m-%d %T"));
             builder = builder.with_creation_time(date.into());
@@ -283,7 +313,6 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
             builder = builder.with_shared(shared.clone());
         }
 
-        // Set validity period
         if let Some(validity) = validity {
             log::info!(
                 "Setting subkey validity duration: {}",
@@ -300,13 +329,11 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
         PGPCommand::Check { pin, card } => {
             let mut builder = builder()?;
 
-            // Apply pin to smartcard
             if let Some(pin) = pin.as_ref() {
                 log::info!("Verifying the supplied user pin");
                 builder = builder.with_pin(pin.clone());
             }
 
-            // Show info about target card
             if let Some(serial) = card.as_ref() {
                 log::info!("Checking keys on smartcard: {}", serial);
             }
@@ -326,7 +353,7 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
             builder.configure(card, settings)
         }
         PGPCommand::Upload { pin, card, yes, output, qr: show_qr } => {
-            common::warn_factory_pin(pin.is_none());
+            warn_factory_pin(pin.is_none());
 
             // The OpenPGP card spec requires at least 6 characters for the user pin
             if let Some(pin) = pin.as_ref()
@@ -341,7 +368,6 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
             // fixed epoch value, so an upload without dates is deterministic and is
             // exactly the configuration the hardware suite provisions with
 
-            // Apply pin to smartcard and cert
             if let Some(pin) = pin.as_ref() {
                 log::info!("Protecting card and keys with the supplied pin");
                 builder = builder.with_pin(pin.clone());
@@ -354,7 +380,6 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
                 confirm("OpenPGP", &target)?;
             }
 
-            // Generate and save result
             let cert = builder.upload(card)?;
             log::info!("Uploaded PGP certificate '{}'", cert);
 
@@ -372,26 +397,17 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
         PGPCommand::Certify { kind, output } => {
             let builder = builder()?;
 
-            // Generate public certificate and save result
             log::info!("Certifying the {} certificate", spelled(&kind));
             let cert = builder.certify(kind)?;
 
             log::info!("Generated PGP certificate '{}'", cert);
             let armored = cert.armored().to_vec()?;
 
-            if let Some(path) = output {
-                log::info!("Saving certificate to file: {}", path.display());
-                fs::write(path, &armored)?;
-            } else {
-                qr::show_qr(&armored, false)?;
-            }
-
-            Ok(())
+            emit_public(&armored, output)
         }
         PGPCommand::Export { pin, output, qr: show_qr } => {
             let mut builder = builder()?;
 
-            // Apply pin to private keys
             if let Some(pin) = pin.as_ref() {
                 log::info!("Protecting exported keys with the supplied pin");
                 builder = builder.with_pin(pin.clone());
@@ -401,7 +417,6 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
                 );
             }
 
-            // Generate secret keys and save result
             let cert = builder.export()?;
             log::info!("Generated PGP secret keys for {}", cert);
 
@@ -419,7 +434,6 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
         PGPCommand::Revoke { output, kind, code, reason } => {
             let builder = builder()?;
 
-            // Generate rev cert and save result
             let raw = builder.revoke(kind, code, &reason)?;
             log::info!("Generated a revocation of the {}", spelled(&kind));
 
@@ -446,7 +460,6 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
         PGPCommand::Trust { input, kind, output } => {
             let builder = builder()?;
 
-            // Generate public certificate and save result
             log::info!("Certifying certificate in file: {}", input.display());
             let other = Cert::from_file(input)?;
 
@@ -456,14 +469,19 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
             log::info!("Generated PGP certificate '{}'", cert);
             let armored = cert.armored().to_vec()?;
 
-            if let Some(path) = output {
-                log::info!("Saving certificate to file: {}", path.display());
-                fs::write(path, &armored)?;
-            } else {
-                qr::show_qr(&armored, false)?;
-            }
+            emit_public(&armored, output)
+        }
+    }
+}
 
+/// Write a public certificate to `output`, or show it as a QR code when there is none
+fn emit_public(armored: &[u8], output: Option<PathBuf>) -> Result<()> {
+    match output {
+        Some(path) => {
+            log::info!("Saving certificate to file: {}", path.display());
+            fs::write(path, armored)?;
             Ok(())
         }
+        None => qr::show_qr(armored, false),
     }
 }
