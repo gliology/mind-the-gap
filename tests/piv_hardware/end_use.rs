@@ -50,6 +50,9 @@ pub(super) fn only_reader(dir: &std::path::Path, reader: &str) {
 }
 
 /// A command for an end-use tool, with OpenSC restricted to the card under test
+///
+/// The session's SSH agent is hidden as well: when it is gpg-agent, `ssh` asking it for keys
+/// makes it start an scdaemon, which then holds every reader on the machine exclusively.
 fn tool(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     let mut command = std::process::Command::new(program);
     command.env(
@@ -58,6 +61,7 @@ fn tool(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
             .get()
             .expect("only_reader runs before any end-use step"),
     );
+    command.env_remove("SSH_AUTH_SOCK");
     command
 }
 
@@ -559,6 +563,8 @@ pub(super) fn ssh_authenticates(dir: &std::path::Path, module: &str) {
         .args(["-o", "StrictHostKeyChecking=no"])
         .args(["-o", "UserKnownHostsFile=/dev/null"])
         .args(["-o", "PreferredAuthentications=publickey"])
+        // An `IdentityAgent` in the user's ssh config would bypass the missing socket
+        .args(["-o", "IdentityAgent=none"])
         .args(["-I", module])
         .args(["-p", &port.to_string()])
         .arg(format!("{user}@127.0.0.1"))

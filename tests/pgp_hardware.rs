@@ -51,6 +51,9 @@ const TEST_PIN: &str = "471120";
 const TEST_NAME: &str = "Hardware Test";
 const TEST_EMAIL: &str = "hardware-test@example.com";
 
+#[path = "common/readers.rs"]
+mod readers;
+
 /// Application identifier of the card under test.
 ///
 /// Required, and required to be explicit, for the same reason as the PIV suite's serial: the
@@ -67,6 +70,19 @@ fn target() -> String {
              \n\
              \tMTG_HARDWARE_TEST_CARD=<ident> cargo test --features destructive-hardware-tests --test pgp_hardware\n"
         ),
+    }
+}
+
+/// Whether this run turns the touch policies off, for a host that runs it unattended
+///
+/// `MTG_HARDWARE_TEST_TOUCH=never`, as in the PIV suite: a script cannot touch a YubiKey, so
+/// this is how the suite runs without a person, proving everything except that touch is
+/// enforced, which the default run does.
+fn touch_free() -> bool {
+    match std::env::var("MTG_HARDWARE_TEST_TOUCH") {
+        Err(_) => false,
+        Ok(touch) if touch == "never" => true,
+        Ok(other) => panic!("MTG_HARDWARE_TEST_TOUCH is `never` or unset, not `{other}`"),
     }
 }
 
@@ -98,28 +114,70 @@ fn subject() -> SeededSmartcard {
 /// it by (its application identifier).
 ///
 /// The assertions below have to be independent of the code they are checking, so they read the
-/// card through `openpgp-card` rather than through `SeededSmartcard::check`.
+/// card through `openpgp-card` rather than through `SeededSmartcard::check`. The cards are
+/// told apart over plain PC/SC and every other one is left as it was: dropping an
+/// `openpgp-card` connection resets the card, which would break a suite running on it.
 fn open() -> (Card<openpgp_card::state::Open>, String) {
     let ident = target();
-    let backends: Vec<PcscBackend> = PcscBackend::cards(None)
-        .expect("cannot enumerate PC/SC cards")
-        .filter_map(Result::ok)
+    let context = pcsc::Context::establish(pcsc::Scope::User).expect("cannot open a PC/SC context");
+    let mut names = vec![
+        0;
+        context
+            .list_readers_len()
+            .expect("cannot list PC/SC readers")
+    ];
+    let readers: Vec<std::ffi::CString> = context
+        .list_readers(&mut names)
+        .expect("cannot list PC/SC readers")
+        .map(std::ffi::CStr::to_owned)
         .collect();
 
-    for backend in backends {
+    for reader in readers {
+        let Ok(mut probe) = context.connect(&reader, pcsc::ShareMode::Shared, pcsc::Protocols::ANY)
+        else {
+            continue;
+        };
+        let found = probe_ident(&mut probe).is_some_and(|id| id.eq_ignore_ascii_case(&ident));
+        let _ = probe.disconnect(pcsc::Disposition::LeaveCard);
+        if !found {
+            continue;
+        }
+
+        let backend = PcscBackend::from_pcsc_reader(&context, &reader, None)
+            .expect("cannot connect to the card under test");
         let mut card = Card::new(backend).expect("cannot open card");
         let aid = {
             let tx = card.transaction().expect("cannot start card transaction");
             tx.application_identifier()
                 .expect("cannot read application identifier")
         };
-        if aid.ident().eq_ignore_ascii_case(&ident) {
-            let serialno = aid.to_string().replace(' ', "");
-            return (card, serialno);
-        }
+        let serialno = aid.to_string().replace(' ', "");
+        return (card, serialno);
     }
 
     panic!("no OpenPGP card with identifier '{ident}'; `mind-the-gap pgp status` lists them")
+}
+
+/// A card's OpenPGP identifier, MANUFACTURER:SERIAL, read with two plain APDUs
+fn probe_ident(card: &mut pcsc::Card) -> Option<String> {
+    const SELECT: [u8; 12] = [
+        0x00, 0xA4, 0x04, 0x00, 0x06, 0xD2, 0x76, 0x00, 0x01, 0x24, 0x01, 0x00,
+    ];
+    const GET_AID: [u8; 5] = [0x00, 0xCA, 0x00, 0x4F, 0x00];
+    let transaction = card.transaction().ok()?;
+    let mut buffer = [0; pcsc::MAX_BUFFER_SIZE];
+    let reply = transaction.transmit(&SELECT, &mut buffer).ok()?;
+    if !matches!(reply, [.., 0x90, 0x00] | [.., 0x61, _]) {
+        return None;
+    }
+    let reply = transaction.transmit(&GET_AID, &mut buffer).ok()?;
+    let [aid @ .., 0x90, 0x00] = reply else {
+        return None;
+    };
+    let [_, _, _, _, _, _, _, _, m1, m2, s1, s2, s3, s4, ..] = *aid else {
+        return None;
+    };
+    Some(format!("{m1:02X}{m2:02X}:{s1:02X}{s2:02X}{s3:02X}{s4:02X}"))
 }
 
 /// Fingerprints of the three subkeys, in `SubkeyRole::ALL` order.
@@ -220,8 +278,92 @@ fn provision_and_verify_rsa_cards() {
     }
 }
 
+/// The card refuses every key's operation while nobody touches it, and performs it again
+/// once someone does.
+///
+/// `upload` leaves each key requiring a touch, so the other tests only show that a touch,
+/// when given, unlocks the keys. This one needs a card whose user presence the test decides,
+/// which only a virtual card has: the virtual OpenPGP check runs it with
+/// `MTG_TEST_USER_PRESENCE_FILE` naming the file the card reads, where `deny` refuses every
+/// touch request. A refused request waits out the card's timeout, as on a token nobody
+/// touches.
+#[test]
+#[ignore = "needs a card whose user presence the test decides, which the virtual OpenPGP check provides"]
+fn touch_is_enforced() {
+    let _card = exclusive_card();
+    let presence = std::env::var("MTG_TEST_USER_PRESENCE_FILE").expect(
+        "MTG_TEST_USER_PRESENCE_FILE is not set: this test needs a card it can refuse touches \
+         for, which a real token is not",
+    );
+    let decide = |answer: &str| {
+        std::fs::write(&presence, answer).expect("cannot write the user presence file");
+    };
+
+    let subject = subject();
+    let offline = subject
+        .certify(CertificateKind::Full)
+        .expect("offline certify failed");
+    decide("grant");
+    subject
+        .upload(Some(target()))
+        .expect("upload to card failed");
+
+    let (mut card, _) = open();
+    let mut transaction = card.transaction().expect("cannot start card transaction");
+    keys_work_on_card(&mut transaction, &offline);
+
+    decide("deny");
+    keys_refuse_on_card(&mut transaction, &offline);
+
+    decide("grant");
+    keys_work_on_card(&mut transaction, &offline);
+}
+
+/// The counterpart of [`keys_work_on_card`]: with no touch, each key's operation fails
+fn keys_refuse_on_card(transaction: &mut Card<Transaction<'_>>, cert: &Cert) {
+    let pin = || secrecy::SecretString::from(TEST_PIN.to_string());
+
+    let public = public_mpis(cert, SubkeyRole::Signing);
+    let (algo, input) = signing_input(&public, b"no touch");
+    transaction
+        .verify_user_signing_pin(pin())
+        .expect("card rejected the signing pin");
+    assert!(
+        transaction.card().signature_for_hash(algo, &input).is_err(),
+        "the signing key signed without the touch it demands",
+    );
+
+    let public = public_mpis(cert, SubkeyRole::Authentication);
+    let (algo, input) = signing_input(&public, b"no touch");
+    transaction
+        .verify_user_pin(pin())
+        .expect("card rejected the user pin");
+    assert!(
+        transaction
+            .card()
+            .authenticate_for_hash(algo, &input)
+            .is_err(),
+        "the authentication key authenticated without the touch it demands",
+    );
+
+    let mpi::PublicKey::ECDH { curve: PgpCurve::Cv25519, .. } =
+        public_mpis(cert, SubkeyRole::Decryption)
+    else {
+        panic!("the touch test provisions the default Curve25519 keys");
+    };
+    let point = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([0x2bu8; 32]));
+    assert!(
+        transaction
+            .card()
+            .decipher(Cryptogram::ECDH(point.as_bytes()))
+            .is_err(),
+        "the decryption key agreed without the touch it demands",
+    );
+}
+
 fn provision_and_verify(subject: SeededSmartcard) {
     let ident = target();
+    let readers = readers::shared();
 
     // -- Provision -----------------------------------------------------------------------
     eprintln!("[1/7] deriving the certificate offline");
@@ -239,6 +381,27 @@ fn provision_and_verify(subject: SeededSmartcard) {
         offline.fingerprint(),
         "upload and certify produced different primary keys",
     );
+
+    // `upload` leaves every key at the cached touch policy, which a script cannot satisfy on
+    // a YubiKey; a touch-free run turns them off before the first key is used
+    if touch_free() {
+        eprintln!("      touch-free run: turning every key's touch policy off");
+        subject
+            .configure(
+                Some(ident.clone()),
+                CardSettings {
+                    touch: SubkeyRole::ALL
+                        .iter()
+                        .map(|role| (*role, TouchPolicyArg::Never))
+                        .collect(),
+                    lang: vec![],
+                    url: None,
+                    login: None,
+                    sign_pin: None,
+                },
+            )
+            .expect("configure could not turn the touch policies off");
+    }
 
     // -- The crate's own check agrees ----------------------------------------------------
     eprintln!("[3/7] running check");
@@ -295,8 +458,14 @@ fn provision_and_verify(subject: SeededSmartcard) {
     drop(transaction);
     drop(card);
 
+    // scdaemon takes every reader, so this step waits for the other suites to let go of
+    // theirs, and they wait for it until it has stopped scdaemon again
     eprintln!("[6/7] gpg sees the card and uses its keys -- TOUCH if the card blinks");
+    drop(readers);
+    let gpg = readers::exclusive();
     gpg_sees_the_keys(&expected, &offline, &serialno);
+    drop(gpg);
+    let _readers = readers::shared();
 
     // -- Post-provisioning configuration ---------------------------------------------------
     //
@@ -538,6 +707,19 @@ fn gpg_sees_the_keys(expected: &[(KeyType, [u8; 20])], cert: &Cert, serialno: &s
 
     // Armed before gpg runs, so the daemon is stopped even if an assertion below panics
     let _guard = ScdaemonGuard { home: home.clone() };
+
+    // scdaemon names a card after its AID but may zero the version field (it does for every
+    // YubiKey), so find ours among the cards it sees by manufacturer and serial number
+    let cards = std::process::Command::new("gpg-card")
+        .env("GNUPGHOME", &home)
+        .args(["--no-history", "list", "--cards"])
+        .output()
+        .expect("cannot run gpg-card");
+    let cards = String::from_utf8_lossy(&cards.stdout);
+    let serialno = cards
+        .split_whitespace()
+        .find(|word| word.len() == 32 && word.get(16..28) == serialno.get(16..28))
+        .unwrap_or_else(|| panic!("gpg sees no card with serial number {serialno}:\n{cards}"));
 
     // Make the card current and have the agent learn its keys: the key stubs it writes record
     // this serial number, so the signing and decryption below go to this card and no other

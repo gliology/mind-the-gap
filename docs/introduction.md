@@ -106,7 +106,7 @@ When stepping away from a live-image machine, leave the session with `quit` and 
 | YubiKey 4, firmware 4.3 | ✗ | ✗ | ✓ | ✓ | ✓ |
 | Nitrokey 3 | ✓ in production | ✓ in production | ○ | ○ | ○ |
 | Solo 2, on the LPC55S69 dev kit | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Gnuk | ○ | ○ | ○ | ○ | ○ |
+| Gnuk 2, emulated | ✓ | ✗ | ✗ | ✗ | ✗ |
 
 What the grids leave out:
 
@@ -127,7 +127,10 @@ What the grids leave out:
   image only without FIDO, which is what the dev kit ran. RSA-3072 and RSA-4096 PIV keys
   need a build whose volatile store holds an unsealed RSA key, which stock Solo 2 firmware
   does not have. A production Solo 2 is untested.
-- Gnuk: planned as a second simulated OpenPGP card.
+- Gnuk: the row is its GNU/Linux emulation in CI, built with the KDF data object optional;
+  a stock Gnuk 2 token requires one, which mind-the-gap does not set up yet. Gnuk 2 holds
+  Curve25519 only of what mind-the-gap derives, and `upload` refuses the others before the
+  reset.
 
 "In production" means real cards provisioned from real seeds and used daily, not just a
 test run. Anything marked untested may well work — the backends speak standard OpenPGP

@@ -38,7 +38,7 @@
     not(feature = "no-destructive-hardware-tests")
 ))]
 
-use mind_the_gap::piv::{CertChain, CertificateKind, SeededSmartcard};
+use mind_the_gap::piv::{CertChain, CertificateKind, ManagementTouchArg, SeededSmartcard};
 use mind_the_gap::seed::{Algorithm, Seed256};
 
 use p256::ecdh;
@@ -60,9 +60,12 @@ use yubikey::{CccId, ChuId, MgmAlgorithmId, MsRoots, PinPolicy, Serial, TouchPol
 use zeroize::Zeroizing;
 
 use std::str::FromStr;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 mod end_use;
+#[path = "../common/readers.rs"]
+mod readers;
 
 use end_use::{
     key_agreement_through_pkcs11, nss_recognises_card, only_reader, openssl_conf, pkcs11_paths,
@@ -102,6 +105,21 @@ fn target() -> String {
     }
 }
 
+/// The one card every test here resets, held for each test's whole run
+///
+/// The harness runs tests in parallel, and with `--include-ignored` every algorithm's test
+/// would provision the same card at once and wipe it under the others.
+static CARD: Mutex<()> = Mutex::new(());
+
+/// Take the card for the calling test, and the readers shared with other suites
+///
+/// A test that failed while holding it poisons the lock, but leaves nothing the next
+/// test's own reset does not clear, so the poison is ignored rather than spread.
+fn exclusive_card() -> (MutexGuard<'static, ()>, readers::Readers) {
+    let card = CARD.lock().unwrap_or_else(PoisonError::into_inner);
+    (card, readers::shared())
+}
+
 /// Seed for the provisioned test identity, from the serial of the card under test.
 ///
 /// It must not be a seed anyone would use for real, since this card is wiped and
@@ -117,13 +135,34 @@ fn test_seed() -> Seed256 {
         .into()
 }
 
+/// Whether this run provisions without touch policies, for a host that runs it unattended
+///
+/// `MTG_HARDWARE_TEST_TOUCH=never` sets every slot and the management key to touch never, and
+/// the assertions follow. A script cannot touch a YubiKey, so this is how the suite runs
+/// without a person; it proves everything except that touch is enforced, which the default
+/// run does.
+fn touch_free() -> bool {
+    match std::env::var("MTG_HARDWARE_TEST_TOUCH") {
+        Err(_) => false,
+        Ok(touch) if touch == "never" => true,
+        Ok(other) => panic!("MTG_HARDWARE_TEST_TOUCH is `never` or unset, not `{other}`"),
+    }
+}
+
 fn subject() -> SeededSmartcard {
-    SeededSmartcard::new(&test_seed(), None, "Hardware Test".into())
+    let subject = SeededSmartcard::new(&test_seed(), None, "Hardware Test".into())
         .add_email("hardware-test@example.com")
         .unwrap()
         .with_pin(Zeroizing::new(TEST_PIN.to_string()))
         .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
-        .with_validity_duration(Duration::from_secs(10 * 365 * 24 * 60 * 60))
+        .with_validity_duration(Duration::from_secs(10 * 365 * 24 * 60 * 60));
+    if touch_free() {
+        subject
+            .with_touch_policy(TouchPolicy::Never)
+            .with_management_touch(ManagementTouchArg::Never)
+    } else {
+        subject
+    }
 }
 
 fn open() -> YubiKey {
@@ -239,6 +278,7 @@ fn on_card<T>(what: &str, result: anyhow::Result<T>) -> T {
 /// state `upload` leaves behind, so they have to be sequenced by construction.
 #[test]
 fn provision_and_verify_card() {
+    let _card = exclusive_card();
     let subject = subject();
     let serial = target();
 
@@ -290,6 +330,7 @@ fn provision_and_verify_card() {
 #[test]
 #[ignore = "the card-level half of the checklist above, run by the virtual PIV check"]
 fn provision_and_verify_p256_card() {
+    let _card = exclusive_card();
     provision_and_verify(&subject(), &target(), 7);
 }
 
@@ -303,6 +344,7 @@ fn provision_and_verify_p256_card() {
 #[test]
 #[ignore = "needs a card that imports Ed25519 (0xE0) and X25519 (0xE1) PIV keys"]
 fn provision_and_verify_curve25519_card() {
+    let _card = exclusive_card();
     let subject = subject().with_algorithm(Algorithm::Curve25519);
     let serial = target();
 
@@ -315,6 +357,7 @@ fn provision_and_verify_curve25519_card() {
 #[test]
 #[ignore = "the card-level half of the checklist on P-384"]
 fn provision_and_verify_p384_card() {
+    let _card = exclusive_card();
     let subject = subject().with_algorithm(Algorithm::P384);
     let serial = target();
 
@@ -330,6 +373,7 @@ fn provision_and_verify_p384_card() {
 #[test]
 #[ignore = "the card-level half of the checklist on RSA-2048, run by the virtual PIV check"]
 fn provision_and_verify_rsa2048_card() {
+    let _card = exclusive_card();
     let subject = subject().with_algorithm(Algorithm::Rsa2048);
     let serial = target();
 
@@ -340,6 +384,7 @@ fn provision_and_verify_rsa2048_card() {
 #[test]
 #[ignore = "needs a card that imports RSA-3072 PIV keys, YubiKey firmware 5.7 or later"]
 fn provision_and_verify_rsa3072_card() {
+    let _card = exclusive_card();
     let subject = subject().with_algorithm(Algorithm::Rsa3072);
     let serial = target();
 
@@ -350,6 +395,7 @@ fn provision_and_verify_rsa3072_card() {
 #[test]
 #[ignore = "needs a card that imports RSA-4096 PIV keys, YubiKey firmware 5.7 or later"]
 fn provision_and_verify_rsa4096_card() {
+    let _card = exclusive_card();
     let subject = subject().with_algorithm(Algorithm::Rsa4096);
     let serial = target();
 
@@ -358,6 +404,73 @@ fn provision_and_verify_rsa4096_card() {
 
 /// Sections 1 to 4 of the checklist: provision, then assert what landed on the card and
 /// that the card signs and agrees with it. Returns the chain and the open token for the
+/// The card refuses what its touch policies gate while nobody touches it, and performs it
+/// again once someone does.
+///
+/// Every other test only shows that a touch, when given, unlocks the key. This one needs a
+/// card whose user presence the test decides, which only a virtual card has: the virtual PIV
+/// check runs it with `MTG_TEST_USER_PRESENCE_FILE` naming the file the card reads, where
+/// `deny` refuses every touch request. A refused request waits out the card's 15 second
+/// timeout, as on a token nobody touches.
+#[test]
+#[ignore = "needs a card whose user presence the test decides, which the virtual PIV check provides"]
+fn touch_is_enforced() {
+    let presence = std::env::var("MTG_TEST_USER_PRESENCE_FILE").expect(
+        "MTG_TEST_USER_PRESENCE_FILE is not set: this test needs a card it can refuse touches \
+         for, which a real token is not",
+    );
+    let decide = |answer: &str| {
+        std::fs::write(&presence, answer).expect("cannot write the user presence file");
+    };
+
+    let subject = subject();
+    let serial = target();
+    decide("grant");
+    let (offline, mut token) = provision_and_verify(&subject, &serial, 8);
+
+    // The cached policy of 9A and 9D reuses a touch for 15 seconds, and the run above has
+    // just given one
+    eprintln!("[8/8] touches refused, then granted again");
+    decide("deny");
+    std::thread::sleep(std::time::Duration::from_secs(16));
+
+    card_authentication_needs_no_pin(&mut token, &offline);
+    token
+        .verify_pin(TEST_PIN.as_bytes())
+        .expect("card rejected the PIN we provisioned it with");
+    let refused = |result: yubikey::Result<yubikey::Buffer>, slot: &str| {
+        assert!(result.is_err(), "{slot} answered without the touch its policy demands");
+    };
+    let cert = leaf(&offline, SlotId::Authentication);
+    refused(sign(&mut token, b"no touch", cert, SlotId::Authentication), "9A");
+    token
+        .verify_pin(TEST_PIN.as_bytes())
+        .expect("card rejected the PIN we provisioned it with");
+    let cert = leaf(&offline, SlotId::Signature);
+    refused(sign(&mut token, b"no touch", cert, SlotId::Signature), "9C");
+    let point = p256::SecretKey::from_slice(&[0x2bu8; 32])
+        .expect("ephemeral scalar is invalid")
+        .public_key()
+        .to_sec1_bytes();
+    refused(
+        piv::decrypt_data(&mut token, &point, AlgorithmId::EccP256, SlotId::KeyManagement),
+        "9D",
+    );
+    drop(token);
+    assert!(
+        subject.check(Some(serial.clone())).is_err(),
+        "the management key authenticated without the touch it demands",
+    );
+
+    decide("grant");
+    let mut token = open();
+    authentication_slot_signs(&mut token, &offline);
+    signature_slot_signs(&mut token, &offline);
+    key_management_slot_agrees(&mut token, &offline);
+    drop(token);
+    on_card("check", subject.check(Some(serial)));
+}
+
 /// steps that follow; `total` is only for the step counter in the progress lines.
 fn provision_and_verify(
     subject: &SeededSmartcard,
@@ -408,6 +521,11 @@ fn provision_and_verify(
     }
 
     for (slot, pin_policy, touch_policy) in EXPECTED_POLICIES {
+        let touch_policy = if touch_free() {
+            TouchPolicy::Never
+        } else {
+            touch_policy
+        };
         if has_metadata {
             let metadata = piv::metadata(&mut token, slot)
                 .unwrap_or_else(|e| panic!("cannot read {slot:?} metadata: {e}"));
@@ -430,7 +548,7 @@ fn provision_and_verify(
     }
 
     // The management key, in the algorithm `upload` picks for this firmware and demanding a
-    // touch, which none of the subjects here opts out of. `check` only warns about either.
+    // touch unless the run is touch-free. `check` only warns about either.
     if has_metadata {
         let metadata = piv::metadata(&mut token, SlotId::Management(ManagementSlotId::Management))
             .unwrap_or_else(|e| panic!("cannot read management key metadata: {e}"));
@@ -445,10 +563,15 @@ fn provision_and_verify(
             SlotAlgorithmId::Management(algorithm),
             "management key is not {algorithm:?} on firmware {version}",
         );
+        let touch = if touch_free() {
+            TouchPolicy::Never
+        } else {
+            TouchPolicy::Always
+        };
         assert_eq!(
             metadata.policy.map(|(_, touch)| touch),
-            Some(TouchPolicy::Always),
-            "management key does not demand a touch",
+            Some(touch),
+            "management key touch policy is not {touch:?}",
         );
     }
 

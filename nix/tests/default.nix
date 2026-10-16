@@ -75,4 +75,11 @@ in
       inherit (cards) nk3-usbip;
     }
   );
+  # Gnuk, a second OpenPGP card written independently of opcard, attached the same way
+  usbip-gnuk = vmTest (
+    import ./usbip-gnuk.nix {
+      inherit pkgs pgp-suite;
+      inherit (cards) gnuk-usbip;
+    }
+  );
 }

@@ -16,7 +16,10 @@
     # Nitrokey's OpenPGP card implementation, run as the virtual card in the
     # virtual-pgp check; not a flake, we build its vpicc example with crane
     opcard = {
-      url = "github:Nitrokey/opcard-rs";
+      # The fork's mind-the-gap branch: Nitrokey's main plus our pending PRs (the algorithm
+      # list following the build, the presence control the touch checks need), one commit
+      # each, rebuilt by the maintainer's stack generator; `nix flake update opcard` follows it
+      url = "github:FlorianFranzen/opcard-rs/mind-the-gap";
       flake = false;
     };
 
@@ -44,6 +47,15 @@
       url = "github:FlorianFranzen/usbip-device/mind-the-gap";
       flake = false;
     };
+
+    # Gnuk, the OpenPGP token firmware of the Free Software Initiative of Japan, built as
+    # its GNU/Linux emulation for the usbip-gnuk check: a second OpenPGP card written
+    # independently of opcard, attached as a USB device. Its scheduler, chopstx, is a
+    # submodule
+    gnuk = {
+      url = "git+https://salsa.debian.org/gnuk-team/gnuk/gnuk.git?ref=refs/tags/release/2.2&submodules=1";
+      flake = false;
+    };
   };
 
   outputs =
@@ -56,6 +68,7 @@
       piv-authenticator,
       nitrokey-3-firmware,
       usbip-device,
+      gnuk,
     }:
     let
       # List of all supported system architectures
@@ -103,6 +116,7 @@
               piv-authenticator
               nitrokey-3-firmware
               usbip-device
+              gnuk
               ;
           };
         }

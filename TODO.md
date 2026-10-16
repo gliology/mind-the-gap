@@ -1,10 +1,15 @@
 # Open items
 
-- A second, independent card implementation in CI: Gnuk's emulation build
-  (`--target=GNU_LINUX`) speaks USB/IP and could reuse the plumbing `usbip-nk3` already
-  has, as a second OpenPGP target next to opcard; canokey-qemu (a QEMU USB device with PIV
-  and OpenPGP) would add one for both backends (see "What is not emulated" in
-  [docs/hardware-tests.md](docs/hardware-tests.md))
+- Gnuk 2 tokens: set up the KDF data object (OpenPGP card 3.3, iterated and salted SHA-256)
+  during `pgp upload`, which a stock Gnuk 2 requires before any key import; the
+  `usbip-gnuk` check builds the emulation with it optional until then. canokey-qemu (a QEMU
+  USB device with PIV and OpenPGP) would add an independent PIV implementation in CI (see
+  "What is not emulated" in [docs/hardware-tests.md](docs/hardware-tests.md))
+- Virtual touch refusal: the `VPICC_USER_PRESENCE` control rides on the published stacks
+  until piv-authenticator and opcard take it. Still to do: the same for the simulated
+  Nitrokey 3, whose runner has a user interface of its own, and a refusal that answers at
+  once instead of after the 15 second timeout, which needs trussed's virtual user interface
+  to hand `uptime` to the inner one as it does the presence check
 - Nitrokey 3 PIV: the protocol work is open upstream as trussed-dev/piv-authenticator
   PRs (#46 to #58, with GET METADATA, the policies, SET PIN RETRIES, digest padding and
   the RSA layout waiting on #56), and the `virtual-piv` checks provision the fork's
@@ -12,14 +17,15 @@
   check`. Remaining: the merges, verification on real Nitrokey 3 hardware once a firmware
   carries the fixes, and the yubikey.rs slot-table bug (its `Key::list` reads the key
   history object as a certificate; `piv status` lists slots itself and is immune)
-- A PIV card that is not a YubiKey is only found unable to import an algorithm after the
-  reset: piv-authenticator's SELECT response lists all nine algorithms whatever its build
-  carries (a Solo 2 image built without the `p384` and `rsa` features has neither). Propose upstream that the list
-  follow the backends, and have yubikey.rs expose the SELECT response, so `upload` can
-  refuse such a card while it is intact, as it already does for YubiKeys by version.
-  opcard's algorithm information (DO FA) has the same gap: it lists RSA in a build without
-  an RSA backend, which `pgp upload` trusts and such a dev kit image answers with 6A81
-  after the reset
+- A PIV card that is not a YubiKey is judged before the reset by the algorithms its SELECT
+  response lists, but piv-authenticator lists every algorithm whatever its build carries (a
+  Solo 2 image built without the `p384` and `rsa` features has neither), so the check
+  passes and the import still fails after the reset. Remaining: the piv-authenticator
+  change that lists only what the build supports and the yubikey.rs one that exposes the
+  list (drafted, the latter pinned here from its own branch until the stack takes it), then
+  a virtual check that a build without RSA is refused intact. opcard's algorithm
+  information (DO FA) has the same gap: it lists RSA in a build without an RSA backend,
+  which `pgp upload` trusts and such a dev kit image answers with 6A81 after the reset
 - piv-authenticator empty-slot reads cost ~127 ms each on real NK3 hardware (upstream
   issue #40): a written-containers bitmap in the persistent state (maintained in
   `ContainerStorage::save`/reset, checked in GET DATA and the key history object)
@@ -33,10 +39,10 @@
 - The build server profile signs Nix store paths with the 9D key, whose certificate allows
   key agreement only; PKCS#11 does not look, but 9C or a retired slot would keep signing
   and agreement apart
-- Solo 2: flash the Hacker from `hw/solo2`, pass the device uuid into the PIV app so the
-  serial is per-device (the dev kit reports the 5437251 fallback), and decide which apps and
-  algorithms a Solo 2 image carries, since FIDO, PIV and OpenPGP with RSA do not fit in its
-  512 KiB together, nor does FIDO's `init` leave stack for the RSA heap
+- Solo 2: flash the Hacker from `hw/solo2`, and decide which apps and algorithms a Solo 2
+  image carries, since FIDO, PIV and OpenPGP with RSA and P-384 do not fit in its 512 KiB
+  together (the per-device serial and the stack for the RSA heap are drafted upstream as
+  solo2 PRs and carried on `hw/solo2`)
 - Zeroize the secret copies that remain out of reach without upstream support: transient
   stack copies made when the 32-byte arrays are moved, and copies held inside foreign crates
   (`yubikey::MgmKey`'s cipher key and `p256` key buffers; openpgp-card 0.7 closed the

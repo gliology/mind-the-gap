@@ -6,8 +6,9 @@
 # (device reset, ECC key import with pin and touch policies, AES-256 management key,
 # GET METADATA read-back, msroots), so it also proves the app's Yubico client
 # compatibility. Touch prompts go through trussed's user-presence request, which the
-# virtual platform grants automatically -- what stays uncovered is real readers and a
-# human finger.
+# virtual card grants unless the test refuses it through the file VPICC_USER_PRESENCE
+# names: the P-256 run uses that to prove the touch policies are enforced. What stays
+# uncovered is real readers and a human finger.
 #
 # `algorithm` picks the chain the card is provisioned with: P-256, P-384, Curve25519 for
 # the Ed25519 (0xE0) and X25519 (0xE1) import, or RSA-2048 through the Yubico import layout.
@@ -50,6 +51,9 @@
       wantedBy = [ "multi-user.target" ];
       requires = [ "pcscd.service" ];
       after = [ "pcscd.service" ];
+      # The card reads this file on every touch request: `deny` in it refuses, a missing
+      # file grants, so only the touch test below ever sees a refusal
+      environment.VPICC_USER_PRESENCE = "/run/vpicc-presence";
       serviceConfig = {
         ExecStart = "${piv-vpicc}/bin/piv-vpicc";
         Restart = "always";
@@ -124,5 +128,17 @@
         "provision_and_verify_${algorithm}_card --nocapture > /tmp/suite.log 2>&1"
     )
     machine.succeed("grep -q 'test result: ok. 1 passed' /tmp/suite.log")
+
+    ${pkgs.lib.optionalString (algorithm == "p256") ''
+      # Touch policies are enforced, not only recorded: with every touch refused, 9A, 9C,
+      # 9D and the management key refuse while 9E still signs, and all of them work again
+      # once touches are granted. P-256 only, since the policies do not depend on the key.
+      machine.succeed(
+          "MTG_HARDWARE_TEST_SERIAL=5437251 MTG_TEST_USER_PRESENCE_FILE=/run/vpicc-presence "
+          "piv-suite --ignored --exact touch_is_enforced --nocapture > /tmp/touch.log 2>&1 "
+          "|| { cat /tmp/touch.log; exit 1; }"
+      )
+      machine.succeed("grep -q 'test result: ok. 1 passed' /tmp/touch.log")
+    ''}
   '';
 }

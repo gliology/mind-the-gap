@@ -36,6 +36,25 @@
         "type": "github"
       }
     },
+    "gnuk": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1713579640,
+        "narHash": "sha256-qY/dwkcPJiPx/+inSxH7w7a0v3cWUQDX+NYJwUjnkMY=",
+        "ref": "refs/tags/release/2.2",
+        "rev": "de9652726b1ce52b21e939c6989dda0268b5c640",
+        "revCount": 1362,
+        "submodules": true,
+        "type": "git",
+        "url": "https://salsa.debian.org/gnuk-team/gnuk/gnuk.git"
+      },
+      "original": {
+        "ref": "refs/tags/release/2.2",
+        "submodules": true,
+        "type": "git",
+        "url": "https://salsa.debian.org/gnuk-team/gnuk/gnuk.git"
+      }
+    },
     "nitrokey-3-firmware": {
       "flake": false,
       "locked": {
@@ -72,15 +91,16 @@
     "opcard": {
       "flake": false,
       "locked": {
-        "lastModified": 1789664080,
-        "narHash": "sha256-xngXkxJzYwxZgHy0miJkEslsK/zVWIbjn59oIC3mkTI=",
-        "owner": "Nitrokey",
+        "lastModified": 1792118559,
+        "narHash": "sha256-IuL826t0ADtw7iZrra6mZG6WD0UI1Rnexd3pmjwlMiU=",
+        "owner": "FlorianFranzen",
         "repo": "opcard-rs",
-        "rev": "1afa203f16d19e0020f4a08d0e5c763d2afe9e1a",
+        "rev": "5f2553697a013765589f34ed5673fbe81eb91bba",
         "type": "github"
       },
       "original": {
-        "owner": "Nitrokey",
+        "owner": "FlorianFranzen",
+        "ref": "mind-the-gap",
         "repo": "opcard-rs",
         "type": "github"
       }
@@ -88,11 +108,11 @@
     "piv-authenticator": {
       "flake": false,
       "locked": {
-        "lastModified": 1791960507,
-        "narHash": "sha256-gb9KWnGQtzYnM15z70jVjpEDeT8PNW9mS9sXwl64ZZg=",
+        "lastModified": 1792118340,
+        "narHash": "sha256-Kk4fi/ohCwMUpxI1gXILv7z1264Dn5nlEtrG8RgKYMw=",
         "owner": "FlorianFranzen",
         "repo": "piv-authenticator",
-        "rev": "7800b93e6a87f22d83a2cfcee7fbadccbabb767a",
+        "rev": "edad62b10b29c7332443a90a2d3e7638e61caf24",
         "type": "github"
       },
       "original": {
@@ -106,6 +126,7 @@
       "inputs": {
         "crane": "crane",
         "fenix": "fenix",
+        "gnuk": "gnuk",
         "nitrokey-3-firmware": "nitrokey-3-firmware",
         "nixpkgs": "nixpkgs",
         "opcard": "opcard",

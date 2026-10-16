@@ -8,6 +8,7 @@
   piv-authenticator,
   nitrokey-3-firmware,
   usbip-device,
+  gnuk,
 }:
 
 {
@@ -22,4 +23,5 @@
       usbip-device
       ;
   };
+  gnuk-usbip = import ./gnuk.nix { inherit pkgs gnuk; };
 }

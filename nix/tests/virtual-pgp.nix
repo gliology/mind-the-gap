@@ -4,8 +4,10 @@
 # host process against vsmartcard's vpcd, so the whole PC/SC path (pcscd, the reader
 # driver, APDUs, the card state machine) is exercised with no hardware and no USB. This is
 # the automated half of what the destructive suites do to a real YubiKey: upload, check
-# and configure, driven through the real binary. What it cannot cover is exactly what the
-# manual checklist exists for: real readers, touch prompts and vendor extensions.
+# and configure, driven through the real binary. Touch requests are granted unless the
+# test refuses them through the file VPICC_USER_PRESENCE names, which the last step uses to
+# prove the keys demand one. What it cannot cover is what the manual checklist exists for:
+# real readers, a human finger and vendor extensions.
 {
   pkgs,
   opcard-vpicc,
@@ -41,6 +43,9 @@
       wantedBy = [ "multi-user.target" ];
       requires = [ "pcscd.service" ];
       after = [ "pcscd.service" ];
+      # The card reads this file on every touch request: `deny` in it refuses, a missing
+      # file grants, so only the touch test below ever sees a refusal
+      environment.VPICC_USER_PRESENCE = "/run/vpicc-presence";
       serviceConfig = {
         ExecStart = "${opcard-vpicc}/bin/opcard-vpicc";
         Restart = "always";
@@ -124,5 +129,14 @@
         "--nocapture > /tmp/suite.log 2>&1 || { cat /tmp/suite.log; exit 1; }"
     )
     machine.succeed("grep -q 'test result: ok. 3 passed' /tmp/suite.log")
+
+    # Touch is enforced, not only configured: with every touch refused the three keys
+    # refuse to sign, authenticate and decrypt, and they work again once touches are granted
+    machine.succeed(
+        "MTG_HARDWARE_TEST_CARD=0000:00000000 MTG_TEST_USER_PRESENCE_FILE=/run/vpicc-presence "
+        "pgp-suite --ignored --exact touch_is_enforced --nocapture > /tmp/touch.log 2>&1 "
+        "|| { cat /tmp/touch.log; exit 1; }"
+    )
+    machine.succeed("grep -q 'test result: ok. 1 passed' /tmp/touch.log")
   '';
 }
