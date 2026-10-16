@@ -14,7 +14,7 @@ use crate::seed::{Algorithm, Seed256Derive};
 use anyhow::{Result, anyhow, bail};
 
 use yubikey::certificate::CertInfo;
-use yubikey::piv::{self, RetiredSlotId, SlotId};
+use yubikey::piv::{self, AlgorithmId, RetiredSlotId, SlotId};
 use yubikey::reader::Context;
 use yubikey::{
     CardId, CccId, Certificate as CardCertificate, ChuId, Error as CardError, MgmAlgorithmId,
@@ -142,6 +142,8 @@ pub fn status() -> Result<()> {
                 ),
             }
         }
+        // Dropping a token resets the card, which would throw any other program off it
+        let _ = token.disconnect(pcsc::Disposition::LeaveCard);
 
         println!();
     }
@@ -174,7 +176,11 @@ pub(super) fn open_token(target: Option<String>) -> Result<YubiKey> {
             let cards: Vec<String> = readers
                 .iter()
                 .map(|reader| match reader.open() {
-                    Ok(token) => format!("  {}", describe(&token)),
+                    Ok(token) => {
+                        let line = format!("  {}", describe(&token));
+                        let _ = token.disconnect(pcsc::Disposition::LeaveCard);
+                        line
+                    }
                     Err(_) => format!("  {} (not a PIV card)", common::printable(&reader.name())),
                 })
                 .collect();
@@ -221,6 +227,20 @@ fn describe(token: &YubiKey) -> String {
         version.minor,
         version.patch
     )
+}
+
+/// An algorithm as the error messages name it
+fn card_algorithm_name(algorithm: AlgorithmId) -> &'static str {
+    match algorithm {
+        AlgorithmId::Rsa1024 => "RSA-1024",
+        AlgorithmId::Rsa2048 => "RSA-2048",
+        AlgorithmId::Rsa3072 => "RSA-3072",
+        AlgorithmId::Rsa4096 => "RSA-4096",
+        AlgorithmId::EccP256 => "P-256",
+        AlgorithmId::EccP384 => "P-384",
+        AlgorithmId::Ed25519 => "Ed25519",
+        AlgorithmId::X25519 => "X25519",
+    }
 }
 
 impl SeededSmartcard {
@@ -273,7 +293,6 @@ impl SeededSmartcard {
         Ok(chain)
     }
 
-    /// Algorithm of the management key `upload` installs on `token`
     /// Open the card `upload` would wipe, refuse it if it cannot hold the keys, and name it
     ///
     /// Meant for the confirmation: the question can name the card, and a card that would be
@@ -287,17 +306,31 @@ impl SeededSmartcard {
 
     /// Refuse a card that cannot take what `upload` installs, before anything on it changes
     ///
-    /// Only YubiKeys can be judged up front, by firmware version. Other PIV cards advertise
-    /// algorithms in their SELECT response that their build may lack (piv-authenticator lists
-    /// all nine whatever the backend has), so for them the import itself is the first answer.
+    /// A YubiKey is judged by its firmware version. Other PIV cards are judged by the
+    /// algorithms their SELECT response lists, where they list any; a card that lists
+    /// nothing can only answer with the import itself, once it is reset. piv-authenticator
+    /// lists every algorithm it knows whatever its build carries until its pending change to
+    /// list only what the build supports is released, so on today's builds this check passes
+    /// and the import remains the first answer.
     fn refuse_unfit(&self, token: &YubiKey) -> Result<()> {
         let version = token.version();
         let firmware = format!("{}.{}.{}", version.major, version.minor, version.patch);
         if !token.name().starts_with("Yubico") {
-            log::warn!(
-                "Not a YubiKey: whether the card imports {} keys shows only once it is reset",
-                self.algorithm
-            );
+            let missing = token
+                .piv_application_properties()
+                .and_then(|properties| self.unlisted(properties));
+            match missing {
+                Some(missing) if !missing.is_empty() => bail!(
+                    "The card lists the algorithms it supports, and {} is not among them; \
+                     the card was not touched",
+                    missing.join(" or ")
+                ),
+                Some(_) => {}
+                None => log::warn!(
+                    "Not a YubiKey: whether the card imports {} keys shows only once it is reset",
+                    self.algorithm
+                ),
+            }
             return Ok(());
         }
 
@@ -330,6 +363,40 @@ impl SeededSmartcard {
         Ok(())
     }
 
+    /// What `upload` would install that a card's algorithm list leaves out, or `None` if the
+    /// card lists no algorithms to judge by
+    ///
+    /// `auto` settles on AES-256 or falls back to 3DES after the reset, so it needs one of
+    /// the two; an explicit management key algorithm needs exactly that one.
+    pub(super) fn unlisted(&self, properties: &piv::ApplicationProperties) -> Option<Vec<String>> {
+        let mut missing: Vec<String> = Vec::new();
+        for role in SlotRole::ALL {
+            let algorithm = role.card_algorithm(self.algorithm);
+            let name = card_algorithm_name(algorithm).to_string();
+            if !properties.supports(algorithm)? && !missing.contains(&name) {
+                missing.push(name);
+            }
+        }
+
+        let (management, name): (&[MgmAlgorithmId], _) = match self.management_algorithm {
+            ManagementKeyArg::Aes256 => (&[MgmAlgorithmId::Aes256], "an AES-256"),
+            ManagementKeyArg::Tdes => (&[MgmAlgorithmId::ThreeDes], "a 3DES"),
+            ManagementKeyArg::Auto => {
+                (&[MgmAlgorithmId::Aes256, MgmAlgorithmId::ThreeDes], "an AES-256 or 3DES")
+            }
+        };
+        let mut listed = false;
+        for algorithm in management {
+            listed |= properties.supports_management(*algorithm)?;
+        }
+        if !listed {
+            missing.push(format!("{name} management key"));
+        }
+
+        Some(missing)
+    }
+
+    /// Algorithm of the management key `upload` installs on `token`
     pub(super) fn management_algorithm(&self, token: &YubiKey) -> MgmAlgorithmId {
         match self.management_algorithm {
             ManagementKeyArg::Aes256 => MgmAlgorithmId::Aes256,

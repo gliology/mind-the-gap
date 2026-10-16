@@ -454,4 +454,68 @@ mod tests {
         };
         assert!(err.to_string().contains("never installs"), "{err}");
     }
+
+    /// A SELECT response as trussed's piv-authenticator sends it once its list follows the
+    /// build, with `algorithms` the identifiers listed
+    fn listing(algorithms: &[u8]) -> yubikey::piv::ApplicationProperties {
+        let mut entries: Vec<u8> = algorithms.iter().flat_map(|id| [0x80, 0x01, *id]).collect();
+        entries.extend([0x06, 0x01, 0x00]);
+        let mut template = vec![0x4f, 0x06, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00];
+        template.push(0xac);
+        template.push(u8::try_from(entries.len()).unwrap());
+        template.extend(entries);
+        let mut response = vec![0x61, u8::try_from(template.len()).unwrap()];
+        response.extend(template);
+        yubikey::piv::ApplicationProperties::parse(&response).unwrap()
+    }
+
+    /// A card that lists its algorithms is judged by the list before anything is wiped:
+    /// every slot's key algorithm and a management key algorithm `upload` can install
+    #[test]
+    fn listed_algorithms_decide_before_the_reset() {
+        // AES-256, 3DES, P-256, P-384, Ed25519 and X25519: a build without RSA
+        let no_rsa = listing(&[0x0c, 0x03, 0x11, 0x14, 0xe0, 0xe1]);
+
+        assert_eq!(card().unlisted(&no_rsa), Some(vec![]));
+        assert_eq!(
+            card()
+                .with_algorithm(Algorithm::Curve25519)
+                .unlisted(&no_rsa),
+            Some(vec![])
+        );
+        assert_eq!(
+            card().with_algorithm(Algorithm::Rsa3072).unlisted(&no_rsa),
+            Some(vec!["RSA-3072".to_string()])
+        );
+
+        // Curve25519 needs both of its card algorithms, named once each
+        let no_x25519 = listing(&[0x0c, 0x11, 0xe0]);
+        assert_eq!(
+            card()
+                .with_algorithm(Algorithm::Curve25519)
+                .unlisted(&no_x25519),
+            Some(vec!["X25519".to_string()])
+        );
+
+        // `auto` takes either management key algorithm; an explicit one needs exactly it
+        let tdes_only = listing(&[0x03, 0x11]);
+        assert_eq!(card().unlisted(&tdes_only), Some(vec![]));
+        assert_eq!(
+            card()
+                .with_management_key(ManagementKeyArg::Aes256)
+                .unlisted(&tdes_only),
+            Some(vec!["an AES-256 management key".to_string()])
+        );
+    }
+
+    /// A card that lists nothing, such as a YubiKey, leaves the decision to the version
+    #[test]
+    fn unlisted_algorithms_decide_nothing() {
+        let yubikey = yubikey::piv::ApplicationProperties::parse(&[
+            0x61, 0x11, 0x4f, 0x06, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00, 0x79, 0x07, 0x4f, 0x05,
+            0xa0, 0x00, 0x00, 0x03, 0x08,
+        ])
+        .unwrap();
+        assert_eq!(card().with_algorithm(Algorithm::Rsa4096).unlisted(&yubikey), None);
+    }
 }

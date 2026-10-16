@@ -176,9 +176,9 @@ mind-the-gap piv -d 2026-01-01 certify --kind root -o root.pem
 mind-the-gap piv -d 2026-01-01 -v 10y upload -i <6-8 digit pin> -o uploaded.pem
 ```
 
-`upload` first opens the card and refuses one that cannot hold the keys (on YubiKeys, by
-firmware version), then asks for confirmation on the terminal, naming the card it is about to
-wipe. Pass `-y` / `--yes` to skip the question when scripting; without a terminal and without
+`upload` first opens the card and refuses one that cannot hold the keys (a YubiKey by its
+firmware version, another card by the algorithms its SELECT response lists, where it lists
+any), then asks for confirmation on the terminal, naming the card it is about to wipe. Pass `-y` / `--yes` to skip the question when scripting; without a terminal and without
 `--yes` it aborts rather than hanging.
 
 Expect **no** touch prompt during upload: the derived management key is installed without

@@ -74,22 +74,10 @@ pub fn status() -> Result<()> {
 fn open_card(target: Option<String>) -> Result<Card<Open>> {
     let card = match target {
         Some(ref serial) => {
-            // Find card by ident by briefly connecting to each
-            let backends: Vec<PcscBackend> =
-                PcscBackend::cards(None)?.filter_map(Result::ok).collect();
-            let mut found = None;
-            for backend in backends {
-                let mut c = Card::new(backend)?;
-                let ident = {
-                    let tx = c.transaction()?;
-                    tx.application_identifier()?.ident()
-                };
-                if ident.eq_ignore_ascii_case(serial) {
-                    found = Some(c);
-                    break;
-                }
-            }
-            found.ok_or_else(|| CardError::NotFound(format!("Card '{}' not found", serial)))?
+            let reader = reader_of(serial)?
+                .ok_or_else(|| CardError::NotFound(format!("Card '{}' not found", serial)))?;
+            let context = pcsc::Context::establish(pcsc::Scope::User)?;
+            Card::new(PcscBackend::from_pcsc_reader(&context, &reader, None)?)?
         }
         None => {
             let backends: Vec<PcscBackend> =
@@ -114,6 +102,58 @@ fn open_card(target: Option<String>) -> Result<Card<Open>> {
     };
 
     Ok(card)
+}
+
+/// The reader holding the OpenPGP card `ident`, found without disturbing the other cards
+///
+/// card-backend-pcsc finds a card only by connecting to every one and dropping the others,
+/// and a dropped connection disconnects with a reset: whatever another program was doing on
+/// those cards, a verified pin or an upload half done, is gone. So each card is asked for its
+/// application identifier here over plain PC/SC, inside a transaction, and left as it was.
+fn reader_of(ident: &str) -> Result<Option<std::ffi::CString>> {
+    let context = pcsc::Context::establish(pcsc::Scope::User)?;
+    let mut names = vec![0; context.list_readers_len()?];
+    let readers: Vec<std::ffi::CString> = context
+        .list_readers(&mut names)?
+        .map(std::ffi::CStr::to_owned)
+        .collect();
+    for reader in readers {
+        // An empty reader, or a card another program holds exclusively, is not this one
+        let Ok(mut card) = context.connect(&reader, pcsc::ShareMode::Shared, pcsc::Protocols::ANY)
+        else {
+            continue;
+        };
+        let found = probe_ident(&mut card).is_some_and(|id| id.eq_ignore_ascii_case(ident));
+        let _ = card.disconnect(pcsc::Disposition::LeaveCard);
+        if found {
+            return Ok(Some(reader));
+        }
+    }
+    Ok(None)
+}
+
+/// A card's OpenPGP identifier as openpgp-card spells it, MANUFACTURER:SERIAL, or `None`
+/// for a card without the application
+fn probe_ident(card: &mut pcsc::Card) -> Option<String> {
+    const SELECT: [u8; 12] = [
+        0x00, 0xA4, 0x04, 0x00, 0x06, 0xD2, 0x76, 0x00, 0x01, 0x24, 0x01, 0x00,
+    ];
+    const GET_AID: [u8; 5] = [0x00, 0xCA, 0x00, 0x4F, 0x00];
+    let transaction = card.transaction().ok()?;
+    let mut buffer = [0; pcsc::MAX_BUFFER_SIZE];
+    let reply = transaction.transmit(&SELECT, &mut buffer).ok()?;
+    if !matches!(reply, [.., 0x90, 0x00] | [.., 0x61, _]) {
+        return None;
+    }
+    let reply = transaction.transmit(&GET_AID, &mut buffer).ok()?;
+    let [aid @ .., 0x90, 0x00] = reply else {
+        return None;
+    };
+    // D2 76 00 01 24 01, the version, then the manufacturer and the serial number
+    let [_, _, _, _, _, _, _, _, m1, m2, s1, s2, s3, s4, ..] = *aid else {
+        return None;
+    };
+    Some(format!("{m1:02X}{m2:02X}:{s1:02X}{s2:02X}{s3:02X}{s4:02X}"))
 }
 
 /// Report the card's touch policies, informational only
@@ -324,7 +364,13 @@ impl SeededSmartcard {
 
         let aid = card.application_identifier()?;
         let changeable = card.extended_capabilities()?.algo_attrs_changeable();
-        let information = card.algorithm_information()?;
+        // A card without the list may refuse the request rather than answer it empty, as a
+        // YubiKey 4 does with 6B00; the version is no guide, since Gnuk has the list and
+        // calls itself 2.0
+        let information = match card.algorithm_information() {
+            Err(CardError::CardStatus(_)) => None,
+            information => information?,
+        };
         for role in SubkeyRole::ALL {
             let kt = role.key_type();
             let fits = |attributes: &AlgorithmAttributes| match attributes {
@@ -465,16 +511,6 @@ impl SeededSmartcard {
 
         transaction.factory_reset()?;
 
-        if let Some(pin) = self.pin.as_ref() {
-            let new_pin: Zeroizing<String> =
-                pin.map(|p| String::from_utf8_lossy(p).to_string()).into();
-            transaction.change_user_pin(
-                SecretString::from(common::FACTORY_USER_PIN.to_string()),
-                SecretString::from(AsRef::<str>::as_ref(&*new_pin).to_owned()),
-            )?;
-        }
-        // The missing-pin case was already warned about at the command layer, once
-
         // Set new admin pin derived from subseed
         let admin_pin = self.admin_pin();
         transaction.change_admin_pin(
@@ -581,6 +617,19 @@ impl SeededSmartcard {
                 }
             }
         }
+
+        // The user pin last, once the keys are in: Gnuk wraps the keys it holds under the
+        // user pin and refuses to change it while it holds none, and while no admin pin is
+        // set it holds a new user pin to the admin pin's minimum length of eight
+        if let Some(pin) = self.pin.as_ref() {
+            let new_pin: Zeroizing<String> =
+                pin.map(|p| String::from_utf8_lossy(p).to_string()).into();
+            admin.as_transaction().change_user_pin(
+                SecretString::from(common::FACTORY_USER_PIN.to_string()),
+                SecretString::from(AsRef::<str>::as_ref(&*new_pin).to_owned()),
+            )?;
+        }
+        // The missing-pin case was already warned about at the command layer, once
 
         Ok(())
     }
