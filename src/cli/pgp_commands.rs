@@ -2,9 +2,10 @@
 
 use super::{
     Identity, confirm, parse_date, parse_duration, spelled, spelled_all, warn_factory_pin,
-    warn_if_phrase_is_weaker, write_sensitive,
+    warn_if_phrase_is_weaker, warn_policy, write_sensitive,
 };
 use crate::pgp::{self, CertificateKind, VerificationKind};
+use crate::policy::Policy;
 use crate::qr;
 use crate::seed::Algorithm;
 
@@ -47,7 +48,7 @@ pub(super) enum PGPCommand {
     /// Upload writes sensible defaults; this changes them to your liking afterwards
     /// without reprovisioning anything. Only the options given are touched. (The PIV
     /// backend has no counterpart: its pin and touch policies are fixed when a key is
-    /// imported -- set them with `piv upload`'s --pin-policy and --touch-policy.)
+    /// imported -- set them with `piv upload --policy`.)
     #[command(group = ArgGroup::new("settings").required(true).multiple(true)
         .args(["touch", "lang", "url", "login", "sign_pin"]))]
     Config {
@@ -107,6 +108,11 @@ pub(super) enum PGPCommand {
         /// Show output as QR code on terminal
         #[arg(short, long)]
         qr: bool,
+
+        /// Make the touch requirement unchangeable but by replacing the key, where the card
+        /// offers it (YubiKeys)
+        #[arg(help_heading = "Card", long, env = "MIND_THE_PGP_FIXED_TOUCH")]
+        fixed_touch: bool,
     },
 
     /// Export primary-signed certificates for uids and subkeys
@@ -235,6 +241,11 @@ pub(super) struct PGPOptions {
         env = "MIND_THE_ALGORITHM"
     )]
     pub(super) algorithm: Option<Algorithm>,
+
+    /// Pin and touch requirements upload gives the keys (relaxed by default; see the
+    /// policies chapter of the book)
+    #[arg(help_heading = "Card", long, value_enum, global = true, env = "MIND_THE_POLICY")]
+    pub(super) policy: Option<Policy>,
 }
 
 impl PGPCommand {
@@ -250,7 +261,7 @@ impl PGPCommand {
 /// Run one PGP subcommand, assembling the certificate builder on demand
 pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPCommand) -> Result<()> {
     let Identity { seed, subkey, name, emails } = identity;
-    let PGPOptions { date, subdate, validity, shared, legacy, algorithm } = options;
+    let PGPOptions { date, subdate, validity, shared, legacy, algorithm, policy } = options;
 
     // Refused before the seed is stretched, which takes argon2 seconds per derivation level
     if algorithm == Some(Algorithm::P384) {
@@ -362,8 +373,10 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
 
             builder.configure(card, settings)
         }
-        PGPCommand::Upload { pin, card, yes, output, qr: show_qr } => {
+        PGPCommand::Upload { pin, card, yes, output, qr: show_qr, fixed_touch } => {
             warn_factory_pin(pin.is_none());
+            let policy = policy.unwrap_or_default();
+            warn_policy(policy, true);
 
             // The OpenPGP card spec requires at least 6 characters for the user pin
             if let Some(pin) = pin.as_ref()
@@ -382,6 +395,8 @@ pub(super) fn run_pgp(identity: Identity, options: PGPOptions, command: PGPComma
                 log::info!("Protecting card and keys with the supplied pin");
                 builder = builder.with_pin(pin.clone());
             }
+            log::info!("Setting pin and touch policy: {}", spelled(&policy));
+            builder = builder.with_policy(policy).with_fixed_touch(fixed_touch);
 
             // Opened before the question, so that it names the card and an unfit card is
             // refused while still intact

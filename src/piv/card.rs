@@ -271,7 +271,7 @@ impl SeededSmartcard {
         // `reset_and_lock`: a build server's card is provisioned on an air-gapped machine, and
         // the derived management key never reaches the server it then lives in, so the touch
         // would guard nothing there while costing every unattended re-check a button press.
-        if self.management_touch {
+        if self.policy.management_touch() {
             log::info!("Requiring touch for future management access");
             // Everything else is on the card by now, so a card that refuses the flag (stock
             // piv-authenticator rejects P2=FE) keeps a working provisioning; `check` reports
@@ -280,7 +280,7 @@ impl SeededSmartcard {
                 log::warn!("The card refused a touch requirement for management access: {err}");
             }
         } else {
-            log::info!("Management access stays touch-free (--management-key-touch never)");
+            log::info!("Management access stays touch-free, as the policy asks for no touch");
         }
 
         // Dropping the session works by selecting the Yubico management applet, which only
@@ -357,7 +357,8 @@ impl SeededSmartcard {
         if cached && version < FIRST_CACHED_TOUCH {
             bail!(
                 "YubiKey firmware {firmware} has no cached touch policy (4.3 and later have); \
-                 pass --touch-policy always or never. The card was not touched"
+                 pass a --policy without cached touch, such as strict or never-touch. The \
+                 card was not touched"
             );
         }
         Ok(())

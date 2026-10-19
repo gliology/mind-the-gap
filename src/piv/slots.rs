@@ -4,6 +4,7 @@ use super::{
     SeededSmartcard, chain::ID_MS_SMARTCARD_LOGON, chain::ID_PIV_CARD_AUTH,
     keys::NAME_KEY_MANAGEMENT,
 };
+use crate::policy::{Pin, Touch};
 use crate::seed::Algorithm;
 
 use yubikey::piv::{AlgorithmId, SlotId};
@@ -82,21 +83,6 @@ impl SlotRole {
         }
     }
 
-    /// Pin and touch policy by default, as NIST SP 800-73-4 requires (9E) or recommends (the
-    /// rest); see [`SeededSmartcard::policies_for`] for the overrides
-    pub(super) fn default_policies(self) -> (PinPolicy, TouchPolicy) {
-        match self {
-            // One PIN verification unlocks a series of authentication operations (SSH, TLS,
-            // logon)
-            SlotRole::Authentication => (PinPolicy::Once, TouchPolicy::Cached),
-            // Non-repudiable signing: PIN and touch immediately before every single signature
-            SlotRole::Signature => (PinPolicy::Always, TouchPolicy::Always),
-            SlotRole::KeyManagement => (PinPolicy::Once, TouchPolicy::Cached),
-            // The card authentication key MUST be usable without cardholder verification
-            SlotRole::CardAuthentication => (PinPolicy::Never, TouchPolicy::Never),
-        }
-    }
-
     /// Key usage bits appropriate for this role, for an RSA key if `rsa`
     pub(super) fn key_usage(&self, rsa: bool) -> FlagSet<KeyUsages> {
         match self {
@@ -153,25 +139,35 @@ impl SlotRole {
 }
 
 impl SeededSmartcard {
-    /// Effective pin and touch policy for a slot
+    /// Effective pin and touch policy for a slot, from the card's [`Policy`](crate::policy::Policy)
     pub(super) fn policies_for(&self, slot: SlotId) -> (PinPolicy, TouchPolicy) {
-        // A retired slot holds a superseded key management key, so it keeps that slot's policy
-        let slot = match slot {
-            SlotId::Retired(_) => SlotId::KeyManagement,
-            other => other,
-        };
-
-        let (pin, touch) = SlotRole::of(slot).default_policies();
-
-        // Slot 9E must stay pin-less and touch-less to remain spec compliant, so overrides
-        // deliberately do not apply to it.
-        if slot == SlotId::CardAuthentication {
-            if self.pin_policy.is_some() || self.touch_policy.is_some() {
-                log::warn!("Ignoring policy override for the card authentication slot");
+        match slot {
+            // The card authentication key MUST be usable without cardholder verification, and
+            // a touch would defeat the contactless door access it exists for, so no policy
+            // reaches it
+            SlotId::CardAuthentication => (PinPolicy::Never, TouchPolicy::Never),
+            // A retired slot holds a superseded key management key, so it keeps that slot's
+            // policy
+            slot => {
+                let (pin, touch) = self.policy.piv_slot(slot == SlotId::Signature);
+                (pin_policy(pin), touch_policy(touch))
             }
-            return (pin, touch);
         }
+    }
+}
 
-        (self.pin_policy.unwrap_or(pin), self.touch_policy.unwrap_or(touch))
+fn pin_policy(pin: Pin) -> PinPolicy {
+    match pin {
+        Pin::Never => PinPolicy::Never,
+        Pin::Once => PinPolicy::Once,
+        Pin::Always => PinPolicy::Always,
+    }
+}
+
+fn touch_policy(touch: Touch) -> TouchPolicy {
+    match touch {
+        Touch::Never => TouchPolicy::Never,
+        Touch::Cached => TouchPolicy::Cached,
+        Touch::Always => TouchPolicy::Always,
     }
 }

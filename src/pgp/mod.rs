@@ -8,6 +8,7 @@
 //! per-signature salt, so the same seed reproduces the same bytes -- see the derivation
 //! chapter, <https://gliology.github.io/mind-the-gap/derivation.html>.
 
+use crate::policy::Policy;
 use crate::seed::{self, Algorithm, Seed256, Seed256Derive};
 
 use std::time::{Duration, SystemTime};
@@ -302,6 +303,12 @@ pub struct SeededSmartcard {
 
     /// List of user ids to include in cert
     userids: Vec<packet::UserID>,
+
+    /// Pin and touch requirements `upload` gives the keys
+    policy: Policy,
+
+    /// Whether `upload` makes the touch requirement unchangeable, where the card can
+    fixed_touch: bool,
 }
 
 impl SeededSmartcard {
@@ -357,6 +364,8 @@ impl SeededSmartcard {
             subkey_creation_time: None,
             subkey_validity: None,
             userids: vec![],
+            policy: Policy::default(),
+            fixed_touch: false,
         }
     }
 
@@ -388,6 +397,19 @@ impl SeededSmartcard {
         }
 
         Ok(self)
+    }
+
+    /// Choose the pin and touch requirements `upload` gives the keys
+    pub fn with_policy(mut self, policy: Policy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Make the touch requirement unchangeable but by replacing the key, on cards that offer
+    /// it (YubiKeys); elsewhere `upload` sets the plain variant and says so
+    pub fn with_fixed_touch(mut self, fixed: bool) -> Self {
+        self.fixed_touch = fixed;
+        self
     }
 
     /// Set password to protect secret keys

@@ -11,12 +11,12 @@
 
 use std::time::{Duration, SystemTime};
 
+use crate::policy::Policy;
 use crate::seed::{Algorithm, Seed256, Seed256Derive};
 
 use anyhow::{Result, anyhow};
 
 use yubikey::piv::SlotId;
-use yubikey::{PinPolicy, TouchPolicy};
 
 use x509_cert::ext::pkix::name::GeneralName;
 
@@ -47,30 +47,6 @@ pub enum CertificateKind {
     Intermediate,
     /// The four slot certificates only
     Leaves,
-}
-
-/// Command line mirror of [`yubikey::PinPolicy`], which is a foreign type
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
-pub enum PinPolicyArg {
-    /// Leave the card's own default in place
-    Default,
-    /// Never require the user pin
-    Never,
-    /// Require the user pin once per session
-    Once,
-    /// Require the user pin before every operation
-    Always,
-}
-
-impl From<PinPolicyArg> for PinPolicy {
-    fn from(arg: PinPolicyArg) -> Self {
-        match arg {
-            PinPolicyArg::Default => PinPolicy::Default,
-            PinPolicyArg::Never => PinPolicy::Never,
-            PinPolicyArg::Once => PinPolicy::Once,
-            PinPolicyArg::Always => PinPolicy::Always,
-        }
-    }
 }
 
 /// Slots whose key can be derived without the subkey id, so it comes out the same on every card
@@ -112,40 +88,6 @@ pub enum ManagementKeyArg {
     Aes256,
     /// Triple DES: the only management key a YubiKey 4, or a YubiKey 5 before 5.4, takes
     Tdes,
-}
-
-/// Whether management access to a provisioned card demands a touch
-#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ManagementTouchArg {
-    /// Require a touch for every management authentication
-    #[default]
-    Always,
-    /// Never require a touch, e.g. on a server card provisioned air-gapped
-    Never,
-}
-
-/// Command line mirror of [`yubikey::TouchPolicy`], which is a foreign type
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
-pub enum TouchPolicyArg {
-    /// Leave the card's own default in place
-    Default,
-    /// Never require a touch
-    Never,
-    /// Require a touch before every operation
-    Always,
-    /// Require a touch, then cache it for roughly fifteen seconds
-    Cached,
-}
-
-impl From<TouchPolicyArg> for TouchPolicy {
-    fn from(arg: TouchPolicyArg) -> Self {
-        match arg {
-            TouchPolicyArg::Default => TouchPolicy::Default,
-            TouchPolicyArg::Never => TouchPolicy::Never,
-            TouchPolicyArg::Always => TouchPolicy::Always,
-            TouchPolicyArg::Cached => TouchPolicy::Cached,
-        }
-    }
 }
 
 /// Config to create a PIV certificate chain
@@ -191,20 +133,14 @@ pub struct SeededSmartcard {
     /// Whether to insert an intermediate issuing certificate authority
     intermediate: bool,
 
-    /// Override for the per-slot pin policy, ignored for slot 9E
-    pin_policy: Option<PinPolicy>,
-
-    /// Override for the per-slot touch policy, ignored for slot 9E
-    touch_policy: Option<TouchPolicy>,
+    /// Pin and touch requirements of every slot but 9E, and of management access
+    policy: Policy,
 
     /// Whether to write the certificate authorities to the card's `msroots` object
     msroots: bool,
 
     /// Algorithm of the management key `upload` installs
     management_algorithm: ManagementKeyArg,
-
-    /// Whether `upload` leaves management access demanding a touch
-    management_touch: bool,
 }
 
 impl SeededSmartcard {
@@ -234,11 +170,9 @@ impl SeededSmartcard {
             validity_duration: None,
             pin: None,
             intermediate: false,
-            pin_policy: None,
-            touch_policy: None,
+            policy: Policy::default(),
             msroots: true,
             management_algorithm: ManagementKeyArg::Auto,
-            management_touch: true,
         }
     }
 
@@ -309,15 +243,9 @@ impl SeededSmartcard {
         self
     }
 
-    /// Override the per-slot pin policy
-    pub fn with_pin_policy(mut self, policy: PinPolicy) -> Self {
-        self.pin_policy = Some(policy);
-        self
-    }
-
-    /// Override the per-slot touch policy
-    pub fn with_touch_policy(mut self, policy: TouchPolicy) -> Self {
-        self.touch_policy = Some(policy);
+    /// Choose the pin and touch requirements `upload` gives the slots and management access
+    pub fn with_policy(mut self, policy: Policy) -> Self {
+        self.policy = policy;
         self
     }
 
@@ -327,12 +255,6 @@ impl SeededSmartcard {
     /// no flag to verify either kind.
     pub fn with_management_key(mut self, algorithm: ManagementKeyArg) -> Self {
         self.management_algorithm = algorithm;
-        self
-    }
-
-    /// Choose whether management access keeps demanding a touch after `upload`
-    pub fn with_management_touch(mut self, touch: ManagementTouchArg) -> Self {
-        self.management_touch = touch == ManagementTouchArg::Always;
         self
     }
 
@@ -359,8 +281,8 @@ impl SeededSmartcard {
 mod tests {
     use super::*;
     use crate::seed;
-    use yubikey::MgmAlgorithmId;
     use yubikey::piv::RetiredSlotId;
+    use yubikey::{MgmAlgorithmId, PinPolicy, TouchPolicy};
 
     fn card() -> SeededSmartcard {
         SeededSmartcard::new(&[3u8; 32], Some("builder".into()), "Builder".into())
@@ -389,31 +311,46 @@ mod tests {
         assert_eq!(card.policies_for(retired), (PinPolicy::Once, TouchPolicy::Cached));
     }
 
-    /// The build server profile: the overrides reach 9A, 9C, 9D and the retired slots, while
-    /// 9E stays pin- and touch-free as the spec requires.
+    /// Every mode reaches 9A, 9C, 9D and the retired slots as `Policy` maps it, while 9E stays
+    /// pin- and touch-free as the spec requires; management access follows the mode's touch
     #[test]
-    fn policy_overrides_skip_card_authentication() {
-        let card = card()
-            .with_pin_policy(PinPolicy::Once)
-            .with_touch_policy(TouchPolicy::Never);
+    fn policies_reach_every_slot_but_card_authentication() {
+        use crate::policy::{Pin, Touch};
+        use clap::ValueEnum;
         let retired = SlotId::Retired(RetiredSlotId::try_from(0x83).unwrap());
+        let pin = |pin| match pin {
+            Pin::Never => PinPolicy::Never,
+            Pin::Once => PinPolicy::Once,
+            Pin::Always => PinPolicy::Always,
+        };
+        let touch = |touch| match touch {
+            Touch::Never => TouchPolicy::Never,
+            Touch::Cached => TouchPolicy::Cached,
+            Touch::Always => TouchPolicy::Always,
+        };
 
-        for slot in [
-            SlotId::Authentication,
-            SlotId::Signature,
-            SlotId::KeyManagement,
-            retired,
-        ] {
+        for &policy in Policy::value_variants() {
+            let card = card().with_policy(policy);
+            for slot in [
+                SlotId::Authentication,
+                SlotId::Signature,
+                SlotId::KeyManagement,
+                retired,
+            ] {
+                let (p, t) = policy.piv_slot(slot == SlotId::Signature);
+                assert_eq!(card.policies_for(slot), (pin(p), touch(t)), "{policy:?} on {slot:?}");
+            }
             assert_eq!(
-                card.policies_for(slot),
-                (PinPolicy::Once, TouchPolicy::Never),
-                "{slot:?} slot ignored the override"
+                card.policies_for(SlotId::CardAuthentication),
+                (PinPolicy::Never, TouchPolicy::Never),
+                "{policy:?} reached 9E"
             );
         }
-        assert_eq!(
-            card.policies_for(SlotId::CardAuthentication),
-            (PinPolicy::Never, TouchPolicy::Never)
-        );
+
+        // The build server profile, spelled out
+        let card = card().with_policy(Policy::OncePin);
+        assert_eq!(card.policies_for(SlotId::Signature), (PinPolicy::Once, TouchPolicy::Never));
+        assert!(!Policy::OncePin.management_touch());
     }
 
     /// The 3DES management key: 24 bytes, reproducible, not weak, and sharing nothing with

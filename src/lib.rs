@@ -19,6 +19,7 @@ pub mod seed;
 // Import frontends
 pub mod cli;
 pub(crate) mod common;
+pub mod policy;
 pub(crate) mod prompt;
 pub(crate) mod qr;
 // Import backends

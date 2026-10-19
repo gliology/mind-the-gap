@@ -5,6 +5,7 @@ use super::{
     import::RawRsaKey,
 };
 use crate::common;
+use crate::policy::Touch;
 use crate::seed::Algorithm;
 
 use std::time::SystemTime;
@@ -191,6 +192,56 @@ fn guard_admin_tries(card: &mut Card<Transaction<'_>>) -> Result<()> {
 fn describe(card: &Card<Transaction<'_>>) -> Result<String> {
     let aid = card.application_identifier()?;
     Ok(format!("{} OpenPGP card {}", aid.manufacturer_name(), aid.ident()))
+}
+
+impl SeededSmartcard {
+    /// Give one freshly imported key the policy's touch requirement, advisorily: no card must
+    /// lose its keys over a touch flag, and `pgp configure --touch` can set whatever the card
+    /// supports afterwards
+    fn set_policy_touch(&self, admin: &mut Card<openpgp_card::state::Admin<'_, '_>>, kt: KeyType) {
+        let fixed = self.fixed_touch;
+        let (wanted, fallback) = match (self.policy.pgp_touch(), fixed) {
+            // A reset leaves every key's touch off already, and writing it would only risk a
+            // refusal on cards without the flag; there is no fixed variant of off
+            (Touch::Never, _) => {
+                if fixed {
+                    log::info!("No touch to fix for the {kt:?} key: the policy asks for none");
+                }
+                return;
+            }
+            (Touch::Always, false) => (TouchPolicy::On, None),
+            (Touch::Always, true) => (TouchPolicy::Fixed, Some(TouchPolicy::On)),
+            // Cached is a Yubico extension to the flag that a spec-conforming card (the
+            // Nitrokey 3's opcard, Gnuk) and a YubiKey 4 refuse; plain on is the closest
+            (Touch::Cached, false) => (TouchPolicy::Cached, Some(TouchPolicy::On)),
+            (Touch::Cached, true) => (TouchPolicy::CachedFixed, Some(TouchPolicy::Fixed)),
+        };
+        let Err(refused) = set_touch_policy(admin, kt, wanted) else {
+            return;
+        };
+        let Some(fallback) = fallback else {
+            log::warn!(
+                "Card refused a touch policy for the {kt:?} key ({refused}); \
+                 set a supported one with `pgp configure --touch`"
+            );
+            return;
+        };
+        // A card without the fixed variants may still take the plain one
+        let attempts = [Some(fallback), fixed.then_some(TouchPolicy::On)];
+        for attempt in attempts.into_iter().flatten() {
+            if set_touch_policy(admin, kt, attempt).is_ok() {
+                log::info!(
+                    "Card refused the {wanted:?} touch policy for the {kt:?} key ({refused}), \
+                     set {attempt:?} instead"
+                );
+                return;
+            }
+        }
+        log::warn!(
+            "Card refused a touch policy for the {kt:?} key ({refused}); \
+             set a supported one with `pgp configure --touch`"
+        );
+    }
 }
 
 /// Set the touch policy of one key, on cards that predate OpenPGP card 3 as well
@@ -599,23 +650,17 @@ impl SeededSmartcard {
                 admin.import_key(&key, kt)?;
             }
 
-            // Prefer Cached (one touch valid for ~15s), then plain On, but only advisorily:
-            // Cached is a Yubico extension to the UIF data object that a spec-conforming card
-            // (the Nitrokey 3's opcard) and a YubiKey 4 refuse, and no card must lose its
-            // freshly imported keys over a nicety. `pgp configure --touch` can set whatever
-            // the card actually supports afterwards.
-            if let Err(cached) = set_touch_policy(&mut admin, kt, TouchPolicy::Cached) {
-                match set_touch_policy(&mut admin, kt, TouchPolicy::On) {
-                    Ok(()) => log::info!(
-                        "Card refused the cached touch policy for the {kt:?} key ({cached}), \
-                         every use takes a touch instead"
-                    ),
-                    Err(err) => log::warn!(
-                        "Card refused a touch policy for the {kt:?} key ({err}); \
-                         set a supported one with `pgp configure --touch`"
-                    ),
-                }
-            }
+            self.set_policy_touch(&mut admin, kt);
+        }
+
+        // Explicit rather than the card's default, which differs between cards (a YubiKey
+        // asks once per session, opcard before every signature); advisory, like the touch
+        let forced = self.policy.pgp_signing_pin_forced();
+        if let Err(err) = admin.set_user_pin_signing_validity(forced) {
+            log::warn!(
+                "Card refused to set how long a signing pin entry lasts ({err}); \
+                 set it with `pgp configure --sign-pin`"
+            );
         }
 
         // The user pin last, once the keys are in: Gnuk wraps the keys it holds under the

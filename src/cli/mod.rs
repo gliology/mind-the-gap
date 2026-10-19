@@ -17,6 +17,7 @@ use session::{Overrides, ReplLine, Session, Stickies, repl};
 
 use crate::common;
 use crate::mnemonic::MnemonicSeed;
+use crate::policy::Policy;
 use crate::prompt;
 use crate::seed::Algorithm;
 
@@ -289,6 +290,39 @@ fn parse_date(input: &str) -> Result<DateTime<Utc>> {
     NaiveDate::parse_from_str(input, "%Y-%m-%d")
         .map_err(|e| anyhow!(e))
         .map(|date| Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).expect("Static valid values")))
+}
+
+/// Warn about what an upload's policy gives up, before the card is touched
+///
+/// Warnings rather than refusals, like the factory pin: every mode is a legitimate choice for
+/// some card, a build server's for one, and the user should hear the cost once.
+fn warn_policy(policy: Policy, pgp: bool) {
+    if policy == Policy::Never {
+        log::warn!(
+            "Policy `never`: no pin and no touch, so whoever holds the card can use every key \
+             on it{}",
+            if pgp {
+                " that needs no pin entry per session"
+            } else {
+                ""
+            }
+        );
+    }
+    if pgp {
+        if policy.drops_pin() {
+            log::warn!(
+                "An OpenPGP card always asks for the pin once per session; `{}` cannot drop it",
+                spelled(&policy)
+            );
+        }
+    } else if policy.weakens_signature_pin() {
+        log::warn!(
+            "Policy `{}`: the signature slot 9C no longer asks for the pin before every \
+             signature, which NIST SP 800-73-4 asks for so that a signature stays \
+             non-repudiable",
+            spelled(&policy)
+        );
+    }
 }
 
 /// Warn when a provisioned card keeps the well-known factory user pin

@@ -7,10 +7,12 @@ use super::{
     parse_date, parse_duration,
     pgp_commands::{PGPCommand, PGPOptions},
     piv_commands::{PIVCommand, PIVOptions},
+    spelled,
 };
 use crate::mnemonic::{self, MnemonicSeed};
 use crate::pgp;
 use crate::piv;
+use crate::policy::Policy;
 use crate::prompt;
 use crate::seed::Algorithm;
 
@@ -75,11 +77,9 @@ pub(super) struct Stickies {
     pub(super) org: Option<String>,
     pub(super) unit: Option<String>,
     pub(super) country: Option<String>,
-    pub(super) pin_policy: Option<piv::PinPolicyArg>,
-    pub(super) touch_policy: Option<piv::TouchPolicyArg>,
+    pub(super) policy: Option<Policy>,
     pub(super) algorithm: Option<Algorithm>,
     pub(super) management_key: Option<piv::ManagementKeyArg>,
-    pub(super) management_key_touch: Option<piv::ManagementTouchArg>,
 }
 
 /// What `unset` can forget: the subkey id and every default `set` stores, spelled like
@@ -97,11 +97,9 @@ pub(super) enum Setting {
     Org,
     Unit,
     Country,
-    PinPolicy,
-    TouchPolicy,
+    Policy,
     Algorithm,
     ManagementAlgorithm,
-    ManagementKeyTouch,
 }
 
 /// Per-command overrides of the session's non-secret identity fields
@@ -278,8 +276,7 @@ pub(super) enum ReplCommand {
     #[command(group = ArgGroup::new("fields").required(true).multiple(true)
         .args(["subkey", "name", "emails", "date", "validity", "shared_pgp",
                "shared_piv", "legacy", "intermediate", "no_msroots", "org", "unit",
-               "country", "pin_policy", "touch_policy", "algorithm", "management_key",
-               "management_key_touch"]))]
+               "country", "policy", "algorithm", "management_key"]))]
     Set {
         /// New session subkey id
         #[arg(short = 'k', long)]
@@ -333,13 +330,9 @@ pub(super) enum ReplCommand {
         #[arg(long, value_name = "CC")]
         country: Option<String>,
 
-        /// Default per-slot pin policy for PIV uploads
+        /// Default pin and touch policy for both backends' uploads
         #[arg(long, value_enum)]
-        pin_policy: Option<piv::PinPolicyArg>,
-
-        /// Default per-slot touch policy for PIV uploads
-        #[arg(long, value_enum)]
-        touch_policy: Option<piv::TouchPolicyArg>,
+        policy: Option<Policy>,
 
         /// Default algorithm for both backends
         #[arg(long, value_enum)]
@@ -348,10 +341,6 @@ pub(super) enum ReplCommand {
         /// Default management key algorithm for PIV uploads
         #[arg(long = "management-algorithm", value_enum)]
         management_key: Option<piv::ManagementKeyArg>,
-
-        /// Default management key touch requirement for PIV uploads
-        #[arg(long, value_enum)]
-        management_key_touch: Option<piv::ManagementTouchArg>,
     },
 
     /// Forget session settings that `set` stored, back to the command line's defaults
@@ -492,9 +481,10 @@ fn ask_password_again(session: &mut Session) -> Result<()> {
 fn merge_defaults(backend: &mut Backend, d: &Stickies) {
     match backend {
         Backend::PGP {
-            options: PGPOptions { date, validity, shared, legacy, algorithm, .. },
+            options: PGPOptions { date, validity, shared, legacy, algorithm, policy, .. },
             ..
         } => {
+            *policy = policy.or(d.policy);
             *date = date.or(d.date);
             *validity = validity.or(d.validity);
             if shared.is_empty() {
@@ -514,12 +504,10 @@ fn merge_defaults(backend: &mut Backend, d: &Stickies) {
                     org,
                     unit,
                     country,
-                    pin_policy,
-                    touch_policy,
+                    policy,
                     no_msroots,
                     algorithm,
                     management_key,
-                    management_key_touch,
                     ..
                 },
             ..
@@ -540,11 +528,9 @@ fn merge_defaults(backend: &mut Backend, d: &Stickies) {
             if country.is_none() {
                 country.clone_from(&d.country);
             }
-            *pin_policy = pin_policy.or(d.pin_policy);
-            *touch_policy = touch_policy.or(d.touch_policy);
+            *policy = policy.or(d.policy);
             *algorithm = algorithm.or(d.algorithm);
             *management_key = management_key.or(d.management_key);
-            *management_key_touch = management_key_touch.or(d.management_key_touch);
         }
         Backend::Generate => {}
     }
@@ -697,20 +683,14 @@ pub(super) fn handle_line(session: &mut Session, line: &str) -> Result<Flow> {
                     stored.push(format!("{key}={value}"));
                 }
             }
-            if let Some(policy) = d.pin_policy {
-                stored.push(format!("pin-policy={policy:?}"));
-            }
-            if let Some(policy) = d.touch_policy {
-                stored.push(format!("touch-policy={policy:?}"));
+            if let Some(policy) = d.policy {
+                stored.push(format!("policy={}", spelled(&policy)));
             }
             if let Some(algorithm) = d.algorithm {
                 stored.push(format!("algorithm={algorithm:?}"));
             }
             if let Some(algorithm) = d.management_key {
                 stored.push(format!("management-key={algorithm:?}"));
-            }
-            if let Some(touch) = d.management_key_touch {
-                stored.push(format!("management-key-touch={touch:?}"));
             }
             show("defaults", (!stored.is_empty()).then(|| stored.join(", ")).as_deref());
             Ok(())
@@ -729,11 +709,9 @@ pub(super) fn handle_line(session: &mut Session, line: &str) -> Result<Flow> {
             org,
             unit,
             country,
-            pin_policy,
-            touch_policy,
+            policy,
             algorithm,
             management_key,
-            management_key_touch,
         } => {
             if let Some(subkey) = subkey {
                 session.subkey = Some(subkey);
@@ -759,11 +737,9 @@ pub(super) fn handle_line(session: &mut Session, line: &str) -> Result<Flow> {
             d.org = org.or(d.org.take());
             d.unit = unit.or(d.unit.take());
             d.country = country.or(d.country.take());
-            d.pin_policy = pin_policy.or(d.pin_policy);
-            d.touch_policy = touch_policy.or(d.touch_policy);
+            d.policy = policy.or(d.policy);
             d.algorithm = algorithm.or(d.algorithm);
             d.management_key = management_key.or(d.management_key);
-            d.management_key_touch = management_key_touch.or(d.management_key_touch);
             Ok(())
         }
         ReplCommand::Unset { settings } => {
@@ -781,11 +757,9 @@ pub(super) fn handle_line(session: &mut Session, line: &str) -> Result<Flow> {
                     Setting::Org => d.org = None,
                     Setting::Unit => d.unit = None,
                     Setting::Country => d.country = None,
-                    Setting::PinPolicy => d.pin_policy = None,
-                    Setting::TouchPolicy => d.touch_policy = None,
+                    Setting::Policy => d.policy = None,
                     Setting::Algorithm => d.algorithm = None,
                     Setting::ManagementAlgorithm => d.management_key = None,
-                    Setting::ManagementKeyTouch => d.management_key_touch = None,
                 }
             }
             Ok(())

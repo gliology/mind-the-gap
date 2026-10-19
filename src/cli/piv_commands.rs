@@ -2,9 +2,10 @@
 
 use super::{
     Identity, confirm, parse_date, parse_duration, spelled, spelled_all, warn_factory_pin,
-    warn_if_phrase_is_weaker,
+    warn_if_phrase_is_weaker, warn_policy,
 };
 use crate::piv;
+use crate::policy::Policy;
 use crate::qr;
 use crate::seed::Algorithm;
 
@@ -146,19 +147,10 @@ pub(super) struct PIVOptions {
     )]
     pub(super) country: Option<String>,
 
-    /// Override the per-slot pin policy (ignored for the card authentication slot)
-    #[arg(help_heading = "Card", long, value_enum, global = true, env = "MIND_THE_PIV_PIN_POLICY")]
-    pub(super) pin_policy: Option<piv::PinPolicyArg>,
-
-    /// Override the per-slot touch policy (ignored for the card authentication slot)
-    #[arg(
-        help_heading = "Card",
-        long,
-        value_enum,
-        global = true,
-        env = "MIND_THE_PIV_TOUCH_POLICY"
-    )]
-    pub(super) touch_policy: Option<piv::TouchPolicyArg>,
+    /// Pin and touch requirements upload gives the keys and management access (relaxed by
+    /// default; see the policies chapter of the book)
+    #[arg(help_heading = "Card", long, value_enum, global = true, env = "MIND_THE_POLICY")]
+    pub(super) policy: Option<Policy>,
 
     /// Do not store the certificate authorities in the card's msroots object
     #[arg(help_heading = "Card", long, global = true, env = "MIND_THE_PIV_NO_MSROOTS")]
@@ -184,16 +176,6 @@ pub(super) struct PIVOptions {
         env = "MIND_THE_PIV_MANAGEMENT_ALGORITHM"
     )]
     pub(super) management_key: Option<piv::ManagementKeyArg>,
-
-    /// Whether management access demands a touch after upload (always by default)
-    #[arg(
-        help_heading = "Card",
-        long,
-        value_enum,
-        global = true,
-        env = "MIND_THE_PIV_MANAGEMENT_KEY_TOUCH"
-    )]
-    pub(super) management_key_touch: Option<piv::ManagementTouchArg>,
 }
 
 /// Run one PIV subcommand, assembling the certificate builder on demand
@@ -209,12 +191,10 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
         org,
         unit,
         country,
-        pin_policy,
-        touch_policy,
+        policy,
         no_msroots,
         algorithm,
         management_key,
-        management_key_touch,
     } = options;
 
     // Built lazily, so a command that needs no builder -- status today, anything later --
@@ -268,14 +248,9 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
             builder = builder.with_retired(retired.clone());
         }
 
-        // Policy overrides only affect the user slots, never card authentication
-        if let Some(policy) = pin_policy {
-            log::info!("Setting slot pin policy: {}", spelled(&policy));
-            builder = builder.with_pin_policy(policy.into());
-        }
-        if let Some(policy) = touch_policy {
-            log::info!("Setting slot touch policy: {}", spelled(&policy));
-            builder = builder.with_touch_policy(policy.into());
+        if let Some(policy) = policy {
+            log::info!("Setting pin and touch policy: {}", spelled(&policy));
+            builder = builder.with_policy(policy);
         }
 
         if no_msroots {
@@ -286,10 +261,6 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
         if let Some(algorithm) = management_key {
             log::info!("Setting management key algorithm: {}", spelled(&algorithm));
             builder = builder.with_management_key(algorithm);
-        }
-        if let Some(touch) = management_key_touch {
-            log::info!("Setting management key touch: {}", spelled(&touch));
-            builder = builder.with_management_touch(touch);
         }
 
         // Applied here rather than per command so that certify, check and upload all
@@ -360,6 +331,7 @@ pub(super) fn run_piv(identity: Identity, options: PIVOptions, command: PIVComma
         }
         PIVCommand::Upload { pin, card, yes, output, qr: show_qr } => {
             warn_factory_pin(pin.is_none());
+            warn_policy(policy.unwrap_or_default(), false);
 
             // Verify user inputs further. Counted in characters, not bytes: the card takes
             // up to 8 bytes, but a multi-byte character miscounted here would produce an

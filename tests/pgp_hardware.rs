@@ -13,8 +13,8 @@
 //! ```
 //!
 //! Provisioning needs no touch, the applet being set up through the admin pin, but `upload`
-//! leaves the keys at the cached touch policy, so on a YubiKey the steps that use the keys
-//! (sign, authenticate, decrypt, and gpg doing the same) blink for a touch each.
+//! leaves the keys at the `relaxed` policy's cached touch, so on a YubiKey the steps that use
+//! the keys (sign, authenticate, decrypt, and gpg doing the same) blink for a touch each.
 //!
 //! The card is addressed by its OpenPGP *application identifier* (`0006:20381784`), not the
 //! bare serial the PIV suite wants -- that is what `openpgp-card` matches on. `mind-the-gap
@@ -28,6 +28,7 @@
 use mind_the_gap::pgp::{
     CardSettings, CertificateKind, SeededSmartcard, SubkeyRole, TouchPolicyArg,
 };
+use mind_the_gap::policy::Policy;
 use mind_the_gap::seed::{Algorithm, Seed256};
 
 use sequoia_openpgp::cert::Cert;
@@ -75,9 +76,9 @@ fn target() -> String {
 
 /// Whether this run turns the touch policies off, for a host that runs it unattended
 ///
-/// `MTG_HARDWARE_TEST_TOUCH=never`, as in the PIV suite: a script cannot touch a YubiKey, so
-/// this is how the suite runs without a person, proving everything except that touch is
-/// enforced, which the default run does.
+/// `MTG_HARDWARE_TEST_TOUCH=never` provisions with the `never-touch` policy, as in the PIV
+/// suite: a script cannot touch a YubiKey, so this is how the suite runs without a person,
+/// proving everything except that touch is enforced, which the default run does.
 fn touch_free() -> bool {
     match std::env::var("MTG_HARDWARE_TEST_TOUCH") {
         Err(_) => false,
@@ -102,12 +103,17 @@ fn test_seed() -> Seed256 {
 }
 
 fn subject() -> SeededSmartcard {
-    SeededSmartcard::new(&test_seed(), None, TEST_NAME.into())
+    let subject = SeededSmartcard::new(&test_seed(), None, TEST_NAME.into())
         .add_email(TEST_EMAIL)
         .unwrap()
         .with_pin(Zeroizing::new(TEST_PIN.to_string()))
         .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
-        .with_subkey_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+        .with_subkey_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+    if touch_free() {
+        subject.with_policy(Policy::NeverTouch)
+    } else {
+        subject
+    }
 }
 
 /// Open the card under test directly, bypassing the crate, with the serial number gpg knows
@@ -381,27 +387,6 @@ fn provision_and_verify(subject: SeededSmartcard) {
         offline.fingerprint(),
         "upload and certify produced different primary keys",
     );
-
-    // `upload` leaves every key at the cached touch policy, which a script cannot satisfy on
-    // a YubiKey; a touch-free run turns them off before the first key is used
-    if touch_free() {
-        eprintln!("      touch-free run: turning every key's touch policy off");
-        subject
-            .configure(
-                Some(ident.clone()),
-                CardSettings {
-                    touch: SubkeyRole::ALL
-                        .iter()
-                        .map(|role| (*role, TouchPolicyArg::Never))
-                        .collect(),
-                    lang: vec![],
-                    url: None,
-                    login: None,
-                    sign_pin: None,
-                },
-            )
-            .expect("configure could not turn the touch policies off");
-    }
 
     // -- The crate's own check agrees ----------------------------------------------------
     eprintln!("[3/7] running check");

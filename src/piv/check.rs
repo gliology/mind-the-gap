@@ -127,7 +127,7 @@ impl SeededSmartcard {
 
         // The management key's touch policy, where the card can report it. Advisory like the
         // slot policies below.
-        let expected_touch = if self.management_touch {
+        let expected_touch = if self.policy.management_touch() {
             TouchPolicy::Always
         } else {
             TouchPolicy::Never
@@ -145,11 +145,11 @@ impl SeededSmartcard {
         // The prompt goes to stderr: stdout may be carrying PEM or a report, and a buried
         // prompt is a missed touch and a failed run
         log::info!("Verifying smart card {algorithm:?} management key");
-        if self.management_touch {
+        if self.policy.management_touch() {
             eprintln!("[Please touch device to authenticate management access!]");
         }
         token.authenticate(&self.management_key(algorithm)?)?;
-        if self.management_touch {
+        if self.policy.management_touch() {
             eprintln!();
         }
 
@@ -204,16 +204,11 @@ impl SeededSmartcard {
                         Some(Ok(_)) => {}
                     }
 
-                    // Policies are advisory: warn rather than fail, they can be tightened by
-                    // hand, and `upload` itself lets them be overridden
+                    // Policies are advisory: warn rather than fail, a card provisioned under
+                    // another --policy still holds the right keys
                     if let Some(policy) = metadata.policy {
                         let expected_policy = self.policies_for(*slot);
-                        // `--pin-policy default` and `--touch-policy default` leave the
-                        // choice to the card, so whatever it reports is the expected value
-                        let (pin, touch) = expected_policy;
-                        let pin_ok = pin == PinPolicy::Default || pin == policy.0;
-                        let touch_ok = touch == TouchPolicy::Default || touch == policy.1;
-                        if !(pin_ok && touch_ok) {
+                        if policy != expected_policy {
                             log::warn!(
                                 "Policy mismatch in {:?} slot: card={:?}, expected={:?}",
                                 slot,

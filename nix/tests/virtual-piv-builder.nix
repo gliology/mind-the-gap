@@ -120,8 +120,7 @@ in
     builder = f"{identity} -k pavlov-1"
     # The build server profile from docs/piv-build-server.md
     piv = (
-        "piv --algorithm p384 --pin-policy once --touch-policy never "
-        "--management-key-touch never${
+        "piv --algorithm p384 --policy once-pin${
           if managementKey == null then "" else " --management-algorithm ${managementKey}"
         }"
     )

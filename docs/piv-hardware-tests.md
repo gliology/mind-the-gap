@@ -201,7 +201,8 @@ for s in 9a 9c 9d 9e; do ykman piv keys info $s; done
 ```
 
 - [x] Four private keys and four certificates, all `EC` / `P-256`
-- [x] Per-slot policies match: 9A `PIN once / touch cached`, 9C `PIN always / touch always`,
+- [x] Per-slot policies match the default `relaxed` policy (see [pin and touch
+      policies](policies.md)): 9A `PIN once / touch cached`, 9C `PIN always / touch always`,
       9D `PIN once / touch cached`, 9E `PIN never / touch never`
 - [x] `ykman piv info` shows `Management key algorithm: AES256` (a freshly reset card reports
       `TDES`, so this confirms the key was replaced) and every slot issued by the root CA

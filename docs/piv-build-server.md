@@ -13,8 +13,7 @@ This chapter describes the profile for that case, and why each flag is what it i
 
 ```
 mind-the-gap -s '<mnemonic>' -k pavlov-1 -n 'pavlov builder' piv --algorithm p384 \
-  --pin-policy once --touch-policy never --management-key-touch never \
-  upload -c <serial> --pin <pin> --yes
+  --policy once-pin upload -c <serial> --pin <pin> --yes
 ```
 
 Typed like this, the phrase and the pin sit in the shell history and the process list. On
@@ -30,14 +29,13 @@ seed](multiple-cards.md)).
 | flag | why |
 |---|---|
 | `--algorithm p384` | the cache signing key has to be ECDSA P-384 for Determinate Nix to use it, and `--algorithm` applies to every slot and both authorities at once, so the whole chain moves to P-384 |
-| `--pin-policy once` | the server signs unattended: it unlocks the card with the pin once per session, not once per signature (9C would otherwise demand the pin before every one) |
-| `--touch-policy never` | nobody is at the server to touch the card |
-| `--management-key-touch never` | management access is only ever needed during provisioning, which happens on the air-gapped machine; the derived management key never reaches the server, so a touch would guard nothing there |
+| `--policy once-pin` | the server signs unattended: it unlocks the card with the pin once per session, not once per signature (9C would otherwise demand the pin before every one), and nobody is at the server to touch the card. Management access goes without a touch too: it is only ever needed during provisioning, which happens on the air-gapped machine, and the derived management key never reaches the server, so a touch would guard nothing there. `upload` warns that 9C no longer asks for the pin before every signature; for a build server's signature that is the point |
 | `--management-algorithm auto` (default) | AES-256 where the card supports it; 3DES on a YubiKey 4, or a YubiKey 5 before firmware 5.4, which take nothing else |
 
-Slot 9E keeps its pin-less, touch-less policy whatever the overrides say, as the PIV
-specification requires; the overrides apply to 9A, 9C, 9D and any retired slots. The
-policies are fixed when a key is imported, so changing them means running `upload` again.
+Slot 9E keeps its pin-less, touch-less policy in every mode, as the PIV specification
+requires; the policy applies to 9A, 9C, 9D and any retired slots (see [pin and touch
+policies](policies.md)). The policies are fixed when a key is imported, so changing them
+means running `upload` again.
 
 The pin is the one secret that has to reach the server, in whatever way it keeps its other
 secrets. It unlocks signing on that one card and nothing else: it is not part of any
@@ -75,8 +73,7 @@ the server. It needs the seed, so it cannot run on the server itself.
 
 ```
 mind-the-gap -s '<mnemonic>' -k pavlov-1 -n 'pavlov builder' piv --algorithm p384 \
-  --pin-policy once --touch-policy never --management-key-touch never \
-  check -c <serial> --pin <pin>
+  --policy once-pin check -c <serial> --pin <pin>
 ```
 
 On every card it authenticates with the derived management key, verifies the pin, compares

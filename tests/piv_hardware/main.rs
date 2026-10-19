@@ -38,7 +38,8 @@
     not(feature = "no-destructive-hardware-tests")
 ))]
 
-use mind_the_gap::piv::{CertChain, CertificateKind, ManagementTouchArg, SeededSmartcard};
+use mind_the_gap::piv::{CertChain, CertificateKind, SeededSmartcard};
+use mind_the_gap::policy::Policy;
 use mind_the_gap::seed::{Algorithm, Seed256};
 
 use p256::ecdh;
@@ -137,8 +138,8 @@ fn test_seed() -> Seed256 {
 
 /// Whether this run provisions without touch policies, for a host that runs it unattended
 ///
-/// `MTG_HARDWARE_TEST_TOUCH=never` sets every slot and the management key to touch never, and
-/// the assertions follow. A script cannot touch a YubiKey, so this is how the suite runs
+/// `MTG_HARDWARE_TEST_TOUCH=never` provisions with the `never-touch` policy, the standard's
+/// pins without any touch, and the assertions follow. A script cannot touch a YubiKey, so this is how the suite runs
 /// without a person; it proves everything except that touch is enforced, which the default
 /// run does.
 fn touch_free() -> bool {
@@ -157,9 +158,7 @@ fn subject() -> SeededSmartcard {
         .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
         .with_validity_duration(Duration::from_secs(10 * 365 * 24 * 60 * 60));
     if touch_free() {
-        subject
-            .with_touch_policy(TouchPolicy::Never)
-            .with_management_touch(ManagementTouchArg::Never)
+        subject.with_policy(Policy::NeverTouch)
     } else {
         subject
     }
