@@ -48,6 +48,15 @@ in
     }
   );
 
+  # Both suites at once on a virtual PIV and a virtual OpenPGP card in one machine, so a
+  # suite that disturbs another card shows here rather than on a test host
+  virtual-parallel = vmTest (
+    import ./virtual-parallel.nix {
+      inherit pkgs piv-suite pgp-suite;
+      inherit (cards) piv-vpicc opcard-vpicc;
+    }
+  );
+
   # The same for PIV, once per algorithm: provision the trussed piv-authenticator
   # behind vpcd end to end -- reset, pin and management key handling, key import
   # with metadata read-back, the certificate chain -- then run the card-level

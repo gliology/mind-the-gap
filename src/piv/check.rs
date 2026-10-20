@@ -1,6 +1,7 @@
 //! Comparing a card with the derived chain, by metadata or by a signature challenge.
 
 use super::{ManagementKeyArg, SeededSmartcard, SlotRole, card::open_token};
+use crate::target::CardTarget;
 
 use anyhow::{Result, anyhow, bail};
 
@@ -111,7 +112,7 @@ impl SeededSmartcard {
     /// Slot keys are compared through `GET METADATA`. A card without it (YubiKey before
     /// 5.3) proves each key by signing a random challenge instead, which needs `--pin` for
     /// every slot whose pin policy is not `never`; its slot policies cannot be read at all.
-    pub fn check(&self, target: Option<String>) -> Result<()> {
+    pub fn check(&self, target: Option<CardTarget>) -> Result<()> {
         let chain = self.generate_chain()?;
         let mut token = open_token(target)?;
 

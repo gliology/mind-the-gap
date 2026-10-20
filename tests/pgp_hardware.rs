@@ -30,6 +30,7 @@ use mind_the_gap::pgp::{
 };
 use mind_the_gap::policy::Policy;
 use mind_the_gap::seed::{Algorithm, Seed256};
+use mind_the_gap::target::CardTarget;
 
 use sequoia_openpgp::cert::Cert;
 use sequoia_openpgp::policy::StandardPolicy;
@@ -45,7 +46,7 @@ use sequoia_openpgp::types::Curve as PgpCurve;
 
 use zeroize::Zeroizing;
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime};
 
 const TEST_PIN: &str = "471120";
@@ -116,52 +117,69 @@ fn subject() -> SeededSmartcard {
     }
 }
 
+/// The reader the card under test sits in, found once per run
+///
+/// Finding a card by its identifier means asking every attached card who it is, the one
+/// moment a suite touches other cards. So it happens once, holding the readers exclusively
+/// while no other suite talks to its card, and every later step addresses this card by
+/// reader alone. The cards are asked over plain PC/SC and left as they were: dropping an
+/// `openpgp-card` connection resets the card, which would break a suite running on it.
+fn reader() -> &'static std::ffi::CStr {
+    static READER: OnceLock<std::ffi::CString> = OnceLock::new();
+    READER.get_or_init(|| {
+        let _readers = readers::exclusive();
+        let ident = target();
+        let context =
+            pcsc::Context::establish(pcsc::Scope::User).expect("cannot open a PC/SC context");
+        let mut names = vec![
+            0;
+            context
+                .list_readers_len()
+                .expect("cannot list PC/SC readers")
+        ];
+        let readers: Vec<std::ffi::CString> = context
+            .list_readers(&mut names)
+            .expect("cannot list PC/SC readers")
+            .map(std::ffi::CStr::to_owned)
+            .collect();
+        for reader in readers {
+            let Ok(mut probe) =
+                context.connect(&reader, pcsc::ShareMode::Shared, pcsc::Protocols::ANY)
+            else {
+                continue;
+            };
+            let found = probe_ident(&mut probe).is_some_and(|id| id.eq_ignore_ascii_case(&ident));
+            let _ = probe.disconnect(pcsc::Disposition::LeaveCard);
+            if found {
+                return reader;
+            }
+        }
+        panic!("no OpenPGP card with identifier '{ident}'; `mind-the-gap pgp status` lists them")
+    })
+}
+
+/// The card under test as the crate is told to address it
+fn addressed() -> CardTarget {
+    CardTarget::Reader(reader().to_string_lossy().into_owned())
+}
+
 /// Open the card under test directly, bypassing the crate, with the serial number gpg knows
 /// it by (its application identifier).
 ///
 /// The assertions below have to be independent of the code they are checking, so they read the
-/// card through `openpgp-card` rather than through `SeededSmartcard::check`. The cards are
-/// told apart over plain PC/SC and every other one is left as it was: dropping an
-/// `openpgp-card` connection resets the card, which would break a suite running on it.
+/// card through `openpgp-card` rather than through `SeededSmartcard::check`.
 fn open() -> (Card<openpgp_card::state::Open>, String) {
-    let ident = target();
     let context = pcsc::Context::establish(pcsc::Scope::User).expect("cannot open a PC/SC context");
-    let mut names = vec![
-        0;
-        context
-            .list_readers_len()
-            .expect("cannot list PC/SC readers")
-    ];
-    let readers: Vec<std::ffi::CString> = context
-        .list_readers(&mut names)
-        .expect("cannot list PC/SC readers")
-        .map(std::ffi::CStr::to_owned)
-        .collect();
-
-    for reader in readers {
-        let Ok(mut probe) = context.connect(&reader, pcsc::ShareMode::Shared, pcsc::Protocols::ANY)
-        else {
-            continue;
-        };
-        let found = probe_ident(&mut probe).is_some_and(|id| id.eq_ignore_ascii_case(&ident));
-        let _ = probe.disconnect(pcsc::Disposition::LeaveCard);
-        if !found {
-            continue;
-        }
-
-        let backend = PcscBackend::from_pcsc_reader(&context, &reader, None)
-            .expect("cannot connect to the card under test");
-        let mut card = Card::new(backend).expect("cannot open card");
-        let aid = {
-            let tx = card.transaction().expect("cannot start card transaction");
-            tx.application_identifier()
-                .expect("cannot read application identifier")
-        };
-        let serialno = aid.to_string().replace(' ', "");
-        return (card, serialno);
-    }
-
-    panic!("no OpenPGP card with identifier '{ident}'; `mind-the-gap pgp status` lists them")
+    let backend = PcscBackend::from_pcsc_reader(&context, reader(), None)
+        .expect("cannot connect to the card under test");
+    let mut card = Card::new(backend).expect("cannot open card");
+    let aid = {
+        let tx = card.transaction().expect("cannot start card transaction");
+        tx.application_identifier()
+            .expect("cannot read application identifier")
+    };
+    let serialno = aid.to_string().replace(' ', "");
+    (card, serialno)
 }
 
 /// A card's OpenPGP identifier, MANUFACTURER:SERIAL, read with two plain APDUs
@@ -247,7 +265,10 @@ static CARD: Mutex<()> = Mutex::new(());
 /// A test that failed while holding it poisons the lock, but leaves nothing the next
 /// test's own factory reset does not clear, so the poison is ignored rather than spread.
 fn exclusive_card() -> MutexGuard<'static, ()> {
-    CARD.lock().unwrap_or_else(PoisonError::into_inner)
+    let card = CARD.lock().unwrap_or_else(PoisonError::into_inner);
+    // Before any shared hold: finding the reader takes the exclusive one
+    reader();
+    card
 }
 
 #[test]
@@ -311,7 +332,7 @@ fn touch_is_enforced() {
         .expect("offline certify failed");
     decide("grant");
     subject
-        .upload(Some(target()))
+        .upload(Some(addressed()))
         .expect("upload to card failed");
 
     let (mut card, _) = open();
@@ -379,7 +400,7 @@ fn provision_and_verify(subject: SeededSmartcard) {
 
     eprintln!("[2/7] uploading to card {ident} (no touch needed)");
     let uploaded = subject
-        .upload(Some(ident.clone()))
+        .upload(Some(addressed()))
         .expect("upload to card failed");
 
     assert_eq!(
@@ -391,7 +412,7 @@ fn provision_and_verify(subject: SeededSmartcard) {
     // -- The crate's own check agrees ----------------------------------------------------
     eprintln!("[3/7] running check");
     subject
-        .check(Some(ident.clone()))
+        .check(Some(addressed()))
         .expect("check disagreed with the card");
 
     // -- Independent verification --------------------------------------------------------
@@ -459,7 +480,7 @@ fn provision_and_verify(subject: SeededSmartcard) {
     eprintln!("[7/7] configure adjusts the provisioned card");
     subject
         .configure(
-            Some(ident.clone()),
+            Some(addressed()),
             CardSettings {
                 touch: vec![(SubkeyRole::Authentication, TouchPolicyArg::Always)],
                 lang: vec![*b"en", *b"de"],

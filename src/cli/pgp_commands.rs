@@ -8,6 +8,7 @@ use crate::pgp::{self, CertificateKind, VerificationKind};
 use crate::policy::Policy;
 use crate::qr;
 use crate::seed::Algorithm;
+use crate::target::CardTarget;
 
 use std::{path::PathBuf, time::Duration};
 
@@ -38,9 +39,9 @@ pub(super) enum PGPCommand {
         #[arg(short = 'i', long, env = "MIND_THE_PIN")]
         pin: Option<Zeroizing<String>>,
 
-        /// Serial number of smart card to check
-        #[arg(short, long, env = "MIND_THE_CARD")]
-        card: Option<String>,
+        /// Card to address: its identifier (MMMM:SSSSSSSS), or its reader as `pgp status` shows it
+        #[arg(short, long, value_name = "CARD", env = "MIND_THE_CARD")]
+        card: Option<CardTarget>,
     },
 
     /// Adjust a provisioned card's settings, authenticated by the derived admin pin
@@ -52,9 +53,9 @@ pub(super) enum PGPCommand {
     #[command(group = ArgGroup::new("settings").required(true).multiple(true)
         .args(["touch", "lang", "url", "login", "sign_pin"]))]
     Config {
-        /// Serial number of smart card to adjust
-        #[arg(short, long, env = "MIND_THE_CARD")]
-        card: Option<String>,
+        /// Card to address: its identifier (MMMM:SSSSSSSS), or its reader as `pgp status` shows it
+        #[arg(short, long, value_name = "CARD", env = "MIND_THE_CARD")]
+        card: Option<CardTarget>,
 
         /// Touch policy per key, as `<key>=<policy>`
         ///
@@ -93,9 +94,9 @@ pub(super) enum PGPCommand {
         #[arg(short = 'i', long, env = "MIND_THE_PIN")]
         pin: Option<Zeroizing<String>>,
 
-        /// Serial number of smart card target
-        #[arg(short, long, env = "MIND_THE_CARD")]
-        card: Option<String>,
+        /// Card to address: its identifier (MMMM:SSSSSSSS), or its reader as `pgp status` shows it
+        #[arg(short, long, value_name = "CARD", env = "MIND_THE_CARD")]
+        card: Option<CardTarget>,
 
         /// Reset the card without asking first
         #[arg(short, long)]

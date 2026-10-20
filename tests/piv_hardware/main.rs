@@ -41,6 +41,7 @@
 use mind_the_gap::piv::{CertChain, CertificateKind, SeededSmartcard};
 use mind_the_gap::policy::Policy;
 use mind_the_gap::seed::{Algorithm, Seed256};
+use mind_the_gap::target::CardTarget;
 
 use p256::ecdh;
 
@@ -56,12 +57,13 @@ use x509_cert::der::Encode;
 use x509_cert::der::EncodePem;
 
 use yubikey::piv::{self, AlgorithmId, ManagementSlotId, SlotAlgorithmId, SlotId};
+use yubikey::reader::Context;
 use yubikey::{CccId, ChuId, MgmAlgorithmId, MsRoots, PinPolicy, Serial, TouchPolicy, YubiKey};
 
 use zeroize::Zeroizing;
 
 use std::str::FromStr;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime};
 
 mod end_use;
@@ -118,6 +120,8 @@ static CARD: Mutex<()> = Mutex::new(());
 /// test's own reset does not clear, so the poison is ignored rather than spread.
 fn exclusive_card() -> (MutexGuard<'static, ()>, readers::Readers) {
     let card = CARD.lock().unwrap_or_else(PoisonError::into_inner);
+    // Before the shared hold: finding the reader takes the exclusive one
+    reader();
     (card, readers::shared())
 }
 
@@ -164,8 +168,40 @@ fn subject() -> SeededSmartcard {
     }
 }
 
+/// The reader the card under test sits in, found once per run
+///
+/// Finding a card by its serial means asking every attached card who it is, the one moment a
+/// suite touches other cards. So it happens once, holding the readers exclusively while no
+/// other suite talks to its card, and every later step addresses this card by reader alone.
+fn reader() -> &'static str {
+    static READER: OnceLock<String> = OnceLock::new();
+    READER.get_or_init(|| {
+        let _readers = readers::exclusive();
+        let serial = Serial::from_str(&target()).expect("serial is not a number");
+        let token = on_card(
+            "finding the card",
+            YubiKey::open_by_serial(serial).map_err(anyhow::Error::from),
+        );
+        let name = token.name().to_string();
+        let _ = token.disconnect(pcsc::Disposition::LeaveCard);
+        name
+    })
+}
+
+/// The card under test as the crate is told to address it
+fn addressed() -> CardTarget {
+    CardTarget::Reader(reader().to_string())
+}
+
 fn open() -> YubiKey {
-    YubiKey::open_by_serial(Serial::from_str(&target()).expect("serial is not a number"))
+    let mut context = Context::open().expect("cannot open a PC/SC context");
+    let reader = context
+        .iter()
+        .expect("cannot list PC/SC readers")
+        .find(|candidate| candidate.name() == reader())
+        .expect("the reader of the card under test is gone");
+    reader
+        .open()
         .expect("cannot open the card named by MTG_HARDWARE_TEST_SERIAL")
 }
 
@@ -457,7 +493,7 @@ fn touch_is_enforced() {
     );
     drop(token);
     assert!(
-        subject.check(Some(serial.clone())).is_err(),
+        subject.check(Some(addressed())).is_err(),
         "the management key authenticated without the touch it demands",
     );
 
@@ -467,7 +503,7 @@ fn touch_is_enforced() {
     signature_slot_signs(&mut token, &offline);
     key_management_slot_agrees(&mut token, &offline);
     drop(token);
-    on_card("check", subject.check(Some(serial)));
+    on_card("check", subject.check(Some(addressed())));
 }
 
 /// steps that follow; `total` is only for the step counter in the progress lines.
@@ -488,7 +524,7 @@ fn provision_and_verify(
     // No touch here: `upload` installs the management key touch-free and only switches the
     // requirement on once provisioning has succeeded
     eprintln!("[2/{total}] uploading to card {serial}");
-    let uploaded = on_card("upload", subject.upload(Some(serial.to_string())));
+    let uploaded = on_card("upload", subject.upload(Some(addressed())));
 
     assert_eq!(
         uploaded
@@ -501,7 +537,7 @@ fn provision_and_verify(
     );
 
     eprintln!("[3/{total}] running check -- TOUCH THE TOKEN when it blinks");
-    on_card("check", subject.check(Some(serial.to_string())));
+    on_card("check", subject.check(Some(addressed())));
 
     // -- Section 2: what actually landed -------------------------------------------------
     //

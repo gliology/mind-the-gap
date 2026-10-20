@@ -16,12 +16,14 @@
 pub mod mnemonic;
 pub mod rsa;
 pub mod seed;
+pub mod target;
 // Import frontends
 pub mod cli;
 pub(crate) mod common;
 pub mod policy;
 pub(crate) mod prompt;
 pub(crate) mod qr;
+pub(crate) mod readers;
 // Import backends
 pub mod pgp;
 pub mod piv;

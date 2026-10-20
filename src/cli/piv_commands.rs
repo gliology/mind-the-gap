@@ -8,6 +8,7 @@ use crate::piv;
 use crate::policy::Policy;
 use crate::qr;
 use crate::seed::Algorithm;
+use crate::target::CardTarget;
 
 use std::{path::PathBuf, time::Duration};
 
@@ -47,9 +48,9 @@ pub(super) enum PIVCommand {
         #[arg(short = 'i', long, env = "MIND_THE_PIN")]
         pin: Option<Zeroizing<String>>,
 
-        /// Serial number of smart card target
-        #[arg(short, long, env = "MIND_THE_CARD")]
-        card: Option<String>,
+        /// Card to address: its serial number, or its reader as `piv status` shows it
+        #[arg(short, long, value_name = "CARD", env = "MIND_THE_CARD")]
+        card: Option<CardTarget>,
     },
 
     /// Reset the card and provision the derived chain
@@ -63,9 +64,9 @@ pub(super) enum PIVCommand {
         #[arg(short = 'i', long, env = "MIND_THE_PIN")]
         pin: Option<Zeroizing<String>>,
 
-        /// Serial number of smart card target
-        #[arg(short, long, env = "MIND_THE_CARD")]
-        card: Option<String>,
+        /// Card to address: its serial number, or its reader as `piv status` shows it
+        #[arg(short, long, value_name = "CARD", env = "MIND_THE_CARD")]
+        card: Option<CardTarget>,
 
         /// Reset the card without asking first
         #[arg(short, long)]

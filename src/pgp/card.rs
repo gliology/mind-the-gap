@@ -6,8 +6,11 @@ use super::{
 };
 use crate::common;
 use crate::policy::Touch;
+use crate::readers;
 use crate::seed::Algorithm;
+use crate::target::CardTarget;
 
+use std::ffi::CString;
 use std::time::SystemTime;
 
 use anyhow::{Result, anyhow, bail};
@@ -31,7 +34,8 @@ use openpgp_card::{Card, Error as CardError};
 
 use openpgp_card::ocard::algorithm::AlgorithmAttributes;
 use openpgp_card::ocard::data::{
-    Fingerprint as CardFingerprint, KeyGenerationTime, TouchPolicy, UserInteractionFlag,
+    ApplicationIdentifier, Fingerprint as CardFingerprint, KeyGenerationTime, TouchPolicy,
+    UserInteractionFlag,
 };
 use openpgp_card::state::{Open, Transaction};
 
@@ -39,29 +43,27 @@ use openpgp_card::state::{Open, Transaction};
 pub fn status() -> Result<()> {
     println!("Available OpenPGP cards:");
 
-    let backends: Vec<PcscBackend> = PcscBackend::cards(None)
-        .map(|iter| iter.filter_map(Result::ok).collect())
-        .unwrap_or_default();
-
-    if backends.is_empty() {
+    let cards = summaries()?;
+    if cards.is_empty() {
         println!(" - None");
         println!();
     }
 
-    for backend in backends {
-        let mut card = Card::new(backend)?;
-        let mut transaction = card.transaction()?;
+    for card in cards {
+        println!(" - Card {}", card.aid.ident());
+        println!("   Reader: {}", common::printable(&card.reader.to_string_lossy()));
 
-        println!(" - Card {}", transaction.application_identifier()?.ident());
-
-        let name = transaction.cardholder_name()?;
-        if !name.is_empty() {
-            println!("   Cardholder: {}", common::printable(&name));
+        if !card.name.is_empty() {
+            println!("   Cardholder: {}", common::printable(&card.name));
         }
 
-        for kt in SubkeyRole::ALL.map(SubkeyRole::key_type) {
-            if let Ok(Some(fp)) = transaction.fingerprint(kt) {
-                println!("   {:?} key: {}", kt, fp.to_spaced_hex());
+        for (kt, fingerprint) in SubkeyRole::ALL
+            .map(SubkeyRole::key_type)
+            .iter()
+            .zip(card.keys)
+        {
+            if let Some(fingerprint) = fingerprint {
+                println!("   {:?} key: {}", kt, fingerprint.to_spaced_hex());
             }
         }
 
@@ -71,30 +73,100 @@ pub fn status() -> Result<()> {
     Ok(())
 }
 
-// Determine smartcard to which to connect based on optional target string
-fn open_card(target: Option<String>) -> Result<Card<Open>> {
-    let card = match target {
-        Some(ref serial) => {
-            let reader = reader_of(serial)?
-                .ok_or_else(|| CardError::NotFound(format!("Card '{}' not found", serial)))?;
-            let context = pcsc::Context::establish(pcsc::Scope::User)?;
-            Card::new(PcscBackend::from_pcsc_reader(&context, &reader, None)?)?
-        }
-        None => {
-            let backends: Vec<PcscBackend> =
-                PcscBackend::cards(None)?.filter_map(Result::ok).collect();
+/// What `status` and the card choice show of one OpenPGP card
+struct Summary {
+    reader: CString,
+    aid: ApplicationIdentifier,
+    name: String,
+    /// Signing, decryption and authentication fingerprint, `None` for an empty slot
+    keys: [Option<CardFingerprint>; 3],
+}
 
-            match backends.len() {
-                0 => bail!("No card detected, please insert card"),
-                1 => Card::new(backends.into_iter().next().unwrap())?,
+/// The OpenPGP cards attached, read over plain PC/SC and left as they were
+///
+/// Opening each card through `openpgp-card` would reset every one of them when it is
+/// dropped, throwing off any other program using a card, a parallel test run included.
+fn summaries() -> Result<Vec<Summary>> {
+    let (context, readers) = readers::list()?;
+    let mut cards = Vec::new();
+    for reader in readers {
+        // An empty reader, or a card another program holds exclusively, has nothing to show
+        let Ok(Some((aid, name, keys))) = readers::ask(&context, &reader, read_summary) else {
+            continue;
+        };
+        cards.push(Summary { reader, aid, name, keys });
+    }
+    Ok(cards)
+}
+
+type SummaryData = (ApplicationIdentifier, String, [Option<CardFingerprint>; 3]);
+
+/// AID, cardholder name and fingerprints of the card in a transaction, `None` without an
+/// OpenPGP application
+fn read_summary(transaction: &pcsc::Transaction<'_>) -> Option<SummaryData> {
+    readers::transmit(transaction, &readers::select(&OPENPGP_AID))?;
+    let aid = readers::transmit(transaction, &GET_DATA_AID)?;
+    let aid = ApplicationIdentifier::try_from(aid.as_slice()).ok()?;
+
+    // The name is ISO 8859-1 on the card, as `openpgp-card` reads it too
+    let holder = readers::transmit(transaction, &GET_DATA_CARDHOLDER).unwrap_or_default();
+    let name = readers::find_tlv(&holder, 0x5B)
+        .map(|name| name.iter().map(|&byte| char::from(byte)).collect())
+        .unwrap_or_default();
+
+    let related = readers::transmit(transaction, &GET_DATA_APPLICATION_RELATED).unwrap_or_default();
+    let mut keys = [None, None, None];
+    if let Some(fingerprints) = readers::find_tlv(&related, 0xC5) {
+        for (slot, chunk) in keys.iter_mut().zip(fingerprints.chunks_exact(20)) {
+            if chunk.iter().any(|&byte| byte != 0) {
+                *slot = CardFingerprint::try_from(chunk).ok();
+            }
+        }
+    }
+    Some((aid, name, keys))
+}
+
+/// The OpenPGP application, as SELECT names it
+const OPENPGP_AID: [u8; 6] = [0xD2, 0x76, 0x00, 0x01, 0x24, 0x01];
+/// GET DATA of the application identifier (4F)
+const GET_DATA_AID: [u8; 5] = [0x00, 0xCA, 0x00, 0x4F, 0x00];
+/// GET DATA of the cardholder related data (65), where the name is
+const GET_DATA_CARDHOLDER: [u8; 5] = [0x00, 0xCA, 0x00, 0x65, 0x00];
+/// GET DATA of the application related data (6E), where the fingerprints are
+const GET_DATA_APPLICATION_RELATED: [u8; 5] = [0x00, 0xCA, 0x00, 0x6E, 0x00];
+
+// Determine smartcard to which to connect based on optional target string
+fn open_card(target: Option<CardTarget>) -> Result<Card<Open>> {
+    let reader = match target {
+        Some(CardTarget::Ident(ident)) => reader_of(&ident)?.ok_or_else(|| {
+            CardError::NotFound(format!(
+                "Card '{ident}' not found; `pgp status` lists the attached ones"
+            ))
+        })?,
+        Some(CardTarget::Reader(name)) => CString::new(name)?,
+        Some(CardTarget::Serial(serial)) => bail!(
+            "--card {serial} is a PIV serial number; name an OpenPGP card by its identifier \
+             (MMMM:SSSSSSSS) or its reader, as `pgp status` shows them"
+        ),
+        None => {
+            let mut cards = summaries()?;
+            match cards.len() {
+                0 => bail!("No OpenPGP card detected, please insert card"),
+                1 => cards.remove(0).reader,
                 n => {
-                    let mut cards = Vec::new();
-                    for backend in backends {
-                        let mut card = Card::new(backend)?;
-                        cards.push(format!("  {}", describe(&card.transaction()?)?));
-                    }
+                    let cards: Vec<String> = cards
+                        .iter()
+                        .map(|card| {
+                            format!(
+                                "  {} OpenPGP card {} in '{}'",
+                                card.aid.manufacturer_name(),
+                                card.aid.ident(),
+                                common::printable(&card.reader.to_string_lossy())
+                            )
+                        })
+                        .collect();
                     bail!(
-                        "{n} cards are attached, pick one with --card <ident>:\n{}",
+                        "{n} OpenPGP cards are attached, pick one with --card <ident>:\n{}",
                         cards.join("\n")
                     )
                 }
@@ -102,59 +174,33 @@ fn open_card(target: Option<String>) -> Result<Card<Open>> {
         }
     };
 
-    Ok(card)
+    let context = pcsc::Context::establish(pcsc::Scope::User)?;
+    let backend = PcscBackend::from_pcsc_reader(&context, &reader, None).map_err(|err| {
+        anyhow!(
+            "Cannot open the card in reader '{}': {err}; `pgp status` lists the attached ones",
+            common::printable(&reader.to_string_lossy())
+        )
+    })?;
+    Ok(Card::new(backend)?)
 }
 
 /// The reader holding the OpenPGP card `ident`, found without disturbing the other cards
-///
-/// card-backend-pcsc finds a card only by connecting to every one and dropping the others,
-/// and a dropped connection disconnects with a reset: whatever another program was doing on
-/// those cards, a verified pin or an upload half done, is gone. So each card is asked for its
-/// application identifier here over plain PC/SC, inside a transaction, and left as it was.
-fn reader_of(ident: &str) -> Result<Option<std::ffi::CString>> {
-    let context = pcsc::Context::establish(pcsc::Scope::User)?;
-    let mut names = vec![0; context.list_readers_len()?];
-    let readers: Vec<std::ffi::CString> = context
-        .list_readers(&mut names)?
-        .map(std::ffi::CStr::to_owned)
-        .collect();
+fn reader_of(ident: &str) -> Result<Option<CString>> {
+    let (context, readers) = readers::list()?;
     for reader in readers {
         // An empty reader, or a card another program holds exclusively, is not this one
-        let Ok(mut card) = context.connect(&reader, pcsc::ShareMode::Shared, pcsc::Protocols::ANY)
-        else {
-            continue;
-        };
-        let found = probe_ident(&mut card).is_some_and(|id| id.eq_ignore_ascii_case(ident));
-        let _ = card.disconnect(pcsc::Disposition::LeaveCard);
-        if found {
+        let found = readers::ask(&context, &reader, |transaction| {
+            readers::transmit(transaction, &readers::select(&OPENPGP_AID))?;
+            let aid = readers::transmit(transaction, &GET_DATA_AID)?;
+            ApplicationIdentifier::try_from(aid.as_slice()).ok()
+        });
+        if let Ok(Some(aid)) = found
+            && aid.ident().eq_ignore_ascii_case(ident)
+        {
             return Ok(Some(reader));
         }
     }
     Ok(None)
-}
-
-/// A card's OpenPGP identifier as openpgp-card spells it, MANUFACTURER:SERIAL, or `None`
-/// for a card without the application
-fn probe_ident(card: &mut pcsc::Card) -> Option<String> {
-    const SELECT: [u8; 12] = [
-        0x00, 0xA4, 0x04, 0x00, 0x06, 0xD2, 0x76, 0x00, 0x01, 0x24, 0x01, 0x00,
-    ];
-    const GET_AID: [u8; 5] = [0x00, 0xCA, 0x00, 0x4F, 0x00];
-    let transaction = card.transaction().ok()?;
-    let mut buffer = [0; pcsc::MAX_BUFFER_SIZE];
-    let reply = transaction.transmit(&SELECT, &mut buffer).ok()?;
-    if !matches!(reply, [.., 0x90, 0x00] | [.., 0x61, _]) {
-        return None;
-    }
-    let reply = transaction.transmit(&GET_AID, &mut buffer).ok()?;
-    let [aid @ .., 0x90, 0x00] = reply else {
-        return None;
-    };
-    // D2 76 00 01 24 01, the version, then the manufacturer and the serial number
-    let [_, _, _, _, _, _, _, _, m1, m2, s1, s2, s3, s4, ..] = *aid else {
-        return None;
-    };
-    Some(format!("{m1:02X}{m2:02X}:{s1:02X}{s2:02X}{s3:02X}{s4:02X}"))
 }
 
 /// Report the card's touch policies, informational only
@@ -273,7 +319,7 @@ fn set_touch_policy(
 
 impl SeededSmartcard {
     /// Check smartcard access and subkeys
-    pub fn check(&self, target: Option<String>) -> Result<()> {
+    pub fn check(&self, target: Option<CardTarget>) -> Result<()> {
         // Fingerprints first: comparing them costs no pin retries, so a wrong seed, subkey id
         // or scheme fails here without consuming one of the card's three admin attempts --
         // three mistaken checks would otherwise lock the admin pin.
@@ -310,7 +356,7 @@ impl SeededSmartcard {
     /// anything. Fingerprints are compared first -- that costs no pin retries, so a wrong
     /// seed, subkey id or scheme fails here without spending one of the card's three admin
     /// attempts.
-    pub fn configure(&self, target: Option<String>, settings: CardSettings) -> Result<()> {
+    pub fn configure(&self, target: Option<CardTarget>, settings: CardSettings) -> Result<()> {
         let mut cert = self.primary_cert(true)?;
         cert = self.append_subkeys(cert)?;
 
@@ -366,7 +412,7 @@ impl SeededSmartcard {
     }
 
     /// Upload secret subkeys
-    pub fn upload(&self, target: Option<String>) -> Result<Cert> {
+    pub fn upload(&self, target: Option<CardTarget>) -> Result<Cert> {
         let mut cert = self.primary_cert(false)?;
 
         cert = self.append_uids(cert)?;
@@ -382,7 +428,7 @@ impl SeededSmartcard {
     /// Meant for the confirmation: the question can name the card, and a card that would be
     /// wiped for nothing is refused while it is still intact. `upload` repeats the check on
     /// the card it opens itself.
-    pub fn preflight(&self, target: Option<String>) -> Result<String> {
+    pub fn preflight(&self, target: Option<CardTarget>) -> Result<String> {
         let mut card = open_card(target)?;
         let mut transaction = card.transaction()?;
         self.refuse_unfit(&mut transaction)?;
@@ -552,7 +598,7 @@ impl SeededSmartcard {
     }
 
     /// Upload subkeys to a smartcard and reset and lock smartcard in the process
-    fn upload_subkeys(&self, cert: &Cert, target: Option<String>) -> Result<()> {
+    fn upload_subkeys(&self, cert: &Cert, target: Option<CardTarget>) -> Result<()> {
         let mut card = open_card(target)?;
 
         let mut transaction = card.transaction()?;

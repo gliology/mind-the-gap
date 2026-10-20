@@ -1,7 +1,5 @@
 //! Everything that writes to a card: the reset, the keys, certificates and identifiers.
 
-use std::str::FromStr;
-
 use super::{
     CertChain, ManagementKeyArg, SeededSmartcard, SlotRole,
     keys::NAME_CCC_ID,
@@ -9,7 +7,9 @@ use super::{
     slots::{FIRST_RETIRED_SLOT, LAST_RETIRED_SLOT},
 };
 use crate::common;
+use crate::readers;
 use crate::seed::{Algorithm, Seed256Derive};
+use crate::target::CardTarget;
 
 use anyhow::{Result, anyhow, bail};
 
@@ -18,7 +18,7 @@ use yubikey::piv::{self, AlgorithmId, RetiredSlotId, SlotId};
 use yubikey::reader::Context;
 use yubikey::{
     CardId, CccId, Certificate as CardCertificate, ChuId, Error as CardError, MgmAlgorithmId,
-    MgmKey, MsRoots, Serial, TouchPolicy, Version, YubiKey,
+    MgmKey, MsRoots, TouchPolicy, Version, YubiKey,
 };
 
 use cms::content_info::ContentInfo;
@@ -151,43 +151,128 @@ pub fn status() -> Result<()> {
     Ok(())
 }
 
-/// Connect to a PIV token, optionally selected by serial number.
+/// Connect to a PIV token, named by serial number or reader, or the only one attached
 ///
 /// Mirrors [`crate::pgp`]'s `open_card`: bare `YubiKey::open()` silently picks the first
 /// reader, which is the wrong behaviour when several cards are attached.
-pub(super) fn open_token(target: Option<String>) -> Result<YubiKey> {
-    if let Some(serial) = target {
-        let token = YubiKey::open_by_serial(Serial::from_str(&serial)?)?;
-        log::info!("Connected to {}", describe(&token));
-        return Ok(token);
-    }
-
-    let mut context = Context::open()?;
-    let readers: Vec<_> = context.iter()?.collect();
-
-    match readers.len() {
-        0 => bail!("No card detected, please insert card"),
-        1 => {
-            let token = readers[0].open()?;
-            log::info!("Connected to {}", describe(&token));
-            Ok(token)
+pub(super) fn open_token(target: Option<CardTarget>) -> Result<YubiKey> {
+    let reader = match target {
+        Some(CardTarget::Reader(name)) => name,
+        Some(CardTarget::Serial(serial)) => reader_of(serial)?,
+        Some(CardTarget::Ident(ident)) => bail!(
+            "--card {ident} is an OpenPGP card identifier; name a PIV card by its serial \
+             number or its reader, as `piv status` shows them"
+        ),
+        None => {
+            let (context, readers) = readers::list()?;
+            match readers.as_slice() {
+                [] => bail!("No card detected, please insert card"),
+                [only] => only.to_string_lossy().into_owned(),
+                _ => {
+                    let cards: Vec<String> = readers
+                        .iter()
+                        .map(|reader| {
+                            let name = common::printable(&reader.to_string_lossy());
+                            match readers::ask(&context, reader, read_serial) {
+                                Ok(Some(serial)) => format!("  {name}, serial {serial}"),
+                                _ => format!("  {name} (not a PIV card)"),
+                            }
+                        })
+                        .collect();
+                    bail!(
+                        "{} cards are attached, pick one with --card <serial>:\n{}",
+                        readers.len(),
+                        cards.join("\n")
+                    )
+                }
+            }
         }
-        n => {
-            let cards: Vec<String> = readers
-                .iter()
-                .map(|reader| match reader.open() {
-                    Ok(token) => {
-                        let line = format!("  {}", describe(&token));
-                        let _ = token.disconnect(pcsc::Disposition::LeaveCard);
-                        line
-                    }
-                    Err(_) => format!("  {} (not a PIV card)", common::printable(&reader.name())),
-                })
-                .collect();
-            bail!("{n} cards are attached, pick one with --card <serial>:\n{}", cards.join("\n"))
+    };
+
+    let token = open_reader(&reader)?;
+    log::info!("Connected to {}", describe(&token));
+    Ok(token)
+}
+
+/// Open the PIV card in exactly this reader, without asking any other
+fn open_reader(name: &str) -> Result<YubiKey> {
+    let mut context = Context::open()?;
+    let reader = context
+        .iter()?
+        .find(|reader| reader.name() == name)
+        .ok_or_else(|| {
+            anyhow!(
+                "No reader named '{}'; `piv status` lists the attached ones",
+                common::printable(name)
+            )
+        })?;
+    Ok(reader.open()?)
+}
+
+/// The reader holding the PIV card with this serial, found without disturbing the other cards
+///
+/// `YubiKey::open_by_serial` would open every card through the crate and leave each one
+/// reset; here each is asked inside a transaction and left as it was.
+fn reader_of(serial: u32) -> Result<String> {
+    let (context, readers) = readers::list()?;
+    let mut held = None;
+    for reader in readers {
+        match readers::ask(&context, &reader, read_serial) {
+            Ok(Some(found)) if found == serial => return Ok(reader.to_string_lossy().into_owned()),
+            Err(pcsc::Error::SharingViolation) => {
+                held.get_or_insert(reader);
+            }
+            _ => {}
+        }
+    }
+    match held {
+        // The card may well be the one another program holds, so say which and who usually
+        Some(reader) => bail!(
+            "No PIV card with serial {serial} found, and reader '{}' could not be asked: {}. \
+             Usually gpg's scdaemon holds it: `gpgconf --kill scdaemon`",
+            common::printable(&reader.to_string_lossy()),
+            pcsc::Error::SharingViolation
+        ),
+        None => {
+            bail!("No PIV card with serial {serial} found; `piv status` lists the attached ones")
         }
     }
 }
+
+/// The serial number a PIV card reports, the way yubikey.rs reads it, or `None` for a card
+/// without the PIV application or a serial
+fn read_serial(transaction: &pcsc::Transaction<'_>) -> Option<u32> {
+    // YubiKeys answer to the RID alone, other implementations only to the full AID
+    readers::transmit(transaction, &readers::select(&PIV_RID))
+        .or_else(|| readers::transmit(transaction, &readers::select(&PIV_AID)))?;
+    let version = readers::transmit(transaction, &GET_VERSION)?;
+    let serial = match version.first()? {
+        // A YubiKey 4 tells its serial through the OTP application only
+        4 => {
+            readers::transmit(transaction, &readers::select(&OTP_AID))?;
+            let serial = readers::transmit(transaction, &OTP_GET_SERIAL);
+            readers::transmit(transaction, &readers::select(&PIV_RID));
+            serial?
+        }
+        _ => readers::transmit(transaction, &GET_SERIAL)?,
+    };
+    Some(u32::from_be_bytes(serial.get(..4)?.try_into().ok()?))
+}
+
+/// The PIV application's registered identifier, which YubiKeys select by
+const PIV_RID: [u8; 5] = [0xA0, 0x00, 0x00, 0x03, 0x08];
+/// The full PIV application identifier of SP 800-73
+const PIV_AID: [u8; 11] = [
+    0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00,
+];
+/// Yubico's OTP application, where a YubiKey 4 keeps its serial
+const OTP_AID: [u8; 8] = [0xA0, 0x00, 0x00, 0x05, 0x27, 0x20, 0x01, 0x01];
+/// Yubico's GET VERSION of the PIV application
+const GET_VERSION: [u8; 5] = [0x00, 0xFD, 0x00, 0x00, 0x00];
+/// Yubico's GET SERIAL of the PIV application, firmware 5 and later and the trussed app
+const GET_SERIAL: [u8; 5] = [0x00, 0xF8, 0x00, 0x00, 0x00];
+/// The OTP application's serial number request
+const OTP_GET_SERIAL: [u8; 5] = [0x00, 0x01, 0x10, 0x00, 0x00];
 
 /// Spend the tries of a pin or puk until the card itself reports it blocked
 ///
@@ -245,7 +330,7 @@ fn card_algorithm_name(algorithm: AlgorithmId) -> &'static str {
 
 impl SeededSmartcard {
     /// Generate keys and certificates and upload them to a card
-    pub fn upload(&self, target: Option<String>) -> Result<CertChain> {
+    pub fn upload(&self, target: Option<CardTarget>) -> Result<CertChain> {
         // Build the whole chain before touching the card, so that a derivation or encoding
         // failure never leaves a freshly reset card half provisioned.
         let chain = self.generate_chain()?;
@@ -298,7 +383,7 @@ impl SeededSmartcard {
     /// Meant for the confirmation: the question can name the card, and a card that would be
     /// wiped for nothing is refused while it is still intact. `upload` repeats the check on
     /// the card it opens itself.
-    pub fn preflight(&self, target: Option<String>) -> Result<String> {
+    pub fn preflight(&self, target: Option<CardTarget>) -> Result<String> {
         let token = open_token(target)?;
         self.refuse_unfit(&token)?;
         Ok(describe(&token))

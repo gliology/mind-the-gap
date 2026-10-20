@@ -129,8 +129,9 @@ qrcode = { version = "0.14", default-features = false }
 sequoia-openpgp = { git = "https://gitlab.com/gli.al/sequoia.git", rev = "8ea683342764b6dedbf86e8d106d026266412e4d", default-features = false, features = ["crypto-nettle"] }
 openpgp-card = "0.7"
 card-backend-pcsc = "0.5"
-# Finding a card by its OpenPGP identifier without resetting the others on the way, which
-# card-backend-pcsc's own enumeration does (src/pgp/card.rs). Already in the tree through it.
+# Asking cards who they are without disturbing them (src/readers.rs): finding one by serial
+# or identifier and listing them, where the card libraries would reset every card they
+# opened. Already in the tree through card-backend-pcsc and yubikey.
 pcsc = "2"
 # openpgp-card takes pins as `SecretString`
 secrecy = "0.10"

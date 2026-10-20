@@ -38,11 +38,15 @@ the key blink and touches its sensor.
 Other cards can stay attached, so a test host can keep several plugged in. Each suite derives
 its test identity from the card it names, so no two cards ever hold the same keys, and it
 points the outside tools at that card alone: OpenSC sees only its reader, and gpg is handed
-its serial number. Suites on different cards can run at the same time. The one step that
-cannot share is the OpenPGP suite's gpg step, whose scdaemon takes every reader: it waits
-until no other suite is talking to a card, and they wait for it, through a lock file in
-`$XDG_RUNTIME_DIR` that every suite takes. A desktop's own scdaemon is outside that lock, so
-stop it first with `gpgconf --kill scdaemon`.
+its serial number. Suites on different cards can run at the same time, through a lock file
+in `$XDG_RUNTIME_DIR` that every suite takes. Two steps touch other cards and take it
+exclusively, so they wait until no other suite is talking to a card and the others wait for
+them: finding the card at the start, which asks every attached card who it is, after which a
+suite addresses its card by reader alone; and the OpenPGP suite's gpg step, whose scdaemon
+takes every reader. A desktop's own scdaemon is outside that lock, so stop it first with
+`gpgconf --kill scdaemon`. The `virtual-parallel` check runs the PIV and the OpenPGP
+card-level suites side by side on two virtual cards in one machine, so a step that disturbs
+another card fails there.
 
 The second feature, `no-destructive-hardware-tests`, is a safety interlock that must never be
 enabled by hand. The tests compile only when `destructive-hardware-tests` is on and it is off,
@@ -163,6 +167,7 @@ card lacks the algorithm, and the check asserts `upload` turns it away before th
 | `virtual-piv`, `-p384`, `-curve25519`, `-rsa2048`, `-rsa3072`, `-rsa4096` | piv-authenticator over vpcd | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (P-256) |
 | `virtual-piv-builder`, `-tdes` | piv-authenticator over vpcd, build server profile | — | ✓ | — | — | — | — | — |
 | `virtual-pgp` | opcard over vpcd | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `virtual-parallel` | piv-authenticator and opcard over two vpcd readers, both suites at once | ✓ | — | ✓ (OpenPGP) | ✓ (PIV) | — | — | — |
 | `usbip-nk3`, PIV | Nitrokey 3 firmware over USB/IP | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ |
 | `usbip-nk3`, OpenPGP | Nitrokey 3 firmware over USB/IP | ✓ | — | ✓ | ✓ | ✓ | ✓ | ○ |
 | `usbip-gnuk` | Gnuk emulation over USB/IP | refused | — | ✓ | refused | refused | refused | ○ |

@@ -82,7 +82,12 @@ gpg-card list D2760001240103040006123456780000       # one of them
 ```
 
 `gpg --card-status` shows only one card, whichever scdaemon picked. OpenSC presents each
-card as its own token, and `mind-the-gap piv status` and `pgp status` list them all.
+card as its own token, and `mind-the-gap piv status` and `pgp status` list them all, with
+the reader each sits in. `--card` names one in any of three ways: a PIV serial number, an
+OpenPGP identifier (`0006:12345678`), or the reader as the status lines show it
+(`--card 'Yubico YubiKey FIDO+CCID 01 00'`). A serial or an identifier has to be looked
+for, which asks every attached card who it is; a reader is opened directly, and is the way
+to address a card while other programs work on the cards next to it.
 
 ## The live image
 
