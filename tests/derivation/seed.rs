@@ -1,8 +1,11 @@
 //! The seed tree: labels, derivation and the P-384 scalar.
 
 use mind_the_gap::seed::{
-    Algorithm, Seed256, Seed256Derive, algorithm_label, derive_p384_scalar, label,
+    Algorithm, CardSerial, KeyPath, Seed256, Seed256Derive, algorithm_label, card_id_label,
+    credential_label, date_label, derive_p384_scalar, generation_of, label, midnight, sub_label,
 };
+
+use std::time::{Duration, SystemTime};
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD_NO_PAD;
@@ -26,7 +29,7 @@ fn base64_round_trips() {
     let derived = SEED.derive(path);
     let encoded = SEED.base64(path);
     let decoded = BASE64_STANDARD_NO_PAD.decode(&encoded).unwrap();
-    assert_eq!(decoded.as_slice(), derived.as_ref());
+    assert_eq!(decoded.as_slice(), &derived[..]);
 }
 
 /// The algorithm is a label segment of its own, behind a second colon.
@@ -116,3 +119,90 @@ fn weak_tdes_keys_are_recognised() {
     assert!(!is_weak_tdes_key(&key));
     assert_eq!(&key[..], &SEED.derive(Some(b"key:management:tdes"))[..24]);
 }
+
+/// The labels bound to a card end in its serial, spelled inside the label grammar: decimal for
+/// a PIV card, the manufacturer and serial in lowercase hex for an OpenPGP card
+#[test]
+fn card_labels_end_in_the_serial() {
+    let piv = CardSerial::piv(16395444);
+    let pgp = CardSerial::pgp(0x0006, 0x0FA2_B3C4);
+    assert_eq!(piv.segment(), "16395444");
+    assert_eq!(pgp.segment(), "0006-0fa2b3c4");
+    assert_eq!(credential_label("management", "aes256", &piv), b"pin:management:aes256:16395444");
+    assert_eq!(credential_label("admin", "ascii", &pgp), b"pin:admin:ascii:0006-0fa2b3c4");
+    assert_eq!(card_id_label("chuid", &piv), b"id:chuid:16395444");
+}
+
+/// A credential is its card's alone: another serial, another kind or another seed is
+/// another credential
+#[test]
+fn credentials_are_bound_to_one_card() {
+    let one = CardSerial::piv(1);
+    let other = CardSerial::piv(2);
+    assert_ne!(*SEED.credential("puk", "ascii", &one), *SEED.credential("puk", "ascii", &other));
+    assert_ne!(
+        *SEED.credential("management", "aes256", &one),
+        *SEED.credential("management", "tdes", &one)
+    );
+    assert_ne!(*SEED.credential("puk", "ascii", &one), *[7u8; 32].credential("puk", "ascii", &one));
+
+    // An ASCII credential is the base64 of the derived bytes, cut to what the card takes
+    let puk = SEED.ascii_credential("puk", &one, 8);
+    assert_eq!(puk.len(), 8);
+    assert!(
+        SEED.ascii_credential("puk", &one, 43)
+            .starts_with(puk.as_str())
+    );
+}
+
+/// The key path's steps: `sub:<id>` and `date:<YYYY-MM-DD>`, each its own label, and none at
+/// all where none is given
+#[test]
+fn key_path_steps_are_labelled() {
+    let date = "2026-05-01".parse().unwrap();
+    assert_eq!(sub_label("laptop"), b"sub:laptop");
+    assert_eq!(sub_label(""), b"sub:");
+    assert_eq!(date_label(date), b"date:2026-05-01");
+
+    let bare = KeyPath::default();
+    assert_eq!(**bare.device(&SEED), SEED);
+    assert_eq!(**bare.shared(&SEED), SEED);
+
+    let path = KeyPath { subkey: Some("laptop".into()), date: Some(date) };
+    assert_eq!(**path.device(&SEED), **SEED.sub("laptop").date(date));
+    assert_eq!(**path.shared(&SEED), **SEED.date(date));
+    // A device without a date, and a date without a device, are each one step
+    let device = KeyPath { subkey: Some("laptop".into()), date: None };
+    assert_eq!(**device.device(&SEED), **SEED.sub("laptop"));
+    assert_eq!(**device.shared(&SEED), SEED);
+}
+
+/// A generation's date is its creation time, midnight UTC, and reads back from it; the
+/// undated generation is created one second after the epoch, which OpenPGP reads as a time
+#[test]
+fn generations_round_trip_through_their_creation_time() {
+    let date = "2026-05-01".parse().unwrap();
+    let dated = KeyPath { subkey: None, date: Some(date) };
+    assert_eq!(dated.creation_time(), SystemTime::UNIX_EPOCH + Duration::from_secs(1_777_593_600));
+    assert_eq!(dated.creation_time(), midnight(date));
+    assert_eq!(generation_of(dated.creation_time()), Some(Some(date)));
+
+    let undated = KeyPath::default();
+    assert_eq!(undated.creation_time(), SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+    assert_eq!(generation_of(undated.creation_time()), Some(None));
+
+    // Any other time is no generation this tool made
+    assert_eq!(generation_of(midnight(date) + Duration::from_secs(60)), None);
+}
+
+/// The seed id is frozen: it is what a record kept with the phrase is compared with, so one
+/// that moved would make every written-down seed look mistyped
+#[test]
+fn seed_id_is_frozen() {
+    assert_eq!(SEED.seed_id(), SEED_ID);
+    assert_eq!(SEED.seed_id().len(), 16);
+    assert_ne!([43u8; 32].seed_id(), SEED_ID);
+}
+
+/// The seed id of [`SEED`]
+const SEED_ID: &str = "439a39ab47cfcb56";

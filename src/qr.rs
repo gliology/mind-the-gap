@@ -1,6 +1,6 @@
 //! Render byte blobs as terminal QR codes, the transfer path off an air-gapped machine.
 //!
-//! The preferred display is [`show_qr`]: the code takes over the terminal's alternate
+//! The preferred display is [`show_qr_pages`]: the code takes over the terminal's alternate
 //! screen and vanishes without a trace when dismissed, so a QR of a secret key never
 //! lingers in scrollback, the same guarantee the `generate` ceremony gives the seed
 //! phrase. Callers declare whether the payload is sensitive: public certificates may
@@ -37,13 +37,6 @@ fn render(data: &[u8]) -> Result<Zeroizing<String>> {
     ))
 }
 
-/// Display the data as a QR code that leaves no trace, dismissed with Esc
-///
-/// A single page of [`show_qr_pages`]; see there for where the code goes.
-pub fn show_qr(data: &[u8], sensitive: bool) -> Result<()> {
-    show_qr_pages(&[QrPage { title: None, data }], sensitive)
-}
-
 /// One code of a sequence: what it carries, and the bytes
 pub struct QrPage<'a> {
     /// Shown above the code, so that whoever scans a sequence knows which one is which
@@ -68,7 +61,7 @@ pub fn show_qr_pages(pages: &[QrPage<'_>], sensitive: bool) -> Result<()> {
     // The largest QR code carries 2953 bytes; say so up front instead of letting the
     // encoder's raw error surface, and name the way out
     if let Some(page) = pages.iter().find(|page| page.data.len() > 2953) {
-        bail!("{} bytes exceed what one QR code can carry (2953), use --output", page.data.len());
+        bail!("{} bytes exceed what one QR code can carry (2953), use --to", page.data.len());
     }
     let images = pages
         .iter()
@@ -98,7 +91,7 @@ pub fn show_qr_pages(pages: &[QrPage<'_>], sensitive: bool) -> Result<()> {
         if sensitive {
             bail!(
                 "Refusing to write a secret-material QR code to a pipe or file, \
-                 use --output for a protected file or run on a terminal"
+                 use --to for a protected file or run on a terminal"
             );
         }
         print();
@@ -145,7 +138,7 @@ pub fn show_qr_pages(pages: &[QrPage<'_>], sensitive: bool) -> Result<()> {
         )?;
         screen.tty.flush()?;
         if pressed_within(&mut screen.tty.0, 250)? {
-            bail!("QR code cancelled before it fit the screen; use --output for a protected file");
+            bail!("QR code cancelled before it fit the screen; use --to for a protected file");
         }
     };
 

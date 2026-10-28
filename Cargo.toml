@@ -23,7 +23,7 @@ build = "build.rs"
 #     MTG_HARDWARE_TEST_SERIAL=<serial> cargo test --features destructive-hardware-tests --test piv_hardware
 #
 # The OpenPGP suite names its card by ident instead (MTG_HARDWARE_TEST_CARD=<ident>,
-# --test pgp_hardware). Use a spare card. See docs/piv-hardware-tests.md.
+# --test pgp_hardware). Use a spare card. See docs/hardware-tests.md.
 destructive-hardware-tests = []
 
 # Safety interlock -- never enable this by hand.
@@ -36,22 +36,26 @@ no-destructive-hardware-tests = []
 
 [dependencies]
 # Command line interface
-clap = { version = "4.3", features = [ "derive", "cargo", "env" ]}
+# `string` lets the config file's values become clap's own defaults, see src/cli/config.rs
+clap = { version = "4.3", features = [ "derive", "cargo", "env", "string" ]}
 # Shell completions and the man page, written by the mind-the-build binary at package time
 clap_complete = "4.4"
 clap_mangen = "0.3"
 
 # Logging: the facade the library and the card stacks log through, and its backend behind
-# the wrapper in src/main.rs that keeps card traffic out of the log
+# the wrapper in src/cli/logging.rs that keeps card traffic out of the log. The logger
+# prints no timestamps, so its default humantime feature, which pulls in jiff, stays off.
 log = "0.4"
-env_logger = "0.11"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "regex"] }
 
 # Error handling
 anyhow = "1.0"
 
-# To parse dates and times. Default features off: nothing reads the clock or the local
-# time zone (creation times are fixed or given), so `clock` and its tz tree stay out.
+# Dates and the calendar a validity counts on. Default features off: nothing reads the clock
+# or the local time zone (creation times are fixed or given), so `clock` and its tz tree
+# stay out.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# The times a ceremony transcript and a revocation list are stamped with, as RFC 3339
 humantime = "2.1"
 
 # Clear sensitive data
@@ -92,6 +96,11 @@ getrandom = "0.4"
 # above), and the optional wordlists are unused -- English is always built in.
 tiny-bip39 = { version = "2.0", default-features = false }
 
+# The password in NFKD before it is stretched (src/mnemonic.rs), as BIP-39 takes its
+# passphrase, so that one password typed differently derives the same keys. Part of mtg1
+# like argon2 below. Already in the tree through tiny-bip39.
+unicode-normalization = { version = "0.1", default-features = false, features = ["std"] }
+
 # Key Derivation
 #
 # NOTE: argon2 0.5 is shared with the sequoia fork, and its output is a frozen constant
@@ -110,7 +119,8 @@ base64 = "0.22"
 # property of the number rather than of the test, and the rsa crate only assembles the key
 # from the two primes. Versions follow what yubikey already pulls in, so nothing is new in
 # the tree but sha3; default features stay off where they would add a std or rand layer.
-sha3 = { version = "0.10", default-features = false }
+# The SHAKE256 state determines both primes, so it is wiped on drop like any other secret.
+sha3 = { version = "0.10", default-features = false, features = ["zeroize"] }
 crypto-primes = "0.7"
 crypto-bigint = { version = "0.7", default-features = false, features = ["alloc"] }
 rsa = "0.10.0-rc.18"
@@ -122,7 +132,7 @@ qrcode = { version = "0.14", default-features = false }
 #
 # Pinned by revision rather than by tag: a tag can be force-moved and `cargo update` would
 # follow it, and this fork's two-commit patch set is load-bearing for reproducibility (see
-# the security model in docs/introduction.md). The revision is tag openpgp/v2.2.0-mtg0.
+# "The forked sequoia-openpgp" in docs/security.md). The revision is tag openpgp/v2.2.0-mtg0.
 # No `version` on purpose: a crates.io build would silently swap in stock sequoia, which
 # salts its signatures, so publishing has to fail instead. Default features off: the
 # compression algorithms are unused, nothing here compresses or reads compressed packets.
@@ -145,25 +155,49 @@ yubikey = "0.9.0-rc.0"
 # feature unification would break on a yubikey patch release.
 x509-cert = { version = "0.3", features = [ "builder", "hazmat", "pem" ]}
 # The chain's DER encoding, its OIDs and key usage flags, and the SPKIs that `check` compares
-der = { version = "0.8", features = [ "oid", "alloc", "flagset" ]}
+der = { version = "0.8", features = [ "oid", "alloc", "flagset", "derive" ]}
 spki = { version = "0.8", features = [ "fingerprint", "alloc" ]}
 # Degenerate PKCS#7 (certs-only SignedData) for the YubiKey msroots object; still a
 # prerelease, but it unifies with the final x509-cert 0.3 and der/spki 0.8 above.
 cms = { version = "0.3.0-pre.2", features = [ "std" ]}
+# The Web Key Directory names a mailbox by the SHA-1 of its local part (src/cli/output.rs);
+# no key or certificate is hashed with it. Already in the tree through yubikey's stack.
+sha1 = { version = "0.11", default-features = false }
+# PIV keys out of the gap (`ungap --app piv`, src/piv/export.rs): PKCS#8 encrypted with
+# PBES2, PBKDF2-HMAC-SHA256 and AES-256-CBC, the profile openssl writes by default and mail
+# clients read. pkcs5's own PBES2 cannot resolve until scrypt 0.12 is released, so the few
+# structures are built here from these, each already in the tree but cbc. Both wipe their
+# key schedules on drop: aes has it through yubikey already, cbc's state needs it asked for.
+aes = { version = "0.9", default-features = false, features = ["zeroize"] }
+cbc = { version = "0.2", default-features = false, features = ["alloc", "block-padding", "zeroize"] }
+
+# Not used directly: yubikey encrypts with the derived 3DES management key through des, and
+# only this feature makes des wipe the key schedule it expands that key into.
+des = { version = "0.9", default-features = false, features = ["zeroize"] }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 # NOTE: this is sha2 0.10 while yubikey/ecdsa pull sha2 0.11. Two majors coexist fine here
-# because no sha2 type crosses the boundary -- do not "fix" this by bumping it.
+# because no sha2 type crosses the boundary -- do not "fix" this by bumping it. The one 0.11
+# use is sha2-ecdsa below, which has to match ecdsa's digest generation.
 sha2 = "0.10"
 # Default features already give arithmetic + ecdsa + pem(-> pkcs8) + std(-> alloc), which is
 # exactly the set x509-cert's Builder::build bounds require.
 p256 = "0.14"
+# OpenPGP P-256 signatures (src/pgp/signer.rs): RFC 6979 with the HMAC on the signature's own
+# hash, SHA-512, which only the hazmat function takes (a SigningKey runs it on SHA-256).
+# sequoia's own signer draws a random nonce, so these are what keep P-256 certificates
+# reproducible, and their hash is part of the scheme like sha2 is. Both are the versions p256
+# already pulls in; sha2 0.11 is renamed beside the 0.10 above.
+ecdsa = { version = "0.17", default-features = false, features = ["algorithm"] }
+sha2-ecdsa = { package = "sha2", version = "0.11", default-features = false }
 # P-384 PIV chains under `--algorithm p384`, for consumers that insist on ECDSA P-384 (a Nix
 # binary cache signing key, for one). Same major and default feature set as p256 above, for
 # the same builder bounds; already in the tree through yubikey.
 p384 = "0.14"
 # Ed25519 PIV chains under `--algorithm curve25519`: signs certificates through x509-cert's
 # builder, whose bounds `pkcs8` satisfies (SPKI encoding and the signature algorithm
-# identifier). Versions unify with yubikey's own use of both dalek crates.
-ed25519-dalek = { version = "3", default-features = false, features = [ "alloc", "pkcs8" ] }
+# identifier). Versions unify with yubikey's own use of both dalek crates. `zeroize` wipes the
+# signing keys on drop, asked for here rather than left to what another crate enables.
+ed25519-dalek = { version = "3", default-features = false, features = [ "alloc", "pkcs8", "zeroize" ] }
 # X25519 PIV key management keys on the same curve: only the public key is computed here,
 # the card holds the secret. `static_secrets` is the long-lived key type, `zeroize` wipes it.
 x25519-dalek = { version = "3", default-features = false, features = [ "static_secrets", "zeroize" ] }
@@ -187,11 +221,25 @@ opt-level = 3
 [profile.dev.package.crypto-primes]
 opt-level = 3
 
+# Every derivation step is an argon2 pass over 64 MiB; unoptimized, one takes seconds, and a
+# command takes several. Optimizing argon2 and its hash alone keeps this crate debuggable.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+# A PIV export stretches its passphrase with 600,000 rounds of HMAC-SHA256 (src/piv/export.rs);
+# unoptimized, every key the test suite exports takes seconds. Optimizing the hash alone, as
+# argon2's above, changes no result.
+[profile.dev.package.sha2]
+opt-level = 3
+
 # cargo-machete scans source textually for each dependency's name; tiny-bip39's library is
-# imported as `bip39` (see src/mnemonic.rs), which the scan cannot see, so it is ignored here
-# rather than flagged on every run.
+# imported as `bip39` (see src/mnemonic.rs), which the scan cannot see, and des is there for
+# its feature alone, so both are ignored here rather than flagged on every run.
 [package.metadata.cargo-machete]
-ignored = ["tiny-bip39"]
+ignored = ["des", "tiny-bip39"]
 
 [dev-dependencies]
 # Unpredictable, self-cleaning temp paths for the tests that shell out to external tools

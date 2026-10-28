@@ -1,5 +1,5 @@
 use mind_the_gap::piv::{CertificateKind, SeededSmartcard, SlotRole};
-use mind_the_gap::seed::{Algorithm, Seed256};
+use mind_the_gap::seed::{Algorithm, KeyPath, Seed256, Seeds};
 
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{DerSignature, VerifyingKey};
@@ -8,39 +8,75 @@ use x509_cert::Certificate;
 use x509_cert::der::Encode;
 use x509_cert::ext::pkix::{ExtendedKeyUsage, KeyUsage};
 
-use std::time::{Duration, SystemTime};
-
 use yubikey::piv::SlotId;
 
 mod chain;
 mod external;
+#[path = "../common/frozen.rs"]
+mod frozen;
 mod golden;
+#[path = "../common/hex.rs"]
+mod hex;
+mod paths;
 
 const SEED_A: Seed256 = [1u8; 32];
 const SEED_B: Seed256 = [2u8; 32];
 
-const SLOTS: [(SlotId, SlotRole); 4] = [
+/// The slots a chain certifies, in chain order: the identity's three usable keys, the card's
+/// own 9E key being the card seed's and outside the chain
+const SLOTS: [(SlotId, SlotRole); 3] = [
     (SlotId::Authentication, SlotRole::Authentication),
     (SlotId::Signature, SlotRole::Signature),
     (SlotId::KeyManagement, SlotRole::KeyManagement),
-    (SlotId::CardAuthentication, SlotRole::CardAuthentication),
 ];
 
-fn builder(seed: &Seed256, name: &str, email: &str) -> SeededSmartcard {
-    SeededSmartcard::new(seed, None, name.into())
+/// A builder on one seed in both roles, along `path`
+fn on_path(seed: &Seed256, path: KeyPath, name: &str, email: &str) -> SeededSmartcard {
+    SeededSmartcard::new(Seeds::one(seed), path, name.into())
         .add_email(email)
         .unwrap()
-        .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+}
+
+/// A builder on one seed in both roles, without a subkey id or a date
+fn builder(seed: &Seed256, name: &str, email: &str) -> SeededSmartcard {
+    on_path(seed, KeyPath::default(), name, email)
 }
 
 fn alice() -> SeededSmartcard {
     builder(&SEED_A, "Alice", "alice@example.com")
 }
 
+/// Alice's builder on a device, without a date
+fn device(id: &str) -> SeededSmartcard {
+    on_path(&SEED_A, KeyPath { subkey: Some(id.into()), date: None }, "Alice", "alice@example.com")
+}
+
 /// SHA-256 over the DER encoding, the same identity `check` compares on
 fn digest(cert: &Certificate) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     Sha256::digest(cert.to_der().unwrap()).to_vec()
+}
+
+/// The one URL a certificate's CRL distribution point names
+fn list_url(cert: &Certificate) -> String {
+    use x509_cert::ext::pkix::CrlDistributionPoints;
+    use x509_cert::ext::pkix::name::{DistributionPointName, GeneralName};
+
+    let (_, points) = cert
+        .tbs_certificate()
+        .get_extension::<CrlDistributionPoints>()
+        .unwrap()
+        .expect("the certificate names no revocation list");
+    let [point] = points.0.as_slice() else {
+        panic!("not one distribution point: {points:?}");
+    };
+    let Some(DistributionPointName::FullName(names)) = &point.distribution_point else {
+        panic!("the distribution point has no full name: {point:?}");
+    };
+    let [GeneralName::UniformResourceIdentifier(url)] = names.as_slice() else {
+        panic!("the distribution point is not one URL: {names:?}");
+    };
+    url.to_string()
 }
 
 /// `id-ecPublicKey`, the SPKI algorithm of every P-256 key (RFC 5480)
@@ -313,19 +349,24 @@ fn certify_differs_by_seed() {
     assert_ne!(digest(&a.leaves[0].1), digest(&b.leaves[0].1));
 }
 
+/// A device's own keys move with the subkey id; the root authority, which is the identity,
+/// and the decryption key, which every card of the identity shares, do not
 #[test]
 fn certify_differs_by_subkey() {
     let a = alice().certify(CertificateKind::Chain).unwrap();
-    let b = SeededSmartcard::new(&SEED_A, Some("work".to_string()), "Alice".into())
-        .add_email("alice@example.com")
-        .unwrap()
-        .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
-        .certify(CertificateKind::Chain)
-        .unwrap();
+    let b = device("work").certify(CertificateKind::Chain).unwrap();
 
-    // The root authority is shared across subkey generations, the slot keys are not
     assert_eq!(digest(&a.root), digest(&b.root));
-    assert_ne!(digest(&a.leaves[0].1), digest(&b.leaves[0].1));
+    for index in [0, 1] {
+        assert_ne!(
+            digest(&a.leaves[index].1),
+            digest(&b.leaves[index].1),
+            "{:?}",
+            a.leaves[index].0
+        );
+    }
+    assert_eq!(a.leaves[2].0, SlotId::KeyManagement);
+    assert_eq!(digest(&a.leaves[2].1), digest(&b.leaves[2].1));
 }
 
 #[test]
@@ -337,5 +378,3 @@ fn certify_differs_by_name() {
 
     assert_ne!(digest(&a.root), digest(&b.root));
 }
-
-// --- Chain shape -------------------------------------------------------------

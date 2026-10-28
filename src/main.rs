@@ -1,12 +1,10 @@
-//! The `mind-the-gap` binary: logging setup around [`mind_the_gap::cli::run`].
-
-use env_logger::Env;
+//! The `mind-the-gap` binary: process hardening around [`mind_the_gap::cli::run`].
 
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     // Die quietly when stdout closes early: Rust ignores SIGPIPE by default, so a plain
-    // `mind-the-gap pgp status | head` would end in a println! panic instead of the
+    // `mind-the-gap list | head` would end in a println! panic instead of the
     // silent exit every other unix tool gives. Nothing here relies on surviving EPIPE.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
@@ -27,44 +25,7 @@ fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
     let memory_lock = lock_memory();
 
-    // Parse logging config and init logger. The logger exists before clap runs, so
-    // the --log-level flag is picked out of argv by hand here; clap still declares it
-    // for help and validation, and the flag wins over the environment.
-    let flag_filter = {
-        let mut args = std::env::args().skip(1);
-        let mut found = None;
-        while let Some(arg) = args.next() {
-            if arg == "--log-level" {
-                found = args.next();
-            } else if let Some(value) = arg.strip_prefix("--log-level=") {
-                found = Some(value.to_string());
-            }
-        }
-        found
-    };
-    let env = Env::default()
-        .filter_or("MIND_THE_LOG_LEVEL", "mind_the_gap=info")
-        .write_style_or("MIND_THE_LOG_STYLE", "auto");
-
-    let mut builder = match &flag_filter {
-        Some(filter) => {
-            let mut builder = env_logger::Builder::new();
-            builder.parse_filters(filter);
-            builder.parse_write_style(
-                &std::env::var("MIND_THE_LOG_STYLE").unwrap_or_else(|_| "auto".into()),
-            );
-            builder
-        }
-        None => env_logger::Builder::from_env(env),
-    };
-    // Timestamps help whoever chose a filter to debug; at the default level the log is the
-    // tool talking to its user
-    if flag_filter.is_none() && std::env::var_os("MIND_THE_LOG_LEVEL").is_none() {
-        builder.format_timestamp(None).format_target(false);
-    }
-    let logger = CardSafeLogger(builder.build());
-    log::set_max_level(logger.0.filter());
-    log::set_boxed_logger(Box::new(logger)).expect("the logger is set once");
+    mind_the_gap::cli::install_logger();
 
     #[cfg(target_os = "linux")]
     if let Err(reason) = memory_lock {
@@ -81,50 +42,6 @@ fn main() -> ExitCode {
             log::error!("{err:#}");
             ExitCode::FAILURE
         }
-    }
-}
-
-/// The card stacks trace raw APDUs, which carry pins and imported key bytes, so a filter
-/// raised to trace while debugging a stubborn reader must not turn into a key logger
-///
-/// Their records above info are dropped here, after the filter: a directive can only ever
-/// be overridden by a more specific one (`openpgp_card::ocard::apdu=debug` beats
-/// `openpgp_card=info`), so no filter directive can make that promise.
-struct CardSafeLogger(env_logger::Logger);
-
-impl CardSafeLogger {
-    const CARD_TARGETS: [&'static str; 5] = [
-        "openpgp_card",
-        "card_backend",
-        "card_backend_pcsc",
-        "yubikey",
-        "pcsc",
-    ];
-
-    fn allows(metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
-            || !Self::CARD_TARGETS.iter().any(|card| {
-                metadata
-                    .target()
-                    .strip_prefix(card)
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
-            })
-    }
-}
-
-impl log::Log for CardSafeLogger {
-    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        Self::allows(metadata) && self.0.enabled(metadata)
-    }
-
-    fn log(&self, record: &log::Record<'_>) {
-        if Self::allows(record.metadata()) {
-            self.0.log(record);
-        }
-    }
-
-    fn flush(&self) {
-        self.0.flush();
     }
 }
 

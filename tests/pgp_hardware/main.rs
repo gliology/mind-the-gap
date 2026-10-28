@@ -3,7 +3,7 @@
 //! The counterpart to `tests/piv_hardware/`, gated on the same two features -- see the feature
 //! comments in `Cargo.toml` for why the second one exists.
 //!
-//! **Running this wipes the card's OpenPGP applet.** `upload` factory-resets it. Note that it
+//! **Running this wipes the card's OpenPGP applet.** `init` factory-resets it. Note that it
 //! resets *only* that applet: a card provisioned by `tests/piv_hardware/` keeps its PIV keys, so
 //! the two suites can share a token, just not at the same time.
 //!
@@ -18,18 +18,20 @@
 //!
 //! The card is addressed by its OpenPGP *application identifier* (`0006:20381784`), not the
 //! bare serial the PIV suite wants -- that is what `openpgp-card` matches on. `mind-the-gap
-//! pgp status` prints it.
+//! list` prints it.
 
 #![cfg(all(
     feature = "destructive-hardware-tests",
     not(feature = "no-destructive-hardware-tests")
 ))]
 
+use mind_the_gap::backend::{Applet, Backend};
 use mind_the_gap::pgp::{
-    CardSettings, CertificateKind, SeededSmartcard, SubkeyRole, TouchPolicyArg,
+    self as backend, CardData, CertificateKind, Kdf, SeededSmartcard, UpdateChange,
 };
 use mind_the_gap::policy::Policy;
-use mind_the_gap::seed::{Algorithm, Seed256};
+use mind_the_gap::role::KeyRole;
+use mind_the_gap::seed::{Algorithm, CardSerial, KeyPath, Seed256, Seeds};
 use mind_the_gap::target::CardTarget;
 
 use sequoia_openpgp::cert::Cert;
@@ -39,6 +41,7 @@ use card_backend_pcsc::PcscBackend;
 use openpgp_card::Card;
 use openpgp_card::ocard::KeyType;
 use openpgp_card::ocard::crypto::{Cryptogram, HashAlgo, SigningAlgo};
+use openpgp_card::ocard::data::TouchPolicy;
 use openpgp_card::state::Transaction;
 
 use sequoia_openpgp::crypto::mpi;
@@ -47,14 +50,19 @@ use sequoia_openpgp::types::Curve as PgpCurve;
 use zeroize::Zeroizing;
 
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::{Duration, SystemTime};
 
 const TEST_PIN: &str = "471120";
 const TEST_NAME: &str = "Hardware Test";
 const TEST_EMAIL: &str = "hardware-test@example.com";
 
-#[path = "common/readers.rs"]
+mod gpg;
+#[path = "../common/hardware.rs"]
+mod hardware;
+#[path = "../common/readers.rs"]
 mod readers;
+
+use gpg::gpg_sees_the_keys;
+use hardware::{next_generation, touch_free};
 
 /// Application identifier of the card under test.
 ///
@@ -67,7 +75,7 @@ fn target() -> String {
             "MTG_HARDWARE_TEST_CARD is not set.\n\
              \n\
              This test factory-resets the OpenPGP applet of the card it runs against, so it\n\
-             will not pick one for you. Print the identifier with `mind-the-gap pgp status`\n\
+             will not pick one for you. Print the identifier with `mind-the-gap list`\n\
              and pass it explicitly:\n\
              \n\
              \tMTG_HARDWARE_TEST_CARD=<ident> cargo test --features destructive-hardware-tests --test pgp_hardware\n"
@@ -75,46 +83,96 @@ fn target() -> String {
     }
 }
 
-/// Whether this run turns the touch policies off, for a host that runs it unattended
+/// Whether this run has `init` set up the KDF data object
 ///
-/// `MTG_HARDWARE_TEST_TOUCH=never` provisions with the `never-touch` policy, as in the PIV
-/// suite: a script cannot touch a YubiKey, so this is how the suite runs without a person,
-/// proving everything except that touch is enforced, which the default run does.
-fn touch_free() -> bool {
-    match std::env::var("MTG_HARDWARE_TEST_TOUCH") {
-        Err(_) => false,
-        Ok(touch) if touch == "never" => true,
-        Ok(other) => panic!("MTG_HARDWARE_TEST_TOUCH is `never` or unset, not `{other}`"),
+/// `MTG_HARDWARE_TEST_KDF=on` or `off` overrides the default, which sets it up on a Gnuk only:
+/// with it on, every step that enters a pin, gpg's included, proves it hashes the pin the
+/// way the card expects.
+fn kdf() -> Kdf {
+    match std::env::var("MTG_HARDWARE_TEST_KDF").as_deref() {
+        Err(_) => Kdf::Auto,
+        Ok("on") => Kdf::On,
+        Ok("off") => Kdf::Off,
+        Ok(other) => panic!("MTG_HARDWARE_TEST_KDF is `on`, `off` or unset, not `{other}`"),
     }
 }
 
-/// Seed for the provisioned test identity, from the identifier of the card under test.
+/// The seed of the provisioned test identity, card seed and key seed in one
 ///
-/// Deliberately different from the PIV suite's, so a crossed wire between the two backends
-/// cannot pass by coincidence, and different per card: gpg-agent signs on whichever attached
-/// card holds the key it looks up, so with one identity on several cards, as on a test host,
-/// it can sign on another card and wait there for a touch.
+/// Tagged apart from the PIV suite's, so that a crossed wire between the two backends cannot
+/// pass by coincidence.
 fn test_seed() -> Seed256 {
-    use sha2::{Digest, Sha256};
-    Sha256::new()
-        .chain_update([0xa7])
-        .chain_update(target().to_ascii_uppercase())
-        .finalize()
-        .into()
+    hardware::seed_tagged(0xa7, &target().to_ascii_uppercase())
+}
+
+/// The key seed of a second identity, a team's, whose decryption key a personal card takes
+fn team_seed() -> Seed256 {
+    hardware::seed_tagged(0x7e, &target().to_ascii_uppercase())
 }
 
 fn subject() -> SeededSmartcard {
-    let subject = SeededSmartcard::new(&test_seed(), None, TEST_NAME.into())
+    subject_at(KeyPath::default())
+}
+
+/// The test identity's keys along `path`, from the one test seed
+fn subject_at(path: KeyPath) -> SeededSmartcard {
+    with_test_settings(SeededSmartcard::new(Seeds::one(&test_seed()), path, TEST_NAME.into()))
+}
+
+/// The settings every test identity is provisioned with
+fn with_test_settings(subject: SeededSmartcard) -> SeededSmartcard {
+    let subject = subject
         .add_email(TEST_EMAIL)
         .unwrap()
         .with_pin(Zeroizing::new(TEST_PIN.to_string()))
-        .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
-        .with_subkey_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        .unwrap()
+        .with_kdf(kdf());
     if touch_free() {
         subject.with_policy(Policy::NeverTouch)
     } else {
         subject
     }
+}
+
+/// Gnuk's manufacturers, FSIJ and the test range an unconfigured Gnuk reports: a card that
+/// takes a new user pin only once it holds keys
+const GNUK: [u16; 2] = [0xF517, 0xFFFE];
+
+/// Initialize the card and upload the subject's keys, as `init` and `upload` do
+///
+/// On a card that refuses a new user pin before it holds keys, `init` leaves the factory pin,
+/// and the pin is changed after the upload, as the book tells a Gnuk user to.
+fn provision(subject: &SeededSmartcard) {
+    subject.init(Some(addressed())).expect("init failed");
+    let plan = subject
+        .plan_upload(Some(addressed()))
+        .expect("cannot plan an upload");
+    let remaining = subject
+        .upload(Some(addressed()), &plan)
+        .expect("upload to card failed");
+    assert!(remaining.is_empty(), "the upload left changes behind:\n{remaining}");
+    let manufacturer = {
+        let (mut card, _) = open();
+        let transaction = card.transaction().expect("cannot start card transaction");
+        transaction
+            .application_identifier()
+            .expect("cannot read application identifier")
+            .manufacturer()
+    };
+    if GNUK.contains(&manufacturer) {
+        backend::change_pin(Some(addressed()), "123456", TEST_PIN)
+            .expect("cannot set the user pin after the upload");
+    }
+}
+
+/// Whether the card has the private-use data objects that tell whose card it is
+fn has_private_use() -> bool {
+    let (mut card, _) = open();
+    let transaction = card.transaction().expect("cannot start card transaction");
+    transaction
+        .extended_capabilities()
+        .expect("cannot read extended capabilities")
+        .private_use_dos()
 }
 
 /// The reader the card under test sits in, found once per run
@@ -154,7 +212,7 @@ fn reader() -> &'static std::ffi::CStr {
                 return reader;
             }
         }
-        panic!("no OpenPGP card with identifier '{ident}'; `mind-the-gap pgp status` lists them")
+        panic!("no OpenPGP card with identifier '{ident}'; `mind-the-gap list` shows them")
     })
 }
 
@@ -204,22 +262,21 @@ fn probe_ident(card: &mut pcsc::Card) -> Option<String> {
     Some(format!("{m1:02X}{m2:02X}:{s1:02X}{s2:02X}{s3:02X}{s4:02X}"))
 }
 
-/// Fingerprints of the three subkeys, in `SubkeyRole::ALL` order.
+/// Fingerprints of a certificate's subkeys, in the card's slot order, of those it has
 fn derived_fingerprints(cert: &Cert) -> Vec<(KeyType, [u8; 20])> {
     let policy = StandardPolicy::new();
     let valid = cert
-        .with_policy(&policy, None)
+        .with_policy(&policy, Some(creation_time(cert)))
         .expect("derived certificate is not valid under the standard policy");
 
-    SubkeyRole::ALL
+    KeyRole::PGP
         .iter()
-        .map(|role| {
+        .filter_map(|role| {
             let kind = role.key_type();
             let subkey = valid
                 .keys()
                 .subkeys()
-                .find(|key| key.key_flags().is_some_and(|flags| role.matches(&flags)))
-                .unwrap_or_else(|| panic!("derived certificate has no {kind:?} subkey"));
+                .find(|key| key.key_flags().is_some_and(|flags| role.matches(&flags)))?;
 
             let fingerprint: [u8; 20] = subkey
                 .key()
@@ -228,28 +285,18 @@ fn derived_fingerprints(cert: &Cert) -> Vec<(KeyType, [u8; 20])> {
                 .try_into()
                 .expect("fingerprint is not 20 bytes");
 
-            (kind, fingerprint)
+            Some((kind, fingerprint))
         })
         .collect()
 }
 
-/// Stops any `scdaemon` this test started, however the test ends.
-///
-/// Asking gpg to talk to a card leaves an scdaemon holding it exclusively, which would break
-/// every later card test in the same `cargo test` run. `Drop` rather than a call at the end of
-/// the test, so that it also runs when an assertion panics.
-struct ScdaemonGuard {
-    home: std::path::PathBuf,
-}
-
-impl Drop for ScdaemonGuard {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new("gpgconf")
-            .env("GNUPGHOME", &self.home)
-            .args(["--kill", "scdaemon"])
-            .output();
-        let _ = std::fs::remove_dir_all(&self.home);
-    }
+/// When a certificate's newest subkey was created, which is when its keys are judged: a
+/// generation dated ahead of the clock is still the one a card holds
+fn creation_time(cert: &Cert) -> std::time::SystemTime {
+    cert.keys()
+        .map(|key| key.key().creation_time())
+        .max()
+        .expect("a certificate has a primary key")
 }
 
 /// The one card every test here factory-resets, held for each test's whole run
@@ -305,10 +352,364 @@ fn provision_and_verify_rsa_cards() {
     }
 }
 
+/// Uploading to a provisioned card again: another policy and cardholder data, written under
+/// the derived admin pin without a factory reset, then a second key seed's decryption key.
+///
+/// The keys stay on the card untouched while the signing pin and, unless the run is
+/// touch-free, the touch policies follow the new policy; the card data lands as given. The
+/// team's decryption key, from a key seed apart from the card seed, takes the one decryption
+/// slot alone. The virtual OpenPGP check runs it too.
+#[test]
+#[ignore = "provisions the card, then uploads to it again; run by the virtual OpenPGP check"]
+fn upload_in_place() {
+    let _card = exclusive_card();
+    let _readers = readers::shared();
+
+    eprintln!("[1/5] initializing card {} and uploading (no touch needed)", target());
+    provision(&subject());
+    let before = subject()
+        .certify(CertificateKind::Full)
+        .expect("offline certify failed");
+    let unchanged = subject()
+        .plan_upload(Some(addressed()))
+        .expect("cannot plan an upload");
+    assert!(unchanged.is_empty(), "a freshly provisioned card has changes:\n{unchanged}");
+
+    // A pin before every signature in both runs, and every touch on in the attended one
+    let policy = if touch_free() {
+        Policy::AlwaysPin
+    } else {
+        Policy::Strict
+    };
+    let updated = subject().with_policy(policy);
+
+    eprintln!("[2/5] uploading another policy");
+    let plan = updated
+        .plan_upload(Some(addressed()))
+        .expect("cannot plan an upload");
+    eprintln!("{plan}");
+    // A key already at plain touch, where the card refused the cached one at provisioning,
+    // has the strict policy's touch already
+    let mut expected = Vec::new();
+    if !touch_free() {
+        let (mut card, _) = open();
+        let mut transaction = card.transaction().expect("cannot start card transaction");
+        for role in KeyRole::PGP {
+            let touch = transaction
+                .user_interaction_flag(role.key_type())
+                .unwrap_or_else(|e| panic!("cannot read {role} touch policy: {e}"))
+                .map(|uif| uif.touch_policy());
+            if touch != Some(TouchPolicy::On) {
+                expected.push(UpdateChange::Touch { role });
+            }
+        }
+    }
+    expected.push(UpdateChange::SigningPin { forced: true });
+    assert_eq!(plan.changes, expected, "unexpected plan:\n{plan}");
+
+    let remaining = updated
+        .upload(Some(addressed()), &plan)
+        .expect("upload failed");
+    assert!(remaining.is_empty(), "the upload left changes behind:\n{remaining}");
+    let again = updated
+        .plan_upload(Some(addressed()))
+        .expect("cannot plan an upload");
+    assert!(again.is_empty(), "an uploaded card still has changes:\n{again}");
+
+    eprintln!("[3/5] asserting card contents independently");
+    {
+        let (mut card, _) = open();
+        let mut transaction = card.transaction().expect("cannot start card transaction");
+        for (kind, want) in derived_fingerprints(&before) {
+            let on_card = transaction
+                .fingerprint(kind)
+                .unwrap_or_else(|e| panic!("cannot read {kind:?} fingerprint: {e}"))
+                .unwrap_or_else(|| panic!("no {kind:?} key on card"));
+            assert_eq!(on_card.as_bytes(), want, "{kind:?} key moved with a new policy");
+            if !touch_free()
+                && let Some(uif) = transaction
+                    .user_interaction_flag(kind)
+                    .unwrap_or_else(|e| panic!("cannot read {kind:?} touch policy: {e}"))
+            {
+                assert_eq!(uif.touch_policy(), TouchPolicy::On, "{kind:?} touch is not on");
+            }
+        }
+        assert!(
+            transaction
+                .pw_status_bytes()
+                .expect("cannot read pin status")
+                .pw1_cds_valid_once(),
+            "a signing pin entry still lasts the session",
+        );
+
+        eprintln!("      each key works -- TOUCH if the card blinks");
+        keys_work_on_card(&mut transaction, &before);
+    }
+    updated
+        .check(Some(addressed()))
+        .expect("check disagreed with the uploaded card");
+
+    eprintln!("[4/5] cardholder data, written as given");
+    let with_data = subject().with_policy(policy).with_card_data(CardData {
+        lang: vec![*b"en", *b"de"],
+        url: Some("https://example.com/alice.asc".to_string()),
+        login: Some("alice".to_string()),
+    });
+    let plan = with_data
+        .plan_upload(Some(addressed()))
+        .expect("cannot plan an upload");
+    assert_eq!(
+        plan.changes,
+        vec![UpdateChange::Lang, UpdateChange::Url, UpdateChange::Login],
+        "unexpected plan:\n{plan}",
+    );
+    let remaining = with_data
+        .upload(Some(addressed()), &plan)
+        .expect("upload failed");
+    assert!(remaining.is_empty(), "the upload left changes behind:\n{remaining}");
+    {
+        // Read back independently of the crate
+        let (mut card, _) = open();
+        let mut transaction = card.transaction().expect("cannot start card transaction");
+        assert_eq!(
+            transaction.url().expect("cannot read url"),
+            "https://example.com/alice.asc",
+            "the upload did not store the url",
+        );
+        assert_eq!(
+            transaction.login_data().expect("cannot read login data"),
+            b"alice",
+            "the upload did not store the login data",
+        );
+    }
+
+    // The same card seed administers the card, the team's key seed derives the key
+    eprintln!("[5/5] a team's decryption key -- TOUCH if the card blinks");
+    let card_seed = test_seed();
+    let team_key_seed = team_seed();
+    let team = with_test_settings(SeededSmartcard::new(
+        Seeds { card: Some(&card_seed), key: Some(&team_key_seed) },
+        KeyPath::default(),
+        "Hardware Team".into(),
+    ))
+    .with_policy(policy)
+    .with_keys(&[KeyRole::Decryption])
+    .expect("the decryption key alone");
+    let plan = team
+        .plan_upload(Some(addressed()))
+        .expect("cannot plan an upload");
+    assert_eq!(
+        plan.changes,
+        vec![UpdateChange::Key { role: KeyRole::Decryption }],
+        "a team key upload writes more than the decryption key:\n{plan}",
+    );
+    let remaining = team
+        .upload(Some(addressed()), &plan)
+        .expect("upload failed");
+    assert!(remaining.is_empty(), "the team upload left changes behind:\n{remaining}");
+    let team_cert = team
+        .certify(CertificateKind::Full)
+        .expect("offline certify failed");
+    let (mut card, _) = open();
+    let mut transaction = card.transaction().expect("cannot start card transaction");
+    for (kind, want) in derived_fingerprints(&before)
+        .into_iter()
+        .filter(|(kind, _)| *kind != KeyType::Decryption)
+        .chain(derived_fingerprints(&team_cert))
+    {
+        let on_card = transaction
+            .fingerprint(kind)
+            .unwrap_or_else(|e| panic!("cannot read {kind:?} fingerprint: {e}"))
+            .unwrap_or_else(|| panic!("no {kind:?} key on card"));
+        assert_eq!(on_card.as_bytes(), want, "{kind:?} key on card is not the expected one");
+    }
+    transaction
+        .verify_user_pin(secrecy::SecretString::from(TEST_PIN.to_string()))
+        .expect("card rejected the user pin");
+    decryption_works(&mut transaction, &team_cert);
+}
+
+/// Rotating a provisioned card to a new key generation in place, without a factory reset.
+///
+/// The card must end up holding the new generation's keys, created at its date, under the
+/// same admin pin and with the user pin unchanged. The virtual OpenPGP check runs it.
+#[test]
+#[ignore = "provisions the card, then rotates it in place; run by the virtual OpenPGP check"]
+fn rotate_in_place() {
+    let _card = exclusive_card();
+    let _readers = readers::shared();
+
+    eprintln!("[1/4] initializing card {} and uploading (no touch needed)", target());
+    let previous = subject();
+    provision(&previous);
+    assert_eq!(
+        backend::generation_on_card(Some(addressed())).expect("cannot read the generation"),
+        None,
+        "a card provisioned without a date reads as dated",
+    );
+
+    eprintln!("[2/4] rotating to {}", next_generation());
+    let rotated = subject_at(KeyPath { subkey: None, date: Some(next_generation()) });
+    let after = rotated
+        .certify(CertificateKind::Full)
+        .expect("offline certify failed");
+    let plan = rotated
+        .plan_rotation_from(&previous, Some(addressed()))
+        .expect("cannot plan a rotation");
+    eprintln!("{plan}");
+    for role in KeyRole::PGP {
+        assert!(
+            plan.changes.contains(&UpdateChange::Key { role }),
+            "the {role} key is not planned:\n{plan}",
+        );
+    }
+    let remaining = rotated
+        .rotate_from(&previous, Some(addressed()), &plan)
+        .expect("rotation failed");
+    assert!(remaining.is_empty(), "the rotation left changes behind:\n{remaining}");
+
+    eprintln!("[3/4] the card holds the new generation, and keeps its user pin");
+    assert_eq!(
+        backend::generation_on_card(Some(addressed())).expect("cannot read the generation"),
+        Some(next_generation()),
+        "the card does not read as the new generation",
+    );
+    let again = rotated
+        .plan_upload(Some(addressed()))
+        .expect("cannot plan an upload");
+    assert!(again.is_empty(), "a rotated card still has changes:\n{again}");
+    {
+        let (mut card, _) = open();
+        let mut transaction = card.transaction().expect("cannot start card transaction");
+        for (kind, want) in derived_fingerprints(&after) {
+            let on_card = transaction
+                .fingerprint(kind)
+                .unwrap_or_else(|e| panic!("cannot read {kind:?} fingerprint: {e}"))
+                .unwrap_or_else(|| panic!("no {kind:?} key on card"));
+            assert_eq!(on_card.as_bytes(), want, "{kind:?} key on card is not the rotated one");
+        }
+        transaction
+            .verify_user_pin(secrecy::SecretString::from(TEST_PIN.to_string()))
+            .expect("the rotation changed the user pin");
+    }
+
+    eprintln!("[4/4] the same admin pin opens the card, and check agrees");
+    rotated
+        .check(Some(addressed()))
+        .expect("check disagreed with the rotated card");
+}
+
+/// The user pin: changed with the current one, which needs no seed, then blocked and set
+/// again under the card seed's derived admin pin, then the card wiped. No touch.
+#[test]
+#[ignore = "provisions the card, then changes, resets and wipes; run by the virtual OpenPGP check"]
+fn change_user_pin() {
+    const NEW_PIN: &str = "582231";
+    let _card = exclusive_card();
+    let _readers = readers::shared();
+
+    eprintln!("[1/4] initializing card {} and uploading (no touch needed)", target());
+    let subject = subject();
+    provision(&subject);
+
+    eprintln!("[2/4] a wrong current pin is refused, the right one changes it");
+    assert!(
+        backend::change_pin(Some(addressed()), "000000", NEW_PIN).is_err(),
+        "a wrong current pin changed the pin",
+    );
+    backend::change_pin(Some(addressed()), TEST_PIN, NEW_PIN).expect("cannot change the pin");
+    {
+        let (mut card, _) = open();
+        let mut transaction = card.transaction().expect("cannot start card transaction");
+        transaction
+            .verify_user_pin(secrecy::SecretString::from(NEW_PIN.to_string()))
+            .expect("the card does not take the new pin");
+    }
+
+    eprintln!("[3/4] blocking the user pin, then setting one with the card seed");
+    {
+        let (mut card, _) = open();
+        let mut transaction = card.transaction().expect("cannot start card transaction");
+        // openpgp-card caches the status bytes with the rest of the application data
+        let left = |transaction: &mut Card<Transaction<'_>>| {
+            transaction
+                .invalidate_cache()
+                .expect("cannot reread the card");
+            transaction
+                .pw_status_bytes()
+                .expect("cannot read pin status")
+                .err_count_pw1()
+        };
+        // Bounded, so a card that does not count wrong entries fails rather than spins
+        for _ in 0..16 {
+            if left(&mut transaction) == 0 {
+                break;
+            }
+            let _ = transaction.verify_user_pin(secrecy::SecretString::from("000000".to_string()));
+        }
+        assert_eq!(left(&mut transaction), 0, "wrong entries do not block the user pin");
+    }
+    subject
+        .reset_pin(Some(addressed()), TEST_PIN)
+        .expect("cannot set the user pin");
+    {
+        let (mut card, _) = open();
+        let mut transaction = card.transaction().expect("cannot start card transaction");
+        assert!(
+            transaction
+                .verify_user_pin(secrecy::SecretString::from(NEW_PIN.to_string()))
+                .is_err(),
+            "the card still takes the old pin",
+        );
+        transaction
+            .verify_user_pin(secrecy::SecretString::from(TEST_PIN.to_string()))
+            .expect("the card does not take the pin set under the admin pin");
+    }
+
+    eprintln!("[4/4] a stranger's card seed cannot wipe it, its own can");
+    // A card without room for the identifier cannot tell the two apart
+    let private_use = has_private_use();
+    let stranger =
+        SeededSmartcard::new(Seeds::one(&team_seed()), KeyPath::default(), "Stranger".into());
+    if private_use {
+        assert!(
+            stranger.plan_wipe(Some(addressed()), false).is_err(),
+            "another card seed may wipe the card",
+        );
+    }
+    subject
+        .plan_wipe(Some(addressed()), false)
+        .expect("the card seed may not wipe its card");
+    subject.wipe(Some(addressed()), false).expect("wipe failed");
+    let (mut card, _) = open();
+    let mut transaction = card.transaction().expect("cannot start card transaction");
+    for kind in [
+        KeyType::Signing,
+        KeyType::Decryption,
+        KeyType::Authentication,
+    ] {
+        assert!(
+            transaction
+                .fingerprint(kind)
+                .expect("cannot read a fingerprint")
+                .is_none(),
+            "the wiped card still holds a {kind:?} key",
+        );
+    }
+    drop(transaction);
+    drop(card);
+    if private_use {
+        assert!(
+            subject.plan_upload(Some(addressed())).is_err(),
+            "a wiped card still takes an upload",
+        );
+    }
+}
+
 /// The card refuses every key's operation while nobody touches it, and performs it again
 /// once someone does.
 ///
-/// `upload` leaves each key requiring a touch, so the other tests only show that a touch,
+/// An upload leaves each key requiring a touch, so the other tests only show that a touch,
 /// when given, unlocks the keys. This one needs a card whose user presence the test decides,
 /// which only a virtual card has: the virtual OpenPGP check runs it with
 /// `MTG_TEST_USER_PRESENCE_FILE` naming the file the card reads, where `deny` refuses every
@@ -331,9 +732,7 @@ fn touch_is_enforced() {
         .certify(CertificateKind::Full)
         .expect("offline certify failed");
     decide("grant");
-    subject
-        .upload(Some(addressed()))
-        .expect("upload to card failed");
+    provision(&subject);
 
     let (mut card, _) = open();
     let mut transaction = card.transaction().expect("cannot start card transaction");
@@ -350,7 +749,7 @@ fn touch_is_enforced() {
 fn keys_refuse_on_card(transaction: &mut Card<Transaction<'_>>, cert: &Cert) {
     let pin = || secrecy::SecretString::from(TEST_PIN.to_string());
 
-    let public = public_mpis(cert, SubkeyRole::Signing);
+    let public = public_mpis(cert, KeyRole::Signature);
     let (algo, input) = signing_input(&public, b"no touch");
     transaction
         .verify_user_signing_pin(pin())
@@ -360,7 +759,7 @@ fn keys_refuse_on_card(transaction: &mut Card<Transaction<'_>>, cert: &Cert) {
         "the signing key signed without the touch it demands",
     );
 
-    let public = public_mpis(cert, SubkeyRole::Authentication);
+    let public = public_mpis(cert, KeyRole::Authentication);
     let (algo, input) = signing_input(&public, b"no touch");
     transaction
         .verify_user_pin(pin())
@@ -374,7 +773,7 @@ fn keys_refuse_on_card(transaction: &mut Card<Transaction<'_>>, cert: &Cert) {
     );
 
     let mpi::PublicKey::ECDH { curve: PgpCurve::Cv25519, .. } =
-        public_mpis(cert, SubkeyRole::Decryption)
+        public_mpis(cert, KeyRole::Decryption)
     else {
         panic!("the touch test provisions the default Curve25519 keys");
     };
@@ -393,24 +792,16 @@ fn provision_and_verify(subject: SeededSmartcard) {
     let readers = readers::shared();
 
     // -- Provision -----------------------------------------------------------------------
-    eprintln!("[1/7] deriving the certificate offline");
+    eprintln!("[1/6] deriving the certificate offline");
     let offline = subject
         .certify(CertificateKind::Full)
         .expect("offline certify failed");
 
-    eprintln!("[2/7] uploading to card {ident} (no touch needed)");
-    let uploaded = subject
-        .upload(Some(addressed()))
-        .expect("upload to card failed");
-
-    assert_eq!(
-        uploaded.fingerprint(),
-        offline.fingerprint(),
-        "upload and certify produced different primary keys",
-    );
+    eprintln!("[2/6] initializing card {ident} and uploading (no touch needed)");
+    provision(&subject);
 
     // -- The crate's own check agrees ----------------------------------------------------
-    eprintln!("[3/7] running check");
+    eprintln!("[3/6] running check");
     subject
         .check(Some(addressed()))
         .expect("check disagreed with the card");
@@ -418,7 +809,7 @@ fn provision_and_verify(subject: SeededSmartcard) {
     // -- Independent verification --------------------------------------------------------
     //
     // `check` is the thing under test, so read the card directly rather than taking its word.
-    eprintln!("[4/7] asserting card contents independently");
+    eprintln!("[4/6] asserting card contents independently");
     let expected = derived_fingerprints(&offline);
 
     let (mut card, serialno) = open();
@@ -431,6 +822,29 @@ fn provision_and_verify(subject: SeededSmartcard) {
             .unwrap_or_else(|| panic!("no {kind:?} key on card"));
 
         assert_eq!(on_card.as_bytes(), want, "{kind:?} key on card is not the derived one",);
+    }
+
+    // The card identifier, which tells whose card it is, sits in data object 0102 wherever
+    // the card has private-use data objects at all
+    let private_use = transaction
+        .extended_capabilities()
+        .expect("cannot read extended capabilities")
+        .private_use_dos();
+    if private_use {
+        let identifier = transaction
+            .private_use_do(2)
+            .expect("cannot read data object 0102");
+        let aid = transaction
+            .application_identifier()
+            .expect("cannot read application identifier");
+        let serial = CardSerial::pgp(aid.manufacturer(), aid.serial());
+        assert_eq!(
+            (!identifier.is_empty()).then(|| String::from_utf8_lossy(&identifier).into_owned()),
+            subject
+                .card_identifier(&serial)
+                .expect("cannot derive the card identifier"),
+            "data object 0102 does not hold the card identifier",
+        );
     }
 
     let cardholder = transaction
@@ -458,7 +872,7 @@ fn provision_and_verify(subject: SeededSmartcard) {
     // (ECDH). The X25519 agreement is the one that settles the scalar byte order, since the
     // card computes with the bytes it was sent and the certificate holds the public key
     // derived from them here.
-    eprintln!("[5/7] each key signs, authenticates or decrypts -- TOUCH if the card blinks");
+    eprintln!("[5/6] each key signs, authenticates or decrypts -- TOUCH if the card blinks");
     keys_work_on_card(&mut transaction, &offline);
 
     drop(transaction);
@@ -466,51 +880,18 @@ fn provision_and_verify(subject: SeededSmartcard) {
 
     // scdaemon takes every reader, so this step waits for the other suites to let go of
     // theirs, and they wait for it until it has stopped scdaemon again
-    eprintln!("[6/7] gpg sees the card and uses its keys -- TOUCH if the card blinks");
+    eprintln!("[6/6] gpg sees the card and uses its keys -- TOUCH if the card blinks");
     drop(readers);
     let gpg = readers::exclusive();
     gpg_sees_the_keys(&expected, &offline, &serialno);
     drop(gpg);
-    let _readers = readers::shared();
-
-    // -- Post-provisioning configuration ---------------------------------------------------
-    //
-    // `configure` adjusts the card under the derived admin pin without reprovisioning; a
-    // later factory reset by the next run reverts everything, so nothing here persists.
-    eprintln!("[7/7] configure adjusts the provisioned card");
-    subject
-        .configure(
-            Some(addressed()),
-            CardSettings {
-                touch: vec![(SubkeyRole::Authentication, TouchPolicyArg::Always)],
-                lang: vec![*b"en", *b"de"],
-                url: Some("https://example.com/alice.asc".to_string()),
-                login: Some("alice".to_string()),
-                sign_pin: None,
-            },
-        )
-        .expect("configure failed against the provisioned card");
-
-    // Read back independently of the crate
-    let (mut card, _) = open();
-    let mut transaction = card.transaction().expect("cannot start card transaction");
-    assert_eq!(
-        transaction.url().expect("cannot read url"),
-        "https://example.com/alice.asc",
-        "configure did not store the url",
-    );
-    assert_eq!(
-        transaction.login_data().expect("cannot read login data"),
-        b"alice",
-        "configure did not store the login data",
-    );
 }
 
 /// A subkey's public key material, as the certificate carries it
-fn public_mpis(cert: &Cert, role: SubkeyRole) -> mpi::PublicKey {
+fn public_mpis(cert: &Cert, role: KeyRole) -> mpi::PublicKey {
     let policy = StandardPolicy::new();
     let valid = cert
-        .with_policy(&policy, None)
+        .with_policy(&policy, Some(creation_time(cert)))
         .expect("derived certificate is not valid under the standard policy");
     valid
         .keys()
@@ -612,7 +993,7 @@ fn keys_work_on_card(transaction: &mut Card<Transaction<'_>>, cert: &Cert) {
     let pin = || secrecy::SecretString::from(TEST_PIN.to_string());
 
     // Signing key: PW1 in signing mode, the one the card resets after every signature
-    let public = public_mpis(cert, SubkeyRole::Signing);
+    let public = public_mpis(cert, KeyRole::Signature);
     let message = b"openpgp signing key";
     let (algo, input) = signing_input(&public, message);
     transaction
@@ -625,7 +1006,7 @@ fn keys_work_on_card(transaction: &mut Card<Transaction<'_>>, cert: &Cert) {
     verify_card_signature(&public, message, &signature, "signing key signature");
 
     // Authentication key: INTERNAL AUTHENTICATE, PW1 in user mode
-    let public = public_mpis(cert, SubkeyRole::Authentication);
+    let public = public_mpis(cert, KeyRole::Authentication);
     let message = b"openpgp authentication key";
     let (algo, input) = signing_input(&public, message);
     transaction
@@ -637,8 +1018,13 @@ fn keys_work_on_card(transaction: &mut Card<Transaction<'_>>, cert: &Cert) {
         .expect("authentication key refused to authenticate");
     verify_card_signature(&public, message, &signature, "authentication key signature");
 
-    // Decryption key: RSA decrypts, ECDH returns the shared secret
-    let public = public_mpis(cert, SubkeyRole::Decryption);
+    decryption_works(transaction, cert);
+}
+
+/// The decryption key at work on the card: RSA decrypts, ECDH returns the shared secret,
+/// each checked off the card; the user pin has to be verified already
+fn decryption_works(transaction: &mut Card<Transaction<'_>>, cert: &Cert) {
+    let public = public_mpis(cert, KeyRole::Decryption);
     match &public {
         mpi::PublicKey::RSA { e, n } => {
             let message = b"openpgp decryption key";
@@ -682,174 +1068,4 @@ fn keys_work_on_card(transaction: &mut Card<Transaction<'_>>, cert: &Cert) {
         }
         other => panic!("unexpected decryption key {other:?}"),
     }
-}
-
-/// Confirm gpg itself finds the three keys, and clean up the scdaemon that costs.
-///
-/// Uses a throwaway GNUPGHOME so the caller's keyring and agent are untouched, and forces
-/// scdaemon through PC/SC -- its internal CCID driver claims the USB interface directly and
-/// fails with "No such device" whenever pcscd already holds the reader.
-///
-/// The card is named by its serial number throughout, because scdaemon otherwise takes
-/// whichever OpenPGP card it likes when several are attached, as on a test host, and the
-/// test identity is the same on all of them.
-#[cfg(has_gpg)]
-fn gpg_sees_the_keys(expected: &[(KeyType, [u8; 20])], cert: &Cert, serialno: &str) {
-    // tempfile gives an unpredictable path, so nothing can pre-place a directory or
-    // symlink there; into_path hands ownership to the ScdaemonGuard below
-    let home = tempfile::tempdir()
-        .expect("cannot create throwaway GNUPGHOME")
-        .keep();
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
-            .expect("cannot restrict GNUPGHOME permissions");
-    }
-
-    std::fs::write(home.join("scdaemon.conf"), "disable-ccid\n")
-        .expect("cannot write scdaemon.conf");
-
-    // Armed before gpg runs, so the daemon is stopped even if an assertion below panics
-    let _guard = ScdaemonGuard { home: home.clone() };
-
-    // scdaemon names a card after its AID but may zero the version field (it does for every
-    // YubiKey), so find ours among the cards it sees by manufacturer and serial number
-    let cards = std::process::Command::new("gpg-card")
-        .env("GNUPGHOME", &home)
-        .args(["--no-history", "list", "--cards"])
-        .output()
-        .expect("cannot run gpg-card");
-    let cards = String::from_utf8_lossy(&cards.stdout);
-    let serialno = cards
-        .split_whitespace()
-        .find(|word| word.len() == 32 && word.get(16..28) == serialno.get(16..28))
-        .unwrap_or_else(|| panic!("gpg sees no card with serial number {serialno}:\n{cards}"));
-
-    // Make the card current and have the agent learn its keys: the key stubs it writes record
-    // this serial number, so the signing and decryption below go to this card and no other
-    let learned = std::process::Command::new("gpg-connect-agent")
-        .env("GNUPGHOME", &home)
-        .args([
-            &format!("scd switchcard {serialno}"),
-            "learn --force",
-            "/bye",
-        ])
-        .output()
-        .expect("cannot run gpg-connect-agent");
-    let replies = String::from_utf8_lossy(&learned.stdout);
-    assert!(
-        learned.status.success() && !replies.lines().any(|line| line.starts_with("ERR")),
-        "gpg-agent cannot learn card {serialno}:\n{replies}\n{}",
-        String::from_utf8_lossy(&learned.stderr),
-    );
-
-    // `gpg --card-status` asks for no card in particular; gpg-card lists the one named
-    let output = std::process::Command::new("gpg-card")
-        .env("GNUPGHOME", &home)
-        .args(["--no-history", "list", serialno])
-        .output()
-        .expect("cannot run gpg-card");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "gpg-card list failed:\n{}\n{}",
-        stdout,
-        String::from_utf8_lossy(&output.stderr),
-    );
-
-    // gpg prints fingerprints spaced in four-character groups, so compare on a normalised copy
-    let normalised: String = stdout.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-    let normalised = normalised.to_uppercase();
-
-    for (kind, fingerprint) in expected {
-        let hex = fingerprint
-            .iter()
-            .map(|byte| format!("{byte:02X}"))
-            .collect::<String>();
-
-        assert!(
-            normalised.contains(&hex),
-            "gpg does not report the {kind:?} key ({hex}):\n{stdout}",
-        );
-    }
-
-    gpg_uses_the_keys(&home, cert);
-}
-
-/// gpg signs and decrypts with the card, end to end, the way a mail client would.
-///
-/// The low-level checks above prove the keys; this proves the whole client path around them,
-/// the ECDH key derivation and session key unwrapping included, which only a real client does.
-#[cfg(has_gpg)]
-fn gpg_uses_the_keys(home: &std::path::Path, cert: &Cert) {
-    use sequoia_openpgp::serialize::SerializeInto;
-    use std::io::Write;
-
-    let gpg = |args: &[&str], input: &[u8]| -> std::process::Output {
-        let mut child = std::process::Command::new("gpg")
-            .env("GNUPGHOME", home)
-            .args([
-                "--batch",
-                "--yes",
-                "--pinentry-mode",
-                "loopback",
-                "--passphrase",
-                TEST_PIN,
-            ])
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("cannot run gpg");
-        child.stdin.take().unwrap().write_all(input).unwrap();
-        child.wait_with_output().expect("gpg did not finish")
-    };
-    let ok = |output: std::process::Output, what: &str| -> Vec<u8> {
-        assert!(
-            output.status.success(),
-            "gpg {what} failed:\n{}",
-            String::from_utf8_lossy(&output.stderr),
-        );
-        output.stdout
-    };
-
-    // The public certificate turns the card status stubs into usable keys
-    ok(gpg(&["--import"], &cert.armored().to_vec().unwrap()), "--import");
-    let fingerprint = cert.fingerprint().to_hex();
-
-    let message = b"signed and sealed on the card";
-    let signed = ok(gpg(&["--local-user", &fingerprint, "--sign"], message), "--sign");
-    let verified = ok(gpg(&["--decrypt"], &signed), "--verify of a card signature");
-    assert_eq!(verified, message, "gpg verified a different message");
-
-    let sealed = ok(
-        gpg(
-            &[
-                "--trust-model",
-                "always",
-                "--recipient",
-                &fingerprint,
-                "--encrypt",
-            ],
-            message,
-        ),
-        "--encrypt",
-    );
-    let opened = ok(gpg(&["--decrypt"], &sealed), "--decrypt on the card");
-    assert_eq!(opened, message, "gpg decrypted to a different message");
-}
-
-#[cfg(not(has_gpg))]
-fn gpg_sees_the_keys(_expected: &[(KeyType, [u8; 20])], _cert: &Cert, _serialno: &str) {
-    // A destructive run that cannot finish its last assertion must say so in the result,
-    // not in a line of buffered output: a pass with a skipped step is not a pass. The card
-    // itself is fine -- provisioning succeeded before this step.
-    panic!(
-        "gpg is not in PATH, so the final cross-check cannot run; the card is provisioned \
-         fine -- install gpg (or enter the dev shell) and rerun to complete the suite"
-    );
 }

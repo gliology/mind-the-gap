@@ -1,5 +1,7 @@
 //! RSA keys from two primes read off a SHAKE256 stream.
 
+use crate::hex::hex;
+
 use mind_the_gap::rsa::{PUBLIC_EXPONENT, derive_key};
 use mind_the_gap::seed::Seed256;
 
@@ -18,10 +20,6 @@ const MODULI: [(u32, &str); 3] = [
     (3072, "38e7eb329f99abededdfa93f17214a76c1e085f2bfb0e017e5565428a693819b"),
     (4096, "481549a77b330ea3aa9ecbf84f5b6a4193970c47ffcd7dbee2a3a56a51d62e04"),
 ];
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
 
 /// The derivation is frozen: the same seed gives the same modulus, forever.
 #[test]

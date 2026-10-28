@@ -2,9 +2,15 @@
 #   fpr      - GnuPG colon-format record type for a fingerprint
 #   iif/oif  - nftables input-/output-interface match keywords (nix/live/system.nix)
 #   SME/TME  - AMD Secure Memory Encryption, Intel Total Memory Encryption
+#   passin   - openssl's option naming where a passphrase comes from
 [default.extend-words]
 fpr = "fpr"
 iif = "iif"
 oif = "oif"
 SME = "SME"
 TME = "TME"
+passin = "passin"
+
+# Web Key Directory hashes: z-base-32 of SHA-1, random letters by construction
+[default]
+extend-ignore-re = ["\"[ybndrfg8ejkmcpqxot1uwisza345h769]{32}\""]

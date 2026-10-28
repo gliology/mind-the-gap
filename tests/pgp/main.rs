@@ -1,5 +1,6 @@
-use mind_the_gap::pgp::{CertificateKind, Scheme, SeededSmartcard, SharedKey, VerificationKind};
-use mind_the_gap::seed::{Algorithm, Seed256};
+use mind_the_gap::pgp::{CertificateKind, SeededSmartcard, VerificationKind};
+use mind_the_gap::role::KeyRole;
+use mind_the_gap::seed::{Algorithm, CardSerial, KeyPath, Seed256, Seeds};
 
 use sequoia_openpgp::crypto::Signer;
 use sequoia_openpgp::crypto::mpi;
@@ -13,16 +14,51 @@ use sequoia_openpgp::{Cert, Packet};
 
 use std::time::{Duration, SystemTime};
 
+#[path = "../common/frozen.rs"]
+mod frozen;
 mod golden;
+#[path = "../common/hex.rs"]
+mod hex;
 
 const SEED_A: Seed256 = [1u8; 32];
 const SEED_B: Seed256 = [2u8; 32];
 
-fn builder(seed: &Seed256, name: &str, email: &str) -> SeededSmartcard {
-    SeededSmartcard::new(seed, None, name.into())
+/// A builder on one seed in both roles, along `path`
+fn on_path(seed: &Seed256, path: KeyPath, name: &str, email: &str) -> SeededSmartcard {
+    SeededSmartcard::new(Seeds::one(seed), path, name.into())
         .add_email(email)
         .unwrap()
-        .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+}
+
+/// A builder on one seed in both roles, without a subkey id or a date
+fn builder(seed: &Seed256, name: &str, email: &str) -> SeededSmartcard {
+    on_path(seed, KeyPath::default(), name, email)
+}
+
+/// Alice's builder on a device, in a generation where one is given
+fn device(id: &str, date: Option<&str>) -> SeededSmartcard {
+    on_path(
+        &SEED_A,
+        KeyPath {
+            subkey: Some(id.into()),
+            date: date.map(|date| date.parse().unwrap()),
+        },
+        "Alice",
+        "alice@example.com",
+    )
+}
+
+/// The fingerprint of the subkey serving `role`
+fn subkey(cert: &Cert, role: KeyRole) -> Option<sequoia_openpgp::Fingerprint> {
+    let policy = StandardPolicy::new();
+    let valid = cert
+        .with_policy(&policy, Some(SystemTime::UNIX_EPOCH + Duration::from_secs(4_000_000_000)))
+        .unwrap();
+    valid
+        .keys()
+        .subkeys()
+        .find(|key| key.key_flags().is_some_and(|flags| role.matches(&flags)))
+        .map(|key| key.key().fingerprint())
 }
 
 // --- Cert structure tests ---
@@ -117,7 +153,7 @@ fn certify_valid_under_policy() {
 #[test]
 fn export_has_secret_keys() {
     let cert = builder(&SEED_A, "Alice", "alice@example.com")
-        .export()
+        .export(None)
         .unwrap();
     assert!(cert.keys().secret().count() > 0);
 }
@@ -125,7 +161,7 @@ fn export_has_secret_keys() {
 #[test]
 fn export_primary_matches_certify() {
     let exported = builder(&SEED_A, "Alice", "alice@example.com")
-        .export()
+        .export(None)
         .unwrap();
     let certified = builder(&SEED_A, "Alice", "alice@example.com")
         .certify(CertificateKind::default())
@@ -304,8 +340,8 @@ fn rsa_certificate_is_rsa_throughout() {
 /// The legacy scheme refuses RSA like any other algorithm it never derived.
 #[test]
 fn legacy_scheme_refuses_rsa() {
-    let result = SeededSmartcard::with_scheme(&SEED_A, None, "Alice".into(), Scheme::Legacy)
-        .with_algorithm(Algorithm::Rsa2048);
+    let result =
+        SeededSmartcard::legacy(&SEED_A, None, "Alice".into()).with_algorithm(Algorithm::Rsa2048);
     assert!(result.is_err(), "the legacy scheme accepted RSA");
 }
 
@@ -336,7 +372,7 @@ fn curves_share_no_keys() {
 /// The legacy scheme predates the algorithm segment and only ever produced Curve25519 keys.
 #[test]
 fn legacy_scheme_refuses_p256() {
-    let err = match SeededSmartcard::with_scheme(&SEED_A, None, "Alice".into(), Scheme::Legacy)
+    let err = match SeededSmartcard::legacy(&SEED_A, None, "Alice".into())
         .with_algorithm(Algorithm::P256)
     {
         Ok(_) => panic!("the legacy scheme accepted P-256"),
@@ -345,7 +381,7 @@ fn legacy_scheme_refuses_p256() {
     assert!(err.to_string().contains("--legacy"), "error does not name the cause: {err}");
 
     // Asking for the algorithm it already derives is not an error
-    SeededSmartcard::with_scheme(&SEED_A, None, "Alice".into(), Scheme::Legacy)
+    SeededSmartcard::legacy(&SEED_A, None, "Alice".into())
         .with_algorithm(Algorithm::Curve25519)
         .unwrap();
 }
@@ -354,11 +390,12 @@ fn legacy_scheme_refuses_p256() {
 /// labels no OpenPGP card asked for.
 #[test]
 fn p384_is_refused() {
-    let err =
-        match SeededSmartcard::new(&SEED_A, None, "Alice".into()).with_algorithm(Algorithm::P384) {
-            Ok(_) => panic!("the OpenPGP backend accepted P-384"),
-            Err(err) => err,
-        };
+    let err = match SeededSmartcard::new(Seeds::one(&SEED_A), KeyPath::default(), "Alice".into())
+        .with_algorithm(Algorithm::P384)
+    {
+        Ok(_) => panic!("the OpenPGP backend accepted P-384"),
+        Err(err) => err,
+    };
     assert!(err.to_string().contains("PIV-only"), "error does not name the cause: {err}");
 }
 
@@ -366,7 +403,7 @@ fn p384_is_refused() {
 
 #[test]
 fn revoke_packet_is_key_revocation() {
-    use mind_the_gap::pgp::RevocationKind;
+    use mind_the_gap::revocation::RevocationKind;
     use sequoia_openpgp::parse::Parse;
 
     let raw = builder(&SEED_A, "Alice", "alice@example.com")
@@ -396,10 +433,12 @@ fn certify_armor_round_trips() {
 
 // --- Cryptographic sign + verify ---
 
+// The exported key is used as a recipient would use it, through sequoia's own signer
+#[allow(clippy::disallowed_methods)]
 #[test]
 fn export_signing_key_can_sign_and_verify() {
     let cert = builder(&SEED_A, "Alice", "alice@example.com")
-        .export()
+        .export(None)
         .unwrap();
     let policy = StandardPolicy::new();
     let vc = cert.with_policy(&policy, None).unwrap();
@@ -514,130 +553,187 @@ fn gpg_accepts_exported_cert() {
     }
 }
 
-/// `--shared` makes the named subkey fall back to the derivation used when no subkey id is
-/// given, so the same key lands on every card, while the rest stay card specific.
+// --- The two seeds and the key path ---
+
+/// A device's signing and authentication subkeys are its own, the decryption subkey the
+/// identity's, on every card alike.
 ///
-/// This is what makes multi-card OpenPGP workable: a client encrypts to exactly *one* of a
-/// certificate's encryption subkeys, so per-card decryption keys mean a message can only be
-/// opened on whichever card the sender happened to pick.
+/// This is what makes several cards of one identity workable: a client encrypts to exactly
+/// *one* of a certificate's encryption subkeys, so per-device decryption keys would mean a
+/// message opens only on whichever card the sender happened to pick.
 #[test]
-fn shared_subkeys_ignore_the_subkey_id() {
-    let fingerprints = |card: SeededSmartcard| {
-        let cert = card.certify(CertificateKind::default()).unwrap();
-        let policy = StandardPolicy::new();
-        let valid = cert.with_policy(&policy, None).unwrap();
+fn devices_share_the_decryption_subkey() {
+    let cert = |card: SeededSmartcard| card.certify(CertificateKind::default()).unwrap();
+    let laptop = cert(device("laptop", None));
+    let desktop = cert(device("desktop", None));
+    let plain = cert(builder(&SEED_A, "Alice", "alice@example.com"));
 
-        let find = |want_encryption: bool| {
-            valid
-                .keys()
-                .subkeys()
-                .find(|key| {
-                    key.key_flags().is_some_and(|flags| {
-                        (flags.for_transport_encryption() || flags.for_storage_encryption())
-                            == want_encryption
-                            && (want_encryption || flags.for_signing())
-                    })
-                })
-                .map(|key| key.key().fingerprint())
-                .unwrap()
-        };
-
-        (find(true), find(false))
-    };
-
-    let card = |id: &str| {
-        SeededSmartcard::new(&SEED_A, Some(id.to_string()), "Alice".into())
-            .add_email("alice@example.com")
-            .unwrap()
-            .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
-            .with_shared(vec![SharedKey::Decryption])
-    };
-
-    let (shared_encryption, shared_signing) = fingerprints(card("laptop"));
-    let (other_encryption, other_signing) = fingerprints(card("desktop"));
-    let (plain_encryption, plain_signing) =
-        fingerprints(builder(&SEED_A, "Alice", "alice@example.com"));
-
-    // The shared subkey is the one a card with no subkey id would have had ...
-    assert_eq!(shared_encryption, plain_encryption);
-    assert_eq!(shared_encryption, other_encryption);
-
-    // ... while everything not named stays scoped to its own card
-    assert_ne!(shared_signing, other_signing);
-    assert_ne!(shared_signing, plain_signing);
-}
-
-/// The subkey id rides on the subkey binding signature, not on a user id.
-///
-/// A user id is bound to the primary key, and the primary is identical on every card, so a
-/// comment there would label one shared identity with one card's name -- and merging two
-/// cards' certificates would leave two user ids for the same person. The binding signature is
-/// the only part that is genuinely per card.
-#[test]
-fn subkey_id_is_recorded_on_the_binding() {
-    const NOTATION: &str = "subkey@mind-the-gap.gli.al";
-
-    let cert = SeededSmartcard::new(&SEED_A, Some("laptop".to_string()), "Alice".into())
-        .add_email("alice@example.com")
-        .unwrap()
-        .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
-        .certify(CertificateKind::default())
-        .unwrap();
-
-    let policy = StandardPolicy::new();
-    let valid = cert.with_policy(&policy, None).unwrap();
-
-    for subkey in valid.keys().subkeys() {
-        let found = subkey
-            .binding_signature()
-            .notation(NOTATION)
-            .any(|value| value == b"mtg1:laptop");
-
-        assert!(found, "{} carries no card notation", subkey.key().fingerprint());
+    assert_eq!(laptop.fingerprint(), desktop.fingerprint(), "one identity, one primary");
+    assert_eq!(subkey(&laptop, KeyRole::Decryption), subkey(&desktop, KeyRole::Decryption));
+    assert_eq!(subkey(&laptop, KeyRole::Decryption), subkey(&plain, KeyRole::Decryption));
+    for role in [KeyRole::Signature, KeyRole::Authentication] {
+        assert_ne!(subkey(&laptop, role), subkey(&desktop, role), "{role}");
+        assert_ne!(subkey(&laptop, role), subkey(&plain, role), "{role}");
     }
-
-    // Exactly one identity, however many cards are merged together later
-    assert_eq!(cert.userids().count(), 1);
 }
 
-/// Without a subkey id there is no card to name, so no notation is added.
+/// A date is a generation: every subkey moves, the decryption subkey too, and is created at
+/// the date's midnight, while the primary key -- the identity -- stays as it is
 #[test]
-fn bindings_carry_no_notation_without_a_subkey_id() {
-    let cert = builder(&SEED_A, "Alice", "alice@example.com")
+fn a_date_moves_every_subkey_but_not_the_identity() {
+    let undated = device("laptop", None)
+        .certify(CertificateKind::default())
+        .unwrap();
+    let dated = device("laptop", Some("2026-05-01"))
         .certify(CertificateKind::default())
         .unwrap();
 
-    let policy = StandardPolicy::new();
-    let valid = cert.with_policy(&policy, None).unwrap();
-
-    for subkey in valid.keys().subkeys() {
+    assert_eq!(undated.fingerprint(), dated.fingerprint());
+    assert_eq!(
+        dated.primary_key().key().creation_time(),
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1)
+    );
+    for role in KeyRole::ALL {
+        assert_ne!(subkey(&undated, role), subkey(&dated, role), "{role} kept its key");
+    }
+    for key in dated.keys().subkeys() {
         assert_eq!(
-            subkey
-                .binding_signature()
-                .notation("subkey@mind-the-gap.gli.al")
-                .count(),
-            0
+            key.key().creation_time(),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_777_593_600),
+            "a subkey is not created at its generation's midnight"
         );
     }
 }
 
-/// A lost card can be retired without taking the identity with it.
+/// The identity's own date is the primary key's creation time, and only that: it is part of
+/// the primary's fingerprint, and of no subkey's
+#[test]
+fn the_identity_date_moves_the_primary_alone() {
+    // A generation after the identity, as generations are: a subkey created before its
+    // primary is no valid subkey
+    let later = SystemTime::UNIX_EPOCH + Duration::from_secs(1_735_689_600);
+    let plain = device("laptop", Some("2026-05-01"))
+        .certify(CertificateKind::default())
+        .unwrap();
+    let dated = device("laptop", Some("2026-05-01"))
+        .with_identity_time(later)
+        .certify(CertificateKind::default())
+        .unwrap();
+    assert_ne!(plain.fingerprint(), dated.fingerprint());
+    assert_eq!(dated.primary_key().key().creation_time(), later);
+    for role in KeyRole::ALL {
+        assert_eq!(subkey(&plain, role), subkey(&dated, role), "{role}");
+    }
+}
+
+/// The card seed derives no key of the identity's: whoever administers a card, the same key
+/// seed gives the same certificate
+#[test]
+fn keys_come_from_the_key_seed_alone() {
+    let administered = SeededSmartcard::new(
+        Seeds { card: Some(&SEED_A), key: Some(&SEED_B) },
+        KeyPath::default(),
+        "Bob".into(),
+    )
+    .add_email("bob@example.com")
+    .unwrap()
+    .certify(CertificateKind::default())
+    .unwrap();
+    let own = builder(&SEED_B, "Bob", "bob@example.com")
+        .certify(CertificateKind::default())
+        .unwrap();
+    assert_eq!(administered.fingerprint(), own.fingerprint());
+    for role in KeyRole::ALL {
+        assert_eq!(subkey(&administered, role), subkey(&own, role), "{role}");
+    }
+}
+
+/// The card identifier is the card seed's and the card's: no key seed and no key path has a
+/// part in it, and another card gets another one
+#[test]
+fn the_card_identifier_comes_from_the_card_seed_and_the_serial() {
+    let serial = CardSerial::pgp(0x0006, 0x1234_5678);
+    let identifier = |card: Option<&Seed256>, key: Option<&Seed256>, path: KeyPath| {
+        SeededSmartcard::new(Seeds { card, key }, path, String::new())
+            .card_identifier(&serial)
+            .unwrap()
+            .unwrap()
+    };
+    let own = identifier(Some(&SEED_A), Some(&SEED_A), KeyPath::default());
+    assert!(own.starts_with("mtg1:"), "{own}");
+    assert_eq!(own, identifier(Some(&SEED_A), Some(&SEED_B), KeyPath::default()));
+    assert_eq!(
+        own,
+        identifier(Some(&SEED_A), None, KeyPath { subkey: Some("laptop".into()), date: None })
+    );
+    assert_ne!(own, identifier(Some(&SEED_B), None, KeyPath::default()));
+    let other = SeededSmartcard::new(
+        Seeds { card: Some(&SEED_A), key: None },
+        KeyPath::default(),
+        String::new(),
+    )
+    .card_identifier(&CardSerial::pgp(0x0006, 0x1234_5679))
+    .unwrap()
+    .unwrap();
+    assert_ne!(own, other);
+
+    // Without the card seed there is no identifier to tell
+    let keys_only = SeededSmartcard::new(
+        Seeds { card: None, key: Some(&SEED_A) },
+        KeyPath::default(),
+        String::new(),
+    );
+    assert!(keys_only.card_identifier(&serial).is_err());
+}
+
+/// `--key` chooses the subkeys a certificate carries, each the very subkey the whole set has
+#[test]
+fn chosen_keys_are_the_certificate_s_subkeys() {
+    let full = device("laptop", None)
+        .certify(CertificateKind::default())
+        .unwrap();
+    let chosen = device("laptop", None)
+        .with_keys(&[KeyRole::Decryption, KeyRole::Signature])
+        .unwrap()
+        .certify(CertificateKind::default())
+        .unwrap();
+    assert_eq!(chosen.keys().subkeys().count(), 2);
+    assert_eq!(subkey(&chosen, KeyRole::Signature), subkey(&full, KeyRole::Signature));
+    assert_eq!(subkey(&chosen, KeyRole::Decryption), subkey(&full, KeyRole::Decryption));
+    assert_eq!(subkey(&chosen, KeyRole::Authentication), None);
+    assert!(device("laptop", None).with_keys(&[]).is_err());
+}
+
+/// The device is no part of the certificate: one identity carries every device's subkeys,
+/// and nothing published says which subkey is on which card
+#[test]
+fn bindings_carry_no_notation() {
+    let cert = device("laptop", None)
+        .certify(CertificateKind::default())
+        .unwrap();
+
+    let policy = StandardPolicy::new();
+    let valid = cert.with_policy(&policy, None).unwrap();
+
+    for subkey in valid.keys().subkeys() {
+        assert_eq!(subkey.binding_signature().notation_data().count(), 0);
+    }
+    assert_eq!(cert.userids().count(), 1);
+}
+
+/// A lost card can be retired without taking the identity with it, or the decryption key
+/// every other card still holds.
 ///
-/// This is what provisioning each card under its own subkey id is for. The primary is
+/// This is what provisioning each device under its own subkey id is for. The primary is
 /// re-derivable from the seed, and a subkey is revoked by its primary, so the card need not be
 /// present -- which is the whole point when it has been lost.
 #[test]
-fn subkeys_can_be_revoked_without_the_identity() {
-    use mind_the_gap::pgp::RevocationKind;
-    use sequoia_openpgp::parse::Parse;
+fn a_device_is_revoked_without_the_identity_or_the_decryption_key() {
+    use mind_the_gap::revocation::RevocationKind;
+    use sequoia_openpgp::cert::amalgamation::ValidAmalgamation;
     use sequoia_openpgp::types::RevocationStatus;
 
-    let card = SeededSmartcard::new(&SEED_A, Some("laptop".to_string()), "Alice".into())
-        .add_email("alice@example.com")
-        .unwrap()
-        .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
-
-    let raw = card
+    let raw = device("laptop", None)
         .revoke(RevocationKind::Subkeys, 1, "laptop lost")
         .unwrap();
     let revoked = Cert::from_bytes(&raw).unwrap();
@@ -647,67 +743,43 @@ fn subkeys_can_be_revoked_without_the_identity() {
     // The identity survives ...
     assert!(
         matches!(revoked.revocation_status(&policy, None), RevocationStatus::NotAsFarAsWeKnow),
-        "revoking this card's subkeys also retired the identity",
+        "revoking this device's subkeys also retired the identity",
     );
 
-    // ... while every one of this card's subkeys is retired
-    let mut subkeys = 0;
-    for subkey in revoked.keys().subkeys() {
-        subkeys += 1;
-        assert!(
-            !matches!(subkey.revocation_status(&policy, None), RevocationStatus::NotAsFarAsWeKnow),
-            "{} was not revoked",
-            subkey.key().fingerprint(),
-        );
-    }
-    assert_eq!(subkeys, 3);
-}
-
-/// Revoking one card's subkeys leaves a shared subkey in service.
-///
-/// A subkey derived without the subkey id is byte-identical on every card; revoking it while
-/// retiring one card would retire it fleet-wide, which is exactly what `--kind subkeys`
-/// promises not to do.
-#[test]
-fn shared_subkeys_survive_a_card_revocation() {
-    use mind_the_gap::pgp::{RevocationKind, SharedKey};
-    use sequoia_openpgp::cert::amalgamation::ValidAmalgamation;
-    use sequoia_openpgp::parse::Parse;
-    use sequoia_openpgp::types::RevocationStatus;
-
-    let card = || {
-        SeededSmartcard::new(&SEED_A, Some("laptop".to_string()), "Alice".into())
-            .add_email("alice@example.com")
-            .unwrap()
-            .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
-            .with_shared(vec![SharedKey::Decryption])
-    };
-
-    let raw = card()
-        .revoke(RevocationKind::Subkeys, 1, "laptop lost")
-        .unwrap();
-    let revoked = Cert::from_bytes(&raw).unwrap();
-
-    let policy = StandardPolicy::new();
+    // ... and so does the decryption subkey, while the device's own are retired
     let valid = revoked.with_policy(&policy, None).unwrap();
+    let mut retired = 0;
     for subkey in valid.keys().subkeys() {
         let flags = subkey.key_flags().unwrap();
         let untouched = matches!(subkey.revocation_status(), RevocationStatus::NotAsFarAsWeKnow);
-
-        if flags.for_transport_encryption() || flags.for_storage_encryption() {
-            assert!(untouched, "the fleet-wide decryption subkey was revoked");
+        if KeyRole::Decryption.matches(&flags) {
+            assert!(untouched, "the identity's decryption subkey was revoked with one device");
         } else {
             assert!(!untouched, "{} was not revoked", subkey.key().fingerprint());
+            retired += 1;
         }
     }
+    assert_eq!(retired, 2);
+}
 
-    // With every subkey shared there is nothing left to revoke for this card alone
-    let all = card()
-        .with_shared(vec![
-            SharedKey::Signing,
-            SharedKey::Decryption,
-            SharedKey::Authentication,
-        ])
-        .revoke(RevocationKind::Subkeys, 1, "laptop lost");
-    assert!(all.is_err());
+/// The decryption subkey is retired on its own, by choosing it alone: a rotation of the
+/// identity's decryption key, not of a device
+#[test]
+fn the_decryption_subkey_is_revoked_when_chosen_alone() {
+    use mind_the_gap::revocation::RevocationKind;
+    use sequoia_openpgp::types::RevocationStatus;
+
+    let raw = device("laptop", Some("2026-05-01"))
+        .with_keys(&[KeyRole::Decryption])
+        .unwrap()
+        .revoke(RevocationKind::Subkeys, 1, "superseded")
+        .unwrap();
+    let revoked = Cert::from_bytes(&raw).unwrap();
+    let policy = StandardPolicy::new();
+    let subkeys: Vec<_> = revoked.keys().subkeys().collect();
+    assert_eq!(subkeys.len(), 1);
+    assert!(!matches!(
+        subkeys[0].revocation_status(&policy, None),
+        RevocationStatus::NotAsFarAsWeKnow
+    ));
 }

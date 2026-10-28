@@ -1,0 +1,10 @@
+# Every OpenPGP signature goes through src/pgp/signer.rs, which signs P-256 with RFC 6979
+# nonces and makes each signature twice, compares and verifies it. sequoia's KeyPair signs ECDSA
+# with a random nonce, so reaching it any other way would quietly make P-256 output differ
+# on every run.
+disallowed-methods = [
+    { path = "sequoia_openpgp::packet::Key::into_keypair", reason = "sign through pgp::signer::DerivedSigner" },
+    { path = "sequoia_openpgp::packet::key::Key4::into_keypair", reason = "sign through pgp::signer::DerivedSigner" },
+    { path = "sequoia_openpgp::packet::key::Key6::into_keypair", reason = "sign through pgp::signer::DerivedSigner" },
+    { path = "sequoia_openpgp::crypto::KeyPair::new", reason = "sign through pgp::signer::DerivedSigner" },
+]

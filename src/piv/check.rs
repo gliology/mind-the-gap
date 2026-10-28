@@ -1,6 +1,9 @@
 //! Comparing a card with the derived chain, by metadata or by a signature challenge.
 
+use super::ownership::{CCC_OBJECT, CHUID_OBJECT, Facts};
 use super::{ManagementKeyArg, SeededSmartcard, SlotRole, card::open_token};
+use crate::ownership::Ownership;
+use crate::seed::Algorithm;
 use crate::target::CardTarget;
 
 use anyhow::{Result, anyhow, bail};
@@ -13,6 +16,8 @@ use yubikey::{
 
 use cms::content_info::ContentInfo;
 
+use x509_cert::Certificate as X509Certificate;
+
 use p256::ecdsa::DerSignature;
 use p256::ecdsa::signature::hazmat::PrehashVerifier;
 
@@ -21,7 +26,7 @@ use rsa::pkcs8::DecodePublicKey;
 use rsa::sha2::Sha256 as RsaSha256;
 use rsa::traits::PublicKeyParts;
 
-use der::Encode;
+use der::{Decode, Encode};
 
 use sha2::{Digest, Sha256};
 use spki::SubjectPublicKeyInfoOwned;
@@ -102,56 +107,58 @@ fn verify_challenge(
     })
 }
 
+/// A card being compared with what the seeds derive, slot by slot, and what disagrees so far
+///
+/// A card without GET METADATA warns about what it cannot show once, not per slot.
+struct Comparison<'a> {
+    token: &'a mut YubiKey,
+    mismatches: &'a mut Vec<String>,
+    /// Whether the slot policies were said to be unreadable
+    policies_warned: bool,
+    /// Whether the signature challenge was said to need the pin
+    pin_warned: bool,
+}
+
+impl<'a> Comparison<'a> {
+    fn new(token: &'a mut YubiKey, mismatches: &'a mut Vec<String>) -> Self {
+        Comparison { token, mismatches, policies_warned: false, pin_warned: false }
+    }
+}
+
 impl SeededSmartcard {
-    /// Check that an available PIV card matches the derived chain
+    /// Check that an available PIV card holds what the seeds derive
     ///
-    /// Every slot is inspected before anything is reported. A card provisioned from the wrong
-    /// seed, or with the wrong `--date`, `--subkey` or DN flags, disagrees in *all* of them,
-    /// and failing on the first would hide how far the divergence actually goes.
+    /// With the card seed, what administers the card: whose card it is, its management key,
+    /// identifiers and 9E key. With the key seed, the chosen keys and their certificates.
+    /// Everything is inspected before anything is reported: a card provisioned from the wrong
+    /// seed, or with the wrong `--date`, `--subkey` or names, disagrees in *all* of it, and
+    /// failing on the first would hide how far the divergence goes.
     ///
     /// Slot keys are compared through `GET METADATA`. A card without it (YubiKey before
     /// 5.3) proves each key by signing a random challenge instead, which needs `--pin` for
     /// every slot whose pin policy is not `never`; its slot policies cannot be read at all.
-    pub fn check(&self, target: Option<CardTarget>) -> Result<()> {
-        let chain = self.generate_chain()?;
+    pub(super) fn check(&self, target: Option<CardTarget>) -> Result<()> {
+        let chain = self
+            .seeds
+            .has_key()
+            .then(|| self.generate_chain())
+            .transpose()?;
         let mut token = open_token(target)?;
+        let facts = Facts::read(&mut token);
 
-        // Card has to be under our management key, in whatever algorithm it holds one: the
-        // derivation for each is fixed, so the card's answer decides which to compare with
-        let algorithm = MgmAlgorithmId::current(&mut token)?;
-        let requested = self.management_algorithm(&token);
-        if self.management_algorithm != ManagementKeyArg::Auto && algorithm != requested {
-            log::warn!(
-                "The card holds a {algorithm:?} management key, not the requested {requested:?}"
-            );
-        }
+        // Collected rather than raised, so one bad slot does not mask the others. Note that
+        // `?` is still used for failures of *our* side -- a chain that will not encode is a
+        // bug here, not a disagreement with the card.
+        let mut mismatches: Vec<String> = Vec::new();
 
-        // The management key's touch policy, where the card can report it. Advisory like the
-        // slot policies below.
-        let expected_touch = if self.policy.management_touch() {
-            TouchPolicy::Always
-        } else {
-            TouchPolicy::Never
-        };
-        if let Ok(metadata) =
-            piv::metadata(&mut token, SlotId::Management(ManagementSlotId::Management))
-            && let Some((_, touch)) = metadata.policy
-            && touch != expected_touch
-        {
-            log::warn!(
-                "Policy mismatch in management key: card touch={touch:?}, expected={expected_touch:?}"
-            );
-        }
-
-        // The prompt goes to stderr: stdout may be carrying PEM or a report, and a buried
-        // prompt is a missed touch and a failed run
-        log::info!("Verifying smart card {algorithm:?} management key");
-        if self.policy.management_touch() {
-            eprintln!("[Please touch device to authenticate management access!]");
-        }
-        token.authenticate(&self.management_key(algorithm)?)?;
-        if self.policy.management_touch() {
-            eprintln!();
+        if self.seeds.has_card() {
+            let ownership = self.ownership(&facts)?;
+            println!("Card seed: {ownership}");
+            if ownership == Ownership::Owned {
+                self.check_card_side(&mut token, &facts, &mut mismatches)?;
+            } else {
+                mismatches.push(format!("the card is {ownership}"));
+            }
         }
 
         // The supplied user pin, if any, has to open the card. A wrong pin consumes one of
@@ -161,94 +168,125 @@ impl SeededSmartcard {
             token.verify_pin(pin.as_bytes())?;
         }
 
-        // Collected rather than raised, so one bad slot does not mask the others. Note that
-        // `?` is still used for failures of *our* side -- a chain that will not encode is a
-        // bug here, not a disagreement with the card.
-        let mut mismatches: Vec<String> = Vec::new();
+        if let Some(chain) = &chain {
+            self.check_key_side(&mut token, chain, &mut mismatches)?;
+        }
 
-        // A card without GET METADATA warns about what it cannot show once, not per slot
-        let mut policies_warned = false;
-        let mut pin_warned = false;
+        // Tidy up, but never at the cost of the report: a failure to drop the management key
+        // session must not swallow the mismatches we came here to show
+        if self.seeds.has_card()
+            && let Err(err) = token.deauthenticate()
+        {
+            log::warn!("Could not deauthenticate management key: {err}");
+        }
 
-        for (slot, expected) in &chain.leaves {
-            match piv::metadata(&mut token, *slot) {
-                Err(CardError::NotSupported) => {
-                    if !policies_warned {
-                        log::warn!(
-                            "Card has no GET METADATA: slot pin and touch policies are not \
-                             verifiable on this card, slot keys are proven by signing"
-                        );
-                        policies_warned = true;
-                    }
+        crate::common::report_mismatches("card", &mismatches)
+    }
 
-                    let spki = expected.tbs_certificate().subject_public_key_info();
-                    if let Some(problem) =
-                        self.challenge_slot(&mut token, *slot, spki, &mut pin_warned)?
-                    {
-                        mismatches.push(problem);
-                    }
+    /// Compare what the card seed derives for this card: its management key, identifiers and
+    /// card authentication key
+    fn check_card_side(
+        &self,
+        token: &mut yubikey::YubiKey,
+        facts: &Facts,
+        mismatches: &mut Vec<String>,
+    ) -> Result<()> {
+        let serial = &facts.serial;
+
+        // Card has to be under our management key, in whatever algorithm it holds one: the
+        // derivation for each is fixed, so the card's answer decides which to compare with
+        let algorithm = MgmAlgorithmId::current(token)?;
+        let requested = self.management_algorithm(token);
+        if self.management_algorithm != ManagementKeyArg::Auto && algorithm != requested {
+            log::warn!(
+                "The card holds a {algorithm:?} management key, not the requested {requested:?}"
+            );
+        }
+
+        // The management key's touch policy, where the card can report it. Advisory like the
+        // slot policies.
+        let expected_touch = if self.policy.management_touch() {
+            TouchPolicy::Always
+        } else {
+            TouchPolicy::Never
+        };
+        if let Ok(metadata) = piv::metadata(token, SlotId::Management(ManagementSlotId::Management))
+            && let Some((_, touch)) = metadata.policy
+            && touch != expected_touch
+        {
+            log::warn!(
+                "Policy mismatch in management key: card touch={touch:?}, expected={expected_touch:?}"
+            );
+        }
+
+        self.authenticate(token, serial)?;
+
+        // Read as objects rather than through `ChuId` and `CccId`, which slice a short one
+        // and panic; the derived content is the object's start, as those types read it
+        let (chuid, ccc) = (self.chuid(serial)?, self.ccc(serial)?);
+        for (name, object, derived) in [
+            ("CHUID", CHUID_OBJECT, &chuid[..]),
+            ("CCC", CCC_OBJECT, &ccc[..]),
+        ] {
+            match token.fetch_object(object) {
+                Ok(read) if read.get(..derived.len()) == Some(derived) => {
+                    log::info!("{name} matches")
                 }
-                Err(err) => mismatches.push(format!("{slot:?} slot: metadata unreadable: {err}")),
-                Ok(metadata) => {
-                    // Key material has to match what we would derive
-                    let want = expected
-                        .tbs_certificate()
-                        .subject_public_key_info()
-                        .to_der()?;
-
-                    match metadata.public.as_ref().map(|key| key.to_der()) {
-                        None => mismatches.push(format!("{slot:?} slot: no key on card")),
-                        Some(Err(err)) => mismatches
-                            .push(format!("{slot:?} slot: on-card public key is malformed: {err}")),
-                        Some(Ok(got)) if got != want => mismatches
-                            .push(format!("{slot:?} slot: public key is not the derived one")),
-                        Some(Ok(_)) => {}
-                    }
-
-                    // Policies are advisory: warn rather than fail, a card provisioned under
-                    // another --policy still holds the right keys
-                    if let Some(policy) = metadata.policy {
-                        let expected_policy = self.policies_for(*slot);
-                        if policy != expected_policy {
-                            log::warn!(
-                                "Policy mismatch in {:?} slot: card={:?}, expected={:?}",
-                                slot,
-                                policy,
-                                expected_policy
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Certificate has to be byte identical
-            let want = Sha256::digest(expected.to_der()?);
-            match CardCertificate::read(&mut token, *slot) {
-                Err(err) => {
-                    mismatches.push(format!("{slot:?} slot: certificate unreadable: {err}"))
-                }
-                Ok(card) => match card.cert.to_der() {
-                    Err(err) => mismatches
-                        .push(format!("{slot:?} slot: on-card certificate is malformed: {err}")),
-                    Ok(der) => {
-                        let got = Sha256::digest(der);
-                        if got != want {
-                            mismatches.push(format!(
-                                "{slot:?} slot: certificate mismatch: card={got:x}, derived={want:x}"
-                            ));
-                        } else {
-                            log::info!("{:?} slot matches: {:x}", slot, got);
-                        }
-                    }
-                },
+                Ok(_) => mismatches.push(format!("{name}: not the derived one")),
+                Err(err) => mismatches.push(format!("{name}: unreadable: {err}")),
             }
         }
 
-        // Advisory for the same reason `upload` only warns when it cannot write it: msroots is
-        // Windows-specific, and a card that never received it is not thereby wrong
-        if self.msroots {
+        // The 9E certificate, derived for the algorithm the card holds it in
+        match facts
+            .card_authentication
+            .as_deref()
+            .map(X509Certificate::from_der)
+        {
+            None => mismatches.push("CardAuthentication slot: no certificate".into()),
+            Some(Err(err)) => {
+                mismatches.push(format!("CardAuthentication slot: malformed certificate: {err}"))
+            }
+            Some(Ok(cert)) => {
+                let algorithm = super::algorithms::algorithm_of(
+                    cert.tbs_certificate().subject_public_key_info(),
+                )
+                .unwrap_or(self.algorithm);
+                let expected = self.card_authentication_certificate(algorithm, serial)?;
+                if cert.to_der()? != expected.to_der()? {
+                    mismatches
+                        .push("CardAuthentication slot: certificate is not the derived one".into());
+                }
+                if algorithm != self.algorithm {
+                    log::warn!(
+                        "The card authentication key is {algorithm}, not the requested {}",
+                        self.algorithm
+                    );
+                }
+                let mut card = Comparison::new(token, mismatches);
+                self.check_slot(&mut card, SlotId::CardAuthentication, &expected, algorithm)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Compare the chosen keys and their certificates with what the key seed derives
+    fn check_key_side(
+        &self,
+        token: &mut yubikey::YubiKey,
+        chain: &super::CertChain,
+        mismatches: &mut Vec<String>,
+    ) -> Result<()> {
+        let mut card = Comparison::new(token, mismatches);
+        for (slot, expected) in &chain.leaves {
+            self.check_slot(&mut card, *slot, expected, self.algorithm)?;
+        }
+
+        // Advisory for the same reason an upload only warns when it cannot write it: msroots
+        // is Windows-specific, and a card that never received it is not thereby wrong
+        if self.msroots && self.whole_identity() {
             let expected = ContentInfo::try_from(chain.cas())?.to_der()?;
-            match MsRoots::read(&mut token) {
+            match MsRoots::read(token) {
                 Ok(Some(roots)) if AsRef::<[u8]>::as_ref(&roots) == expected.as_slice() => {
                     log::info!("Certificate authorities in msroots match")
                 }
@@ -257,14 +295,90 @@ impl SeededSmartcard {
                 Err(err) => log::warn!("Could not read msroots: {err}"),
             }
         }
+        Ok(())
+    }
 
-        // Tidy up, but never at the cost of the report: a failure to drop the management key
-        // session must not swallow the mismatches we came here to show
-        if let Err(err) = token.deauthenticate() {
-            log::warn!("Could not deauthenticate management key: {err}");
+    /// Compare one slot's key, policy and certificate with `expected`
+    fn check_slot(
+        &self,
+        card: &mut Comparison<'_>,
+        slot: SlotId,
+        expected: &X509Certificate,
+        algorithm: Algorithm,
+    ) -> Result<()> {
+        match piv::metadata(card.token, slot) {
+            Err(CardError::NotSupported) => {
+                if !card.policies_warned {
+                    log::warn!(
+                        "Card has no GET METADATA: slot pin and touch policies are not \
+                         verifiable on this card, slot keys are proven by signing"
+                    );
+                    card.policies_warned = true;
+                }
+
+                let spki = expected.tbs_certificate().subject_public_key_info();
+                if let Some(problem) = self.challenge_slot(card, slot, spki, algorithm)? {
+                    card.mismatches.push(problem);
+                }
+            }
+            Err(err) => card
+                .mismatches
+                .push(format!("{slot:?} slot: metadata unreadable: {err}")),
+            Ok(metadata) => {
+                // Key material has to match what we would derive
+                let want = expected
+                    .tbs_certificate()
+                    .subject_public_key_info()
+                    .to_der()?;
+
+                let mismatches = &mut *card.mismatches;
+                match metadata.public.as_ref().map(|key| key.to_der()) {
+                    None => mismatches.push(format!("{slot:?} slot: no key on card")),
+                    Some(Err(err)) => mismatches
+                        .push(format!("{slot:?} slot: on-card public key is malformed: {err}")),
+                    Some(Ok(got)) if got != want => {
+                        mismatches.push(format!("{slot:?} slot: public key is not the derived one"))
+                    }
+                    Some(Ok(_)) => {}
+                }
+
+                // Policies are advisory: warn rather than fail, a card provisioned under
+                // another --policy still holds the right keys
+                if let Some(policy) = metadata.policy {
+                    let expected_policy = self.policies_for(slot);
+                    if policy != expected_policy {
+                        log::warn!(
+                            "Policy mismatch in {:?} slot: card={:?}, expected={:?}",
+                            slot,
+                            policy,
+                            expected_policy
+                        );
+                    }
+                }
+            }
         }
 
-        crate::common::report_mismatches("chain", &mismatches)
+        // Certificate has to be byte identical
+        let want = Sha256::digest(expected.to_der()?);
+        let mismatches = &mut *card.mismatches;
+        match CardCertificate::read(card.token, slot) {
+            Err(err) => mismatches.push(format!("{slot:?} slot: certificate unreadable: {err}")),
+            Ok(card) => match card.cert.to_der() {
+                Err(err) => mismatches
+                    .push(format!("{slot:?} slot: on-card certificate is malformed: {err}")),
+                Ok(der) => {
+                    let got = Sha256::digest(der);
+                    if got != want {
+                        mismatches.push(format!(
+                            "{slot:?} slot: certificate mismatch: card={got:x}, derived={want:x}"
+                        ));
+                    } else {
+                        log::info!("{:?} slot matches: {:x}", slot, got);
+                    }
+                }
+            },
+        }
+        Ok(())
     }
 
     /// Prove that `slot` holds the key behind `spki` on a card that cannot report it
@@ -278,12 +392,12 @@ impl SeededSmartcard {
     /// not a disagreement with the seed.
     fn challenge_slot(
         &self,
-        token: &mut YubiKey,
+        card: &mut Comparison<'_>,
         slot: SlotId,
         spki: &SubjectPublicKeyInfoOwned,
-        pin_warned: &mut bool,
+        algorithm: Algorithm,
     ) -> Result<Option<String>> {
-        let algorithm = SlotRole::of(slot).card_algorithm(self.algorithm);
+        let algorithm = SlotRole::of(slot).card_algorithm(algorithm);
         let width = match algorithm {
             // RSA signs a SHA-256 digest, padded below
             AlgorithmId::EccP256
@@ -307,14 +421,14 @@ impl SeededSmartcard {
         let (pin_policy, touch_policy) = self.policies_for(slot);
         if pin_policy != PinPolicy::Never {
             match &self.pin {
-                Some(pin) => token.verify_pin(pin.as_bytes())?,
+                Some(pin) => card.token.verify_pin(pin.as_bytes())?,
                 None => {
-                    if !*pin_warned {
+                    if !card.pin_warned {
                         log::warn!(
                             "Slot keys cannot be verified on this card without --pin: it has \
                              no GET METADATA, and signing the challenge needs the pin"
                         );
-                        *pin_warned = true;
+                        card.pin_warned = true;
                     }
                     return Ok(None);
                 }
@@ -329,7 +443,7 @@ impl SeededSmartcard {
             eprintln!("[Please touch device to prove the {slot:?} key!]");
         }
         let input = challenge_input(algorithm, spki, &digest)?;
-        let signature = match piv::sign_data(token, &input, algorithm, slot) {
+        let signature = match piv::sign_data(card.token, &input, algorithm, slot) {
             Ok(signature) => signature,
             Err(err) => {
                 return Ok(Some(format!("{slot:?} slot: signature challenge failed: {err}")));

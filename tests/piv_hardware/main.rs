@@ -5,7 +5,7 @@
 //! feature is on *and* the `no-destructive-hardware-tests` interlock is off -- see the feature
 //! comments in `Cargo.toml` for why the second flag exists.
 //!
-//! **Running this wipes the card.** `upload` exhausts the PIN and PUK counters and resets the
+//! **Running this wipes the card.** `init` exhausts the PIN and PUK counters and resets the
 //! device. Point it at a spare:
 //!
 //! ```text
@@ -13,11 +13,11 @@
 //! ```
 //!
 //! Watch the token: several steps blink for a touch and block until you press it, and the
-//! token's own timeout is about fifteen seconds. Touches come at `check` (management key),
-//! the native 9A signature and 9D agreement, then the end-use steps -- the 9A TLS
-//! handshake, the 9C S/MIME signature, the 9D PKCS#11 key agreement, and the 9A SSH login.
-//! `upload` needs none: it installs the management key touch-free and only arms the
-//! requirement afterwards.
+//! token's own timeout is about fifteen seconds. Touches come at `upload` and `check`
+//! (management key), the native 9A signature and 9D agreement, then the end-use steps --
+//! the 9A TLS handshake, the 9C S/MIME signature, the 9D PKCS#11 key agreement, and the 9A
+//! SSH login. `init` needs none: it installs the management key touch-free and only arms
+//! the requirement once the card holds what the card seed derives.
 //!
 //! The checklist runs on P-256, the default chain. Its card-level half is also available
 //! on its own, for either algorithm, as ignored tests (`cargo test ... -- --ignored`): the
@@ -38,9 +38,14 @@
     not(feature = "no-destructive-hardware-tests")
 ))]
 
-use mind_the_gap::piv::{CertChain, CertificateKind, SeededSmartcard};
+use mind_the_gap::backend::{Applet, Backend};
+use mind_the_gap::piv::{
+    self as backend, CertChain, CertificateKind, KeyReason, ManagementKeyArg, SeededSmartcard,
+    UpdateChange,
+};
 use mind_the_gap::policy::Policy;
-use mind_the_gap::seed::{Algorithm, Seed256};
+use mind_the_gap::role::KeyRole;
+use mind_the_gap::seed::{Algorithm, KeyPath, Seed256, Seeds};
 use mind_the_gap::target::CardTarget;
 
 use p256::ecdh;
@@ -56,7 +61,7 @@ use x509_cert::Certificate;
 use x509_cert::der::Encode;
 use x509_cert::der::EncodePem;
 
-use yubikey::piv::{self, AlgorithmId, ManagementSlotId, SlotAlgorithmId, SlotId};
+use yubikey::piv::{self, AlgorithmId, ManagementSlotId, RetiredSlotId, SlotAlgorithmId, SlotId};
 use yubikey::reader::Context;
 use yubikey::{CccId, ChuId, MgmAlgorithmId, MsRoots, PinPolicy, Serial, TouchPolicy, YubiKey};
 
@@ -64,11 +69,15 @@ use zeroize::Zeroizing;
 
 use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 mod end_use;
+#[path = "../common/hardware.rs"]
+mod hardware;
 #[path = "../common/readers.rs"]
 mod readers;
+
+use hardware::{next_generation, touch_free};
 
 use end_use::{
     key_agreement_through_pkcs11, nss_recognises_card, only_reader, openssl_conf, pkcs11_paths,
@@ -125,42 +134,69 @@ fn exclusive_card() -> (MutexGuard<'static, ()>, readers::Readers) {
     (card, readers::shared())
 }
 
-/// Seed for the provisioned test identity, from the serial of the card under test.
-///
-/// It must not be a seed anyone would use for real, since this card is wiped and
-/// re-provisioned at will. It differs per card because the PKCS#11 stack and gpg-agent find
-/// keys by their public half: with one identity on several attached cards, as on a test
-/// host, a step could run on another card and pass there.
+/// The seed of the provisioned test identity, card seed and key seed in one
 fn test_seed() -> Seed256 {
-    use sha2::{Digest, Sha256};
-    Sha256::new()
-        .chain_update([0x5a])
-        .chain_update(target())
-        .finalize()
-        .into()
+    hardware::seed_tagged(0x5a, &target())
 }
 
-/// Whether this run provisions without touch policies, for a host that runs it unattended
+/// The key seed of a second identity, a team's, whose decryption key a personal card keeps
+fn team_seed() -> Seed256 {
+    hardware::seed_tagged(0x7e, &target())
+}
+
+/// Whether this run stores the certificate authorities in msroots
 ///
-/// `MTG_HARDWARE_TEST_TOUCH=never` provisions with the `never-touch` policy, the standard's
-/// pins without any touch, and the assertions follow. A script cannot touch a YubiKey, so this is how the suite runs
-/// without a person; it proves everything except that touch is enforced, which the default
-/// run does.
-fn touch_free() -> bool {
-    match std::env::var("MTG_HARDWARE_TEST_TOUCH") {
-        Err(_) => false,
-        Ok(touch) if touch == "never" => true,
-        Ok(other) => panic!("MTG_HARDWARE_TEST_TOUCH is `never` or unset, not `{other}`"),
+/// msroots is a Yubico extension that other PIV cards may refuse, CanoKey among them.
+/// `MTG_HARDWARE_TEST_MSROOTS=off` provisions as `--no-msroots` does and asserts that the card
+/// holds no authorities instead.
+fn msroots() -> bool {
+    match std::env::var("MTG_HARDWARE_TEST_MSROOTS").as_deref() {
+        Err(_) => true,
+        Ok("off") => false,
+        Ok(other) => panic!("MTG_HARDWARE_TEST_MSROOTS is `off` or unset, not `{other}`"),
+    }
+}
+
+/// The management key algorithm this run has `init` install, where it names one
+///
+/// Unset, `init` picks by firmware and the suite expects AES-256 from 5.4 on.
+/// `MTG_HARDWARE_TEST_MANAGEMENT_ALGORITHM=tdes` or `aes256` asks for one, as
+/// `--management-algorithm` does, for a card that reports a YubiKey's firmware without
+/// taking what that firmware takes, such as CanoKey's 5.7.0 with triple DES only.
+fn management_algorithm() -> Option<MgmAlgorithmId> {
+    match std::env::var("MTG_HARDWARE_TEST_MANAGEMENT_ALGORITHM").as_deref() {
+        Err(_) => None,
+        Ok("tdes") => Some(MgmAlgorithmId::ThreeDes),
+        Ok("aes256") => Some(MgmAlgorithmId::Aes256),
+        Ok(other) => panic!(
+            "MTG_HARDWARE_TEST_MANAGEMENT_ALGORITHM is `tdes`, `aes256` or unset, not `{other}`"
+        ),
     }
 }
 
 fn subject() -> SeededSmartcard {
-    let subject = SeededSmartcard::new(&test_seed(), None, "Hardware Test".into())
+    subject_at(KeyPath::default())
+}
+
+/// The test identity's keys along `path`, from the one test seed
+fn subject_at(path: KeyPath) -> SeededSmartcard {
+    with_test_settings(SeededSmartcard::new(Seeds::one(&test_seed()), path, "Hardware Test".into()))
+}
+
+/// The settings every test identity is provisioned with
+fn with_test_settings(subject: SeededSmartcard) -> SeededSmartcard {
+    let subject = subject
         .add_email("hardware-test@example.com")
         .unwrap()
         .with_pin(Zeroizing::new(TEST_PIN.to_string()))
-        .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
-        .with_validity_duration(Duration::from_secs(10 * 365 * 24 * 60 * 60));
+        .unwrap()
+        .with_validity_duration(Duration::from_secs(10 * 365 * 24 * 60 * 60))
+        .with_msroots(msroots());
+    let subject = match management_algorithm() {
+        Some(MgmAlgorithmId::ThreeDes) => subject.with_management_key(ManagementKeyArg::Tdes),
+        Some(_) => subject.with_management_key(ManagementKeyArg::Aes256),
+        None => subject,
+    };
     if touch_free() {
         subject.with_policy(Policy::NeverTouch)
     } else {
@@ -299,8 +335,8 @@ fn on_card<T>(what: &str, result: anyhow::Result<T>) -> T {
              \tgpgconf --kill scdaemon\n\
              \n\
              It is usually left over from ordinary gpg use. Sharing the card between gpg\n\
-             and PIV at the same time is possible but unreliable -- see the scdaemon section\n\
-             of docs/piv-hardware-tests.md.\n"
+             and PIV at the same time is possible but unreliable -- see \"gpg's scdaemon\"\n\
+             in docs/after-the-gap.md.\n"
         ),
         Err(error) => panic!("{what} failed: {error}"),
     }
@@ -310,7 +346,7 @@ fn on_card<T>(what: &str, result: anyhow::Result<T>) -> T {
 ///
 /// One test rather than several on purpose. The harness runs tests in parallel and in
 /// arbitrary order, but these share one physical card and every later step depends on the
-/// state `upload` leaves behind, so they have to be sequenced by construction.
+/// state `init` and `upload` leave behind, so they have to be sequenced by construction.
 #[test]
 fn provision_and_verify_card() {
     let _card = exclusive_card();
@@ -437,8 +473,313 @@ fn provision_and_verify_rsa4096_card() {
     provision_and_verify(&subject, &serial, 7);
 }
 
-/// Sections 1 to 4 of the checklist: provision, then assert what landed on the card and
-/// that the card signs and agrees with it. Returns the chain and the open token for the
+/// Uploading to a provisioned card again: new validity and another policy are written under
+/// the derived management key without a reset, and a second key seed's decryption key goes
+/// into a retired slot beside the identity's own keys.
+///
+/// The keys must stay on the card untouched, every certificate must take the new validity,
+/// and the slots the policy moves must be imported again under it. The team's key, from a
+/// key seed apart from the card seed, lands in 82 alone: the identity's slots and msroots
+/// stay as they are. Ignored like the other card-level halves; the virtual PIV check runs it,
+/// where the card cannot report policies and the upload imports every key it names again.
+#[test]
+#[ignore = "provisions the card, then uploads to it again; run by the virtual PIV check"]
+fn upload_in_place() {
+    let _card = exclusive_card();
+    let serial = target();
+    let (before, token) = provision_and_verify(&subject(), &serial, 11);
+    let has_metadata = {
+        let version = token.version();
+        (version.major, version.minor) >= (5, 3)
+    };
+    drop(token);
+
+    eprintln!("[8/11] a card that holds the derivation needs nothing");
+    let unchanged = on_card("plan", subject().plan_upload(Some(addressed())));
+    assert!(unchanged.is_empty(), "a freshly provisioned card has changes:\n{unchanged}");
+
+    // A policy that moves 9A whichever one the provisioning used, and that adds no touch to
+    // a touch-free run
+    let policy = if touch_free() {
+        Policy::AlwaysPin
+    } else {
+        Policy::Strict
+    };
+    // Spelled out, like EXPECTED_POLICIES, rather than read back from the policy
+    let updated_policy = |slot: SlotId| match (slot, touch_free()) {
+        (_, true) => (PinPolicy::Always, TouchPolicy::Never),
+        (SlotId::Signature, false) => (PinPolicy::Always, TouchPolicy::Always),
+        (_, false) => (PinPolicy::Once, TouchPolicy::Always),
+    };
+    let updated = subject()
+        .with_validity_duration(Duration::from_secs(5 * 365 * 24 * 60 * 60))
+        .with_policy(policy);
+    let after = updated
+        .certify(CertificateKind::Chain)
+        .expect("offline certify failed");
+
+    eprintln!("[9/11] uploading new validity and policy -- TOUCH when it blinks");
+    let plan = on_card("plan", updated.plan_upload(Some(addressed())));
+    eprintln!("{plan}");
+    let changes = &plan.changes;
+    if has_metadata {
+        assert!(
+            changes.contains(&UpdateChange::Key {
+                role: KeyRole::Authentication,
+                slot: SlotId::Authentication,
+                reason: KeyReason::Policy
+            }),
+            "the 9A policy is not planned:\n{plan}",
+        );
+    } else {
+        // A policy the card cannot report would be re-imported on every upload, so the keys
+        // keep theirs and the plan says how to change it
+        assert!(
+            !changes.iter().any(|change| matches!(
+                change,
+                UpdateChange::Key { reason: KeyReason::Policy, .. }
+            )),
+            "a policy the card cannot report is planned:\n{plan}",
+        );
+        assert!(
+            plan.notes.iter().any(|note| note.contains("`init`")),
+            "the plan does not say how to change the policy:\n{plan}",
+        );
+    }
+    for role in KeyRole::ALL {
+        assert!(
+            !changes.iter().any(|change| matches!(
+                change,
+                UpdateChange::Key { role: r, reason: KeyReason::Differs, .. } if *r == role
+            )),
+            "the {role} key moved with a new validity:\n{plan}",
+        );
+        let slot = backend::SlotRole::from(role).slot();
+        assert!(
+            changes.contains(&UpdateChange::Certificate { role, slot }),
+            "the {slot:?} certificate is not planned:\n{plan}",
+        );
+    }
+
+    let remaining = on_card("upload", updated.upload(Some(addressed()), &plan));
+    assert!(remaining.is_empty(), "the upload left changes behind:\n{remaining}");
+    let again = on_card("plan", updated.plan_upload(Some(addressed())));
+    assert!(again.is_empty(), "an uploaded card still has changes:\n{again}");
+
+    eprintln!("[10/11] the keys that stayed, and their new certificates and policies");
+    let mut token = open();
+    let public = |chain: &CertChain, slot: SlotId| public_key_bytes(leaf(chain, slot)).to_vec();
+    for (slot, _) in &after.leaves {
+        assert_eq!(public(&before, *slot), public(&after, *slot), "{slot:?} key moved");
+        let on_card = yubikey::certificate::Certificate::read(&mut token, *slot)
+            .unwrap_or_else(|e| panic!("cannot read {slot:?} certificate: {e}"));
+        assert_eq!(
+            on_card.cert.to_der().expect("card cert does not encode"),
+            leaf(&after, *slot).to_der().expect("leaf does not encode"),
+            "{slot:?} certificate on card is not the updated one",
+        );
+        if has_metadata {
+            let metadata = piv::metadata(&mut token, *slot)
+                .unwrap_or_else(|e| panic!("cannot read {slot:?} metadata: {e}"));
+            assert_eq!(
+                metadata.policy,
+                Some(updated_policy(*slot)),
+                "{slot:?} policy is not the updated one",
+            );
+        }
+    }
+    drop(token);
+    on_card("check", updated.check(Some(addressed())));
+
+    // The same card seed administers the card, the team's key seed derives the key
+    eprintln!("[11/11] a team's decryption key into retired slot 82 -- TOUCH when it blinks");
+    let team_key_seed = team_seed();
+    let card_seed = test_seed();
+    let team = with_test_settings(SeededSmartcard::new(
+        Seeds { card: Some(&card_seed), key: Some(&team_key_seed) },
+        KeyPath::default(),
+        "Hardware Team".into(),
+    ))
+    .with_policy(policy)
+    .with_keys(&[KeyRole::Decryption])
+    .expect("the decryption key alone")
+    .with_slot(0x82)
+    .expect("a retired slot");
+    let retired = SlotId::Retired(RetiredSlotId::try_from(0x82).expect("0x82 is a retired slot"));
+    let plan = on_card("plan", team.plan_upload(Some(addressed())));
+    eprintln!("{plan}");
+    assert_eq!(
+        plan.changes,
+        vec![
+            UpdateChange::Key {
+                role: KeyRole::Decryption,
+                slot: retired,
+                reason: KeyReason::Differs
+            },
+            UpdateChange::Certificate { role: KeyRole::Decryption, slot: retired },
+            UpdateChange::KeyHistory { on_card: 1 },
+        ],
+        "a team key upload writes more than slot 82 and the key history counting it",
+    );
+    let remaining = on_card("upload", team.upload(Some(addressed()), &plan));
+    assert!(remaining.is_empty(), "the team upload left changes behind:\n{remaining}");
+    let team_chain = team
+        .certify(CertificateKind::Chain)
+        .expect("offline certify failed");
+    assert_ne!(
+        public_key_bytes(leaf(&team_chain, retired)),
+        public_key_bytes(leaf(&after, SlotId::KeyManagement)),
+        "the team's key seed derived the identity's own decryption key",
+    );
+    let again = on_card("plan", updated.plan_upload(Some(addressed())));
+    assert!(again.is_empty(), "the team upload disturbed the identity's slots:\n{again}");
+    on_card("check", team.check(Some(addressed())));
+    let mut token = open();
+    token
+        .verify_pin(TEST_PIN.as_bytes())
+        .expect("card rejected the PIN we provisioned it with");
+    key_management_slot_agrees(&mut token, &team_chain, retired);
+}
+
+/// Rotating a provisioned card to a new key generation in place, without a reset.
+///
+/// The card must end up holding the new generation's keys and certificates, with the
+/// previous decryption key kept in the first retired slot and still the card seed's: the
+/// same management key opens it before and after. Run again, the rotation finds nothing to
+/// do. The virtual PIV check runs it.
+#[test]
+#[ignore = "provisions the card, then rotates it in place; run by the virtual PIV check"]
+fn rotate_in_place() {
+    let _card = exclusive_card();
+    let serial = target();
+    let previous = subject();
+    let (before, token) = provision_and_verify(&previous, &serial, 10);
+    drop(token);
+
+    let rotated = subject_at(KeyPath { subkey: None, date: Some(next_generation()) });
+    let after = rotated
+        .certify(CertificateKind::Chain)
+        .expect("offline certify failed");
+    let retired = SlotId::Retired(RetiredSlotId::try_from(0x82).expect("0x82 is a retired slot"));
+
+    eprintln!("[8/10] rotating to {} -- TOUCH when it blinks", next_generation());
+    assert_eq!(
+        on_card("generation", backend::generation_on_card(Some(addressed()))),
+        None,
+        "a card provisioned without a date reads as dated",
+    );
+    let plan = on_card("plan", rotated.plan_rotation_from(&previous, Some(addressed())));
+    eprintln!("{plan}");
+    assert_eq!(
+        plan.changes.first(),
+        Some(&UpdateChange::Archive { slot: retired }),
+        "the previous decryption key is not kept first:\n{plan}",
+    );
+    for role in KeyRole::ALL {
+        let slot = backend::SlotRole::from(role).slot();
+        assert!(
+            plan.changes
+                .contains(&UpdateChange::Key { role, slot, reason: KeyReason::Differs }),
+            "the {slot:?} key is not planned:\n{plan}",
+        );
+    }
+    let remaining = on_card("rotate", rotated.rotate_from(&previous, Some(addressed()), &plan));
+    assert!(remaining.is_empty(), "the rotation left changes behind:\n{remaining}");
+
+    eprintln!("[9/10] the card holds the new generation, and keeps the previous key");
+    assert_eq!(
+        on_card("generation", backend::generation_on_card(Some(addressed()))),
+        Some(next_generation()),
+        "the card does not read as the new generation",
+    );
+    let again = on_card("plan", rotated.plan_rotation_from(&previous, Some(addressed())));
+    assert!(again.is_empty(), "a rotation run again still has changes:\n{again}");
+    let mut token = open();
+    let kept = yubikey::certificate::Certificate::read(&mut token, retired)
+        .expect("no certificate in the retired slot");
+    assert_eq!(
+        public_key_bytes(&kept.cert),
+        public_key_bytes(leaf(&before, SlotId::KeyManagement)),
+        "the retired slot does not keep the previous key management key",
+    );
+    for (slot, _) in &after.leaves {
+        let on_card = yubikey::certificate::Certificate::read(&mut token, *slot)
+            .unwrap_or_else(|e| panic!("cannot read {slot:?} certificate: {e}"));
+        assert_eq!(
+            on_card.cert.to_der().expect("card cert does not encode"),
+            leaf(&after, *slot).to_der().expect("leaf does not encode"),
+            "{slot:?} certificate on card is not the rotated one",
+        );
+    }
+    token
+        .verify_pin(TEST_PIN.as_bytes())
+        .expect("the rotation changed the user pin");
+
+    eprintln!("[10/10] the kept key still decrypts, and the card checks clean");
+    let mut kept_chain = before.clone();
+    kept_chain.leaves.push((retired, kept.cert.clone()));
+    key_management_slot_agrees(&mut token, &kept_chain, retired);
+    drop(token);
+    on_card("check", rotated.check(Some(addressed())));
+}
+
+/// The user pin: changed with the current one, which needs no seed, then blocked and set
+/// again with the card seed's derived puk, then the card wiped.
+///
+/// A wrong current pin is refused and costs a try. Once blocked, the derived puk unblocks
+/// it without a reset; a wipe then leaves the card for nobody, and a stranger's card seed
+/// cannot wipe it in the first place.
+#[test]
+#[ignore = "provisions the card, then changes and resets its user pin and wipes it; run by the virtual PIV check"]
+fn change_user_pin() {
+    const NEW_PIN: &str = "582231";
+    let _card = exclusive_card();
+    let serial = target();
+    let (_, token) = provision_and_verify(&subject(), &serial, 10);
+    drop(token);
+
+    eprintln!("[8/10] a wrong current pin is refused, the right one changes it");
+    let wrong = backend::change_pin(Some(addressed()), "000000", NEW_PIN)
+        .expect_err("a wrong current pin changed the pin");
+    assert!(wrong.to_string().contains("tries left"), "unexpected error: {wrong}");
+    on_card("change pin", backend::change_pin(Some(addressed()), TEST_PIN, NEW_PIN));
+    let mut token = open();
+    assert!(token.verify_pin(TEST_PIN.as_bytes()).is_err(), "the card still takes the old pin");
+    token
+        .verify_pin(NEW_PIN.as_bytes())
+        .expect("the card does not take the new pin");
+
+    eprintln!("[9/10] a blocked pin is reset with the card seed's puk");
+    for _ in 0..16 {
+        match token.verify_pin(b"000000") {
+            Err(yubikey::Error::WrongPin { tries: 0 }) | Err(yubikey::Error::PinLocked) => break,
+            _ => {}
+        }
+    }
+    assert!(token.verify_pin(NEW_PIN.as_bytes()).is_err(), "the pin did not block");
+    let _ = token.disconnect(pcsc::Disposition::LeaveCard);
+    on_card("reset pin", subject().reset_pin(Some(addressed()), TEST_PIN));
+    let mut token = open();
+    token
+        .verify_pin(TEST_PIN.as_bytes())
+        .expect("the card does not take the pin set with the puk");
+    let _ = token.disconnect(pcsc::Disposition::LeaveCard);
+
+    eprintln!("[10/10] a stranger's card seed cannot wipe it, its own can");
+    let stranger =
+        SeededSmartcard::new(Seeds::one(&team_seed()), KeyPath::default(), "Stranger".into());
+    assert!(
+        stranger.plan_wipe(Some(addressed()), false).is_err(),
+        "another card seed may wipe the card",
+    );
+    on_card("plan wipe", subject().plan_wipe(Some(addressed()), false));
+    on_card("wipe", subject().wipe(Some(addressed()), false));
+    assert!(
+        subject().plan_upload(Some(addressed())).is_err(),
+        "a wiped card still takes an upload",
+    );
+}
+
 /// The card refuses what its touch policies gate while nobody touches it, and performs it
 /// again once someone does.
 ///
@@ -501,12 +842,15 @@ fn touch_is_enforced() {
     let mut token = open();
     authentication_slot_signs(&mut token, &offline);
     signature_slot_signs(&mut token, &offline);
-    key_management_slot_agrees(&mut token, &offline);
+    key_management_slot_agrees(&mut token, &offline, SlotId::KeyManagement);
     drop(token);
     on_card("check", subject.check(Some(addressed())));
 }
 
-/// steps that follow; `total` is only for the step counter in the progress lines.
+/// Sections 1 to 4 of the checklist: provision, then assert what landed on the card and
+/// that the card signs and agrees with it. Returns the chain, with the card's own 9E
+/// certificate added, and the open token for the steps that follow; `total` is only for the
+/// step counter in the progress lines.
 fn provision_and_verify(
     subject: &SeededSmartcard,
     serial: &str,
@@ -514,27 +858,19 @@ fn provision_and_verify(
 ) -> (CertChain, YubiKey) {
     // -- Section 1: provision ------------------------------------------------------------
     //
-    // Build the chain offline first. If this disagrees with what `upload` returns, the card
-    // path has diverged from the reproducible one.
+    // Build the chain offline first: what the upload writes has to be this, byte for byte.
     eprintln!("[1/{total}] deriving the chain offline");
-    let offline = subject
+    let mut offline = subject
         .certify(CertificateKind::Chain)
         .expect("offline certify failed");
 
-    // No touch here: `upload` installs the management key touch-free and only switches the
-    // requirement on once provisioning has succeeded
-    eprintln!("[2/{total}] uploading to card {serial}");
-    let uploaded = on_card("upload", subject.upload(Some(addressed())));
-
-    assert_eq!(
-        uploaded
-            .to_pem(CertificateKind::Chain)
-            .expect("uploaded chain does not encode"),
-        offline
-            .to_pem(CertificateKind::Chain)
-            .expect("offline chain does not encode"),
-        "upload and certify produced different chains",
-    );
+    // No touch for `init`: it installs the management key touch-free and only switches the
+    // requirement on once the card holds what the card seed derives
+    eprintln!("[2/{total}] initializing card {serial}, then uploading -- TOUCH when it blinks");
+    on_card("init", subject.init(Some(addressed())));
+    let plan = on_card("plan", subject.plan_upload(Some(addressed())));
+    let remaining = on_card("upload", subject.upload(Some(addressed()), &plan));
+    assert!(remaining.is_empty(), "the upload left changes behind:\n{remaining}");
 
     eprintln!("[3/{total}] running check -- TOUCH THE TOKEN when it blinks");
     on_card("check", subject.check(Some(addressed())));
@@ -545,6 +881,14 @@ fn provision_and_verify(
     // neither is actually asserted by the call above. Do it here, where a regression fails.
     eprintln!("[4/{total}] asserting slot policies and certificates");
     let mut token = open();
+
+    // The card's own 9E certificate comes from the card seed, and `check` has compared it
+    // with the derived one; the signing steps below need it beside the identity's
+    let nine_e = yubikey::certificate::Certificate::read(&mut token, SlotId::CardAuthentication)
+        .expect("no certificate in 9E");
+    offline
+        .leaves
+        .push((SlotId::CardAuthentication, nine_e.cert.clone()));
 
     // GET METADATA arrived with YubiKey firmware 5.3; before it the policies cannot be read
     // back, and what proves the keys there is the certificate comparison below and the
@@ -581,16 +925,16 @@ fn provision_and_verify(
             "{slot:?} certificate on card differs from the derived one",
         );
     }
-
-    // The management key, in the algorithm `upload` picks for this firmware and demanding a
-    // touch unless the run is touch-free. `check` only warns about either.
+    // The management key, in the algorithm the run asks for or else the one `init` picks for
+    // this firmware, and demanding a touch unless the run is touch-free. `check` only warns
+    // about either.
     if has_metadata {
         let metadata = piv::metadata(&mut token, SlotId::Management(ManagementSlotId::Management))
             .unwrap_or_else(|e| panic!("cannot read management key metadata: {e}"));
-        let algorithm = if (version.major, version.minor) >= (5, 4) {
-            MgmAlgorithmId::Aes256
-        } else {
-            MgmAlgorithmId::ThreeDes
+        let algorithm = match management_algorithm() {
+            Some(algorithm) => algorithm,
+            None if (version.major, version.minor) >= (5, 4) => MgmAlgorithmId::Aes256,
+            None => MgmAlgorithmId::ThreeDes,
         };
 
         assert_eq!(
@@ -612,25 +956,34 @@ fn provision_and_verify(
 
     // -- Section 4: msroots --------------------------------------------------------------
     //
-    // Checked before the signing steps because it needs no PIN and no touch.
+    // Checked before the signing steps because it needs no PIN and no touch. A run without
+    // msroots asserts that none were stored; a card without the object answers the read with
+    // an error, which holds none either.
     eprintln!("[5/{total}] asserting msroots");
-    let expected = cms::content_info::ContentInfo::try_from(offline.cas())
-        .expect("authorities do not form a PKCS#7")
-        .to_der()
-        .expect("PKCS#7 does not encode");
-    let roots = MsRoots::read(&mut token)
-        .expect("cannot read msroots")
-        .expect("no authorities stored in msroots");
-    assert_eq!(
-        AsRef::<[u8]>::as_ref(&roots),
-        expected.as_slice(),
-        "msroots does not hold the derived certificate authorities",
-    );
+    if msroots() {
+        let expected = cms::content_info::ContentInfo::try_from(offline.cas())
+            .expect("authorities do not form a PKCS#7")
+            .to_der()
+            .expect("PKCS#7 does not encode");
+        let roots = MsRoots::read(&mut token)
+            .expect("cannot read msroots")
+            .expect("no authorities stored in msroots");
+        assert_eq!(
+            AsRef::<[u8]>::as_ref(&roots),
+            expected.as_slice(),
+            "msroots does not hold the derived certificate authorities",
+        );
+    } else {
+        assert!(
+            !matches!(MsRoots::read(&mut token), Ok(Some(_))),
+            "msroots holds authorities although the run stores none",
+        );
+    }
 
     // -- Card identifiers ----------------------------------------------------------------
     //
     // Windows smartcard logon and much middleware refuse a card carrying neither, and a
-    // freshly reset YubiKey has neither, so their presence is entirely down to `upload`.
+    // freshly reset YubiKey has neither, so their presence is entirely down to `init`.
     eprintln!("[6/{total}] asserting CHUID and CCC");
     let chuid = ChuId::get(&mut token).expect("no CHUID on card, Windows logon needs one");
     assert_ne!(
@@ -652,7 +1005,7 @@ fn provision_and_verify(
     signature_slot_refuses_without_pin(&mut token, &offline);
     authentication_slot_signs(&mut token, &offline);
     signature_slot_signs(&mut token, &offline);
-    key_management_slot_agrees(&mut token, &offline);
+    key_management_slot_agrees(&mut token, &offline, SlotId::KeyManagement);
 
     (offline, token)
 }
@@ -721,21 +1074,22 @@ fn signature_slot_signs(token: &mut YubiKey, chain: &CertChain) {
     verify(&signature, message, cert, "9C");
 }
 
-/// Slot 9D performs ECDH on the card, and agrees with the same computation done off it.
+/// A key management slot (9D, or a retired one) performs ECDH on the card, and agrees with
+/// the same computation done off it.
 ///
 /// This is the hardware half of the `keyAgreement` decision. The offline suite asserts that
 /// `openssl cms -encrypt` accepts the certificate; only the card can show that the key
 /// actually derives the same shared secret. Done as raw ECDH rather than a CMS round trip so
 /// that it needs no OpenSSL engine configuration.
-fn key_management_slot_agrees(token: &mut YubiKey, chain: &CertChain) {
-    let cert = leaf(chain, SlotId::KeyManagement);
+fn key_management_slot_agrees(token: &mut YubiKey, chain: &CertChain, slot: SlotId) {
+    let cert = leaf(chain, slot);
 
     match slot_algorithm(cert) {
-        AlgorithmId::X25519 => return x25519_key_management_slot_agrees(token, cert),
+        AlgorithmId::X25519 => return x25519_key_management_slot_agrees(token, cert, slot),
         algorithm @ (AlgorithmId::Rsa2048 | AlgorithmId::Rsa3072 | AlgorithmId::Rsa4096) => {
-            return rsa_key_management_slot_decrypts(token, cert, algorithm);
+            return rsa_key_management_slot_decrypts(token, cert, algorithm, slot);
         }
-        AlgorithmId::EccP384 => return p384_key_management_slot_agrees(token, cert),
+        AlgorithmId::EccP384 => return p384_key_management_slot_agrees(token, cert, slot),
         _ => {}
     }
 
@@ -753,9 +1107,9 @@ fn key_management_slot_agrees(token: &mut YubiKey, chain: &CertChain) {
     assert_eq!(point.len(), 65, "ephemeral point is not uncompressed SEC1");
     assert_eq!(point[0], 0x04, "ephemeral point is not uncompressed SEC1");
 
-    eprintln!("      9D key agreement -- TOUCH THE TOKEN when it blinks");
-    let on_card = piv::decrypt_data(token, &point, AlgorithmId::EccP256, SlotId::KeyManagement)
-        .expect("9D refused to perform key agreement");
+    eprintln!("      {slot:?} key agreement -- TOUCH THE TOKEN when it blinks");
+    let on_card = piv::decrypt_data(token, &point, AlgorithmId::EccP256, slot)
+        .expect("the slot refused to perform key agreement");
 
     let off_card = ecdh::diffie_hellman(ephemeral.to_nonzero_scalar(), card_public.as_affine());
 
@@ -768,17 +1122,16 @@ fn key_management_slot_agrees(token: &mut YubiKey, chain: &CertChain) {
 
 /// The X25519 twin of the P-256 agreement above: the card takes the peer's raw 32-byte
 /// point and returns the raw shared secret, which `x25519-dalek` has to reproduce.
-fn x25519_key_management_slot_agrees(token: &mut YubiKey, cert: &Certificate) {
+fn x25519_key_management_slot_agrees(token: &mut YubiKey, cert: &Certificate, slot: SlotId) {
     let card_public: [u8; 32] = public_key_bytes(cert)
         .try_into()
         .expect("9D certificate does not carry an X25519 point");
     let ephemeral = StaticSecret::from([0x2bu8; 32]);
     let point = X25519PublicKey::from(&ephemeral);
 
-    eprintln!("      9D key agreement -- TOUCH THE TOKEN when it blinks");
-    let on_card =
-        piv::decrypt_data(token, point.as_bytes(), AlgorithmId::X25519, SlotId::KeyManagement)
-            .expect("9D refused to perform key agreement");
+    eprintln!("      {slot:?} key agreement -- TOUCH THE TOKEN when it blinks");
+    let on_card = piv::decrypt_data(token, point.as_bytes(), AlgorithmId::X25519, slot)
+        .expect("the slot refused to perform key agreement");
 
     let off_card = ephemeral.diffie_hellman(&X25519PublicKey::from(card_public));
 
@@ -797,33 +1150,29 @@ fn rsa_key_management_slot_decrypts(
     token: &mut YubiKey,
     cert: &Certificate,
     algorithm: AlgorithmId,
+    slot: SlotId,
 ) {
     let message = b"key management slot";
 
-    eprintln!("      9D private key operation -- TOUCH THE TOKEN when it blinks");
-    let result = piv::decrypt_data(
-        token,
-        &pkcs1_sha256_block(message, cert),
-        algorithm,
-        SlotId::KeyManagement,
-    )
-    .expect("9D refused the private key operation");
+    eprintln!("      {slot:?} private key operation -- TOUCH THE TOKEN when it blinks");
+    let result = piv::decrypt_data(token, &pkcs1_sha256_block(message, cert), algorithm, slot)
+        .expect("the slot refused the private key operation");
 
-    verify(&result, message, cert, "9D");
+    verify(&result, message, cert, &format!("{slot:?}"));
 }
 
 /// The P-384 twin of the P-256 agreement: the card takes the peer's uncompressed point and
 /// returns the shared x coordinate, which the same computation off the card has to match.
-fn p384_key_management_slot_agrees(token: &mut YubiKey, cert: &Certificate) {
+fn p384_key_management_slot_agrees(token: &mut YubiKey, cert: &Certificate, slot: SlotId) {
     let card_public = p384::PublicKey::from_sec1_bytes(public_key_bytes(cert))
         .expect("9D certificate does not carry a P-384 point");
     let ephemeral =
         p384::SecretKey::from_slice(&[0x2bu8; 48]).expect("ephemeral scalar is invalid");
     let point = ephemeral.public_key().to_sec1_bytes();
 
-    eprintln!("      9D key agreement -- TOUCH THE TOKEN when it blinks");
-    let on_card = piv::decrypt_data(token, &point, AlgorithmId::EccP384, SlotId::KeyManagement)
-        .expect("9D refused to perform key agreement");
+    eprintln!("      {slot:?} key agreement -- TOUCH THE TOKEN when it blinks");
+    let on_card = piv::decrypt_data(token, &point, AlgorithmId::EccP384, slot)
+        .expect("the slot refused to perform key agreement");
     let off_card =
         p384::ecdh::diffie_hellman(ephemeral.to_nonzero_scalar(), card_public.as_affine());
 

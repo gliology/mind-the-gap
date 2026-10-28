@@ -4,13 +4,19 @@
 //! authentication subkeys, Ed25519 and X25519 by default, NIST P-256 with
 //! [`Algorithm::P256`], or RSA -- from its seeds, and either exports it as a certificate or imports
 //! it into a card through `openpgp-card`. Determinism is the point:
-//! creation times default to fixed values and the patched `sequoia-openpgp` drops its
-//! per-signature salt, so the same seed reproduces the same bytes -- see the derivation
-//! chapter, <https://gliology.github.io/mind-the-gap/derivation.html>.
+//! creation times default to fixed values, the patched `sequoia-openpgp` drops its
+//! per-signature salt, and P-256 signs with RFC 6979 nonces (`signer`), so the same seed
+//! reproduces the same bytes -- see the derivation chapter,
+//! <https://gliology.github.io/mind-the-gap/derivation.html>.
 
+use crate::backend::{Applet, Backend, KeySide, Subtrees};
 use crate::policy::Policy;
-use crate::seed::{self, Algorithm, Seed256, Seed256Derive};
+use crate::revocation::RevocationKind;
+use crate::role::KeyRole;
+use crate::seed::{Algorithm, KeyPath, SecretSeed, Seed256, Seed256Derive, Seeds};
+use crate::target::CardTarget;
 
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Result, anyhow, bail};
@@ -26,48 +32,38 @@ use sequoia_openpgp as openpgp;
 
 use openpgp_card::ocard::KeyType;
 
-use openpgp_card::ocard::data::TouchPolicy;
-
-use crate::pgp::keys::NAME_PRIMARY;
+use rsa::RsaPrivateKey;
 
 mod card;
 mod import;
 mod keys;
+mod ownership;
+mod signer;
+mod update;
 
-pub use card::status;
+pub(crate) use card::read_ident;
+pub use card::{change_pin, list, refuse_unfit_pin};
+pub use update::generation_on_card;
+pub use update::{Change as UpdateChange, UpdatePlan};
 
 /// Why `--algorithm p384` stops at the OpenPGP backend
 ///
 /// The curve exists for PIV chains whose consumers insist on P-384. Deriving OpenPGP keys
-/// on it would add a third set of labels to a frozen scheme for no card that asked for it.
+/// on it would add a third set of labels to the scheme for no card that asked for it.
 pub(crate) const P384_REFUSED: &str = "P-384 is a PIV-only curve: the OpenPGP backend derives on curve25519, p256 or rsa2048 to rsa4096";
 
-/// What a revocation covers
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RevocationKind {
-    /// Retire the whole identity, primary key and all
-    Certificate,
-    /// Retire only this card's subkeys, leaving the identity and every other card alone
-    ///
-    /// The point of provisioning each card under its own subkey id: one lost card can be taken
-    /// out of service without reissuing the identity everywhere.
-    Subkeys,
-}
-
-/// Type of certificate to generate
-#[derive(clap::ValueEnum, Clone, Debug, Default, PartialEq)]
+/// Which part of the certificate to publish
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq)]
 pub enum CertificateKind {
-    /// Generate certificate for user IDs and subkeys
+    /// The primary key, its user ids and the chosen subkeys, all self-signed
     #[default]
-    Generic,
-    /// Generate certificate for primary key only
-    Primary,
-    /// Generate certificate for user IDs only
-    Uids,
-    /// Generate certificate for subkeys only
-    Subkeys,
-    /// Generate full certificate, incl. self-signed primary
     Full,
+    /// The primary key with its direct key signature only
+    Primary,
+    /// The primary key and its user ids
+    Uids,
+    /// The primary key and the chosen subkeys
+    Subkeys,
 }
 
 /// Level of verification to specify in certification
@@ -84,111 +80,52 @@ pub enum VerificationKind {
     Positive,
 }
 
+/// Whether `init` makes the card take its pins through the KDF data object
+///
+/// With it (OpenPGP card 3.3), the host sends an iterated and salted SHA-256 hash of each
+/// pin rather than the pin itself, so the pin never crosses the reader and the card holds
+/// only the hash. Every client that enters a pin then has to know the scheme: gpg does,
+/// OpenKeychain does not yet.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Kdf {
+    /// On where the card depends on it, which is Gnuk: it wraps the keys it holds under the
+    /// pin, and a stock Gnuk 2 imports no key without the KDF data object
+    #[default]
+    Auto,
+    /// On, on every card that offers the KDF data object, refused where it does not
+    On,
+    /// Off: the pins go to the card as they are typed
+    Off,
+}
+
 /// Which set of derivation labels to use
 ///
-/// The labels below are self-describing strings. The scheme they replaced mixed three
-/// conventions -- sequence bytes, protocol constants and strings -- and, more importantly, let
-/// a user-supplied subkey id collide with a fixed label. Cards provisioned under the old
-/// scheme keep working through [`Scheme::Legacy`].
+/// The labels of the current scheme are self-describing strings, behind a card seed and a
+/// key seed. The scheme they replaced mixed three conventions -- sequence bytes, protocol
+/// constants and strings -- derived everything from one seed, and let a user-supplied subkey
+/// id collide with a fixed label. Cards provisioned under the old scheme keep working
+/// through [`Scheme::Legacy`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Scheme {
-    /// Self-describing labels, with the subkey id namespaced behind [`seed::PREFIX_SUB`]
+    /// Self-describing labels, with the subkey id namespaced behind
+    /// [`seed::PREFIX_SUB`](crate::seed::PREFIX_SUB)
     #[default]
     Current,
     /// The original labels, for cards provisioned before the scheme changed
     Legacy,
 }
 
-/// The three subkey roles this backend derives, in generation and upload order.
+/// The OpenPGP side of a usable key: its card slot, its label and its flags
 ///
-/// One type for what used to live in four parallel magic-byte tables: the legacy label
-/// byte, the current label name, the card slot, the binding flags and the flag matching
-/// all hang off the role, so they cannot drift apart.
-///
-/// As a `--shared` value it names a subkey to derive *without* the subkey id, so it comes
-/// out the same on every card. Sharing the decryption key is the usual reason: an OpenPGP
-/// client encrypts to exactly *one* of a certificate's encryption subkeys, so per-card
-/// decryption keys mean a message can only be opened on whichever card the sender happened
-/// to pick. Signing and authentication have no such problem -- the verifier checks
-/// whichever subkey was used.
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SubkeyRole {
-    /// Signing subkey
-    Signing,
-    /// Decryption subkey
-    Decryption,
-    /// Authentication subkey
-    Authentication,
-}
-
-/// The role named by `--shared`, which is simply a subkey role
-pub type SharedKey = SubkeyRole;
-
-/// Command line mirror of `openpgp-card`'s [`TouchPolicy`], which is a foreign type.
-///
-/// Spelled like PIV's touch policies, so both backends share one vocabulary. The `-fixed`
-/// variants brick the setting on purpose: a card configured `always-fixed` or `cached-fixed`
-/// refuses to change that key's policy again until its key is re-imported, which is what
-/// makes the requirement tamper-evident.
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TouchPolicyArg {
-    /// Never require a touch
-    Never,
-    /// Require a touch for every operation
-    Always,
-    /// Require a touch for every operation, and lock this setting until the key is replaced
-    AlwaysFixed,
-    /// Require a touch, valid for about 15 seconds of operations
-    Cached,
-    /// Like cached, and lock this setting until the key is replaced
-    CachedFixed,
-}
-
-impl From<TouchPolicyArg> for TouchPolicy {
-    fn from(arg: TouchPolicyArg) -> Self {
-        match arg {
-            TouchPolicyArg::Never => TouchPolicy::Off,
-            TouchPolicyArg::Always => TouchPolicy::On,
-            TouchPolicyArg::AlwaysFixed => TouchPolicy::Fixed,
-            TouchPolicyArg::Cached => TouchPolicy::Cached,
-            TouchPolicyArg::CachedFixed => TouchPolicy::CachedFixed,
-        }
-    }
-}
-
-/// How long one user pin entry stays valid for signing
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SignPinValidity {
-    /// Every signature asks for the pin again (the card default)
-    Once,
-    /// One pin entry signs until the card is disconnected
-    Session,
-}
-
-/// What [`SeededSmartcard::configure`] may change on a provisioned card.
-///
-/// Everything is optional and only applied when given, so the command can adjust one
-/// setting without touching the others.
-#[derive(Default)]
-pub struct CardSettings {
-    /// Per-key touch policies to set
-    pub touch: Vec<(SubkeyRole, TouchPolicyArg)>,
-    /// Cardholder language preferences, most preferred first
-    pub lang: Vec<[u8; 2]>,
-    /// URL where the public certificate can be fetched
-    pub url: Option<String>,
-    /// Login data (conventionally an account or user name)
-    pub login: Option<String>,
-    /// Whether one pin entry signs once or for the whole session
-    pub sign_pin: Option<SignPinValidity>,
-}
-
-impl SubkeyRole {
-    /// Every role, in the order subkeys are generated and uploaded
-    pub const ALL: [SubkeyRole; 3] = [
-        SubkeyRole::Signing,
-        SubkeyRole::Decryption,
-        SubkeyRole::Authentication,
+/// One place for what used to live in four parallel magic-byte tables: the legacy label
+/// byte, the card slot, the binding flags and the flag matching all hang off the role, so
+/// they cannot drift apart.
+impl KeyRole {
+    /// Every role, in the order subkeys are generated and uploaded, which is the card's
+    pub const PGP: [KeyRole; 3] = [
+        KeyRole::Signature,
+        KeyRole::Decryption,
+        KeyRole::Authentication,
     ];
 
     /// Legacy derivation label byte, frozen for cards provisioned under the old scheme.
@@ -197,37 +134,28 @@ impl SubkeyRole {
     /// the OpenPGP key flags happen to be bundled.
     fn code(self) -> u8 {
         match self {
-            SubkeyRole::Signing => 0x02,
-            SubkeyRole::Decryption => 0x0C,
-            SubkeyRole::Authentication => 0x20,
-        }
-    }
-
-    /// Current-scheme label name; `signature` rather than `signing` because it is the
-    /// OpenPGP card spec's own name for the slot, and it matches the PIV label for the role
-    fn name(self) -> &'static str {
-        match self {
-            SubkeyRole::Signing => "signature",
-            SubkeyRole::Decryption => "decryption",
-            SubkeyRole::Authentication => "authentication",
+            KeyRole::Signature => 0x02,
+            KeyRole::Decryption => 0x0C,
+            KeyRole::Authentication => 0x20,
         }
     }
 
     /// Card slot this role is uploaded to
     pub fn key_type(self) -> KeyType {
         match self {
-            SubkeyRole::Signing => KeyType::Signing,
-            SubkeyRole::Decryption => KeyType::Decryption,
-            SubkeyRole::Authentication => KeyType::Authentication,
+            KeyRole::Signature => KeyType::Signing,
+            KeyRole::Decryption => KeyType::Decryption,
+            KeyRole::Authentication => KeyType::Authentication,
         }
     }
 
     /// Whether the role takes a key agreement key rather than a signing one
     fn is_encryption(self) -> bool {
-        matches!(self, SubkeyRole::Decryption)
+        matches!(self, KeyRole::Decryption)
     }
 
-    /// Label segment of this role's key under `algorithm`, see [`seed::algorithm_label`]
+    /// Label segment of this role's key under `algorithm`, see
+    /// [`seed::algorithm_label`](crate::seed::algorithm_label)
     fn algorithm_segment(self, algorithm: Algorithm) -> &'static str {
         if self.is_encryption() {
             algorithm.agreement_segment()
@@ -239,64 +167,58 @@ impl SubkeyRole {
     /// The key flags the subkey is bound with
     fn flags(self) -> KeyFlags {
         match self {
-            SubkeyRole::Signing => KeyFlags::empty().set_signing(),
-            SubkeyRole::Decryption => KeyFlags::empty()
+            KeyRole::Signature => KeyFlags::empty().set_signing(),
+            KeyRole::Decryption => KeyFlags::empty()
                 .set_transport_encryption()
                 .set_storage_encryption(),
-            SubkeyRole::Authentication => KeyFlags::empty().set_authentication(),
+            KeyRole::Authentication => KeyFlags::empty().set_authentication(),
         }
     }
 
     /// Whether a subkey's flags mark it as serving this role
     pub fn matches(self, flags: &KeyFlags) -> bool {
         match self {
-            SubkeyRole::Signing => flags.for_signing(),
-            SubkeyRole::Decryption => {
+            KeyRole::Signature => flags.for_signing(),
+            KeyRole::Decryption => {
                 flags.for_transport_encryption() || flags.for_storage_encryption()
             }
-            SubkeyRole::Authentication => flags.for_authentication(),
+            KeyRole::Authentication => flags.for_authentication(),
         }
     }
 }
 
 /// Config to create an OpenPGP user cert
 pub struct SeededSmartcard {
-    /// Application seed the primary key and every subseed descend from
-    ///
-    /// Kept so that the primary can be re-derived when the algorithm changes after construction
-    root: Zeroizing<Seed256>,
+    /// The card seed's OpenPGP subtree, which the admin pin and the card identifier of every
+    /// card derive from, and the key seed's, where the primary key sits; under the legacy
+    /// scheme the one seed's subkey seed and its root, with the subkey seed in place of both
+    /// key paths, since it shares no key between cards
+    seeds: Subtrees,
 
-    /// Raw secret of the primary key, derived for `algorithm`
-    seed: Zeroizing<Seed256>,
+    /// The keys derived so far, on the heap, where a builder moved on to its next option
+    /// moves only the pointer
+    derived: Box<Derived>,
+
+    /// Where the subkeys sit under the key seed
+    path: KeyPath,
 
     /// Algorithm every key is derived with; the legacy scheme knows only Curve25519
     algorithm: Algorithm,
 
-    /// Seed used for all subkeys
-    subseed: Zeroizing<Seed256>,
-    /// Seed the subkey id is *not* mixed into, for keys listed in `shared`
-    shared_seed: Zeroizing<Seed256>,
-    /// Subkeys derived from `shared_seed` rather than `subseed`
-    shared: Vec<SharedKey>,
     /// Which set of derivation labels this card was built with
     scheme: Scheme,
-    /// Subkey id this card was provisioned under, recorded in the subkey bindings
-    ///
-    /// Held as a plain `String`: it names a card rather than guarding it, and it is published
-    /// in every certificate this card issues.
-    subkey: Option<String>,
 
     /// Name of the owner of the cert
     name: String,
 
-    /// Password to use to protect smartcard and secret keys
-    pin: Option<Password>,
+    /// User pin `init` installs and `check` verifies
+    pin: Option<Zeroizing<String>>,
 
-    /// Creation time of key certificate, defaults to one second after unix epoch
-    creation_time: Option<SystemTime>,
+    /// Creation time of the primary key, which the identity keeps for good
+    identity_time: Option<SystemTime>,
 
-    /// Creation time of subkeys, defaults to creation time of certificate
-    subkey_creation_time: Option<SystemTime>,
+    /// Creation time of the subkeys under the legacy scheme, which knows no generations
+    legacy_subkey_time: Option<SystemTime>,
 
     /// Validity duration of subkeys
     subkey_validity: Option<Duration>,
@@ -307,72 +229,94 @@ pub struct SeededSmartcard {
     /// Pin and touch requirements `upload` gives the keys
     policy: Policy,
 
+    /// Whether the policy was chosen rather than defaulted: `upload` changes a card's
+    /// policies only when asked to, and otherwise keeps what the card has
+    policy_given: bool,
+
     /// Whether `upload` makes the touch requirement unchangeable, where the card can
     fixed_touch: bool,
+
+    /// Whether `init` sets up the KDF data object
+    kdf: Kdf,
+
+    /// The keys `upload` writes, `check` compares and `publish` certifies
+    keys: Vec<KeyRole>,
+
+    /// Card data `upload` writes when given: language preferences, the certificate's URL
+    /// and the login data
+    card_data: CardData,
+}
+
+/// The keys a builder has derived, each derived once however often a command uses it
+///
+/// Secret, and wiped with the builder: the raw secrets wipe themselves on drop, as the RSA
+/// keys do.
+#[derive(Default)]
+struct Derived {
+    /// The primary key's
+    primary: OnceLock<KeySecret>,
+    /// The subkeys', in [`KeyRole::PGP`] order
+    roles: [OnceLock<KeySecret>; 3],
+}
+
+/// One key's derived secret: the raw bytes, and for RSA the key they stand for, whose primes
+/// take seconds to find
+struct KeySecret {
+    raw: SecretSeed,
+    rsa: Option<Box<RsaPrivateKey>>,
+}
+
+/// Cardholder data an upload writes, each only when given
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CardData {
+    /// Cardholder language preferences, most preferred first
+    pub lang: Vec<[u8; 2]>,
+    /// URL where the public certificate can be fetched
+    pub url: Option<String>,
+    /// Login data (conventionally an account or user name)
+    pub login: Option<String>,
 }
 
 impl SeededSmartcard {
-    /// Initialize an new seeded smartcard config
-    pub fn new(seed: &Seed256, subkey: Option<String>, name: String) -> Self {
-        Self::with_scheme(seed, subkey, name, Scheme::default())
+    /// Initialize a new seeded smartcard config from the seeds a command has
+    pub fn new(seeds: Seeds<'_>, path: KeyPath, name: String) -> Self {
+        let seeds = Subtrees::new(seeds, "pgp", &path);
+        Self::assemble(seeds, path, name, Scheme::Current)
     }
 
-    /// Build a card under an explicit derivation scheme
-    pub fn with_scheme(
-        seed: &Seed256,
-        subkey: Option<String>,
-        name: String,
-        scheme: Scheme,
-    ) -> Self {
-        // Derive application specific root seed. The label matches the subcommand, which was
-        // itself renamed from `open-pgp` to `pgp`; the legacy scheme keeps the old spelling
-        // because changing it would move every key beneath it.
-        let root = match scheme {
-            Scheme::Legacy => seed.derive(Some(b"openpgp")),
-            Scheme::Current => seed.app("pgp"),
-        };
+    /// Build a card under the legacy scheme, from its one seed
+    ///
+    /// The legacy scheme knows no card seed, no generation and no shared key: the admin pin
+    /// and every subkey derive from the subkey seed, the primary from the root.
+    pub fn legacy(seed: &Seed256, subkey: Option<String>, name: String) -> Self {
+        // The label is the subcommand's old spelling, frozen with the rest of the scheme
+        let root = seed.derive(Some(b"openpgp"));
+        let subseed = root.derive(subkey.as_ref().map(|k| k.as_bytes()));
+        let key = KeySide::fixed(root, subseed.clone(), subseed.clone());
+        let path = KeyPath { subkey, date: None };
+        Self::assemble(Subtrees::fixed(subseed, key), path, name, Scheme::Legacy)
+    }
 
-        // Derive seed for primary and subkeys. `shared_seed` is what the subseed would have
-        // been with no subkey id at all, which is identical to `subseed` when none was given
-        // -- that is what makes `--shared` a no-op for a single card.
-        let algorithm = Algorithm::Curve25519;
-        let (seed, subseed, shared_seed) = match scheme {
-            Scheme::Legacy => (
-                root.derive(Some(&[0x01])),
-                root.derive(subkey.as_ref().map(|k| k.as_bytes())),
-                root.derive(None),
-            ),
-            Scheme::Current => (
-                root.algorithm_key(NAME_PRIMARY, algorithm.signing_segment()),
-                root.sub(subkey.as_deref()),
-                root.sub(None),
-            ),
-        };
-
+    fn assemble(seeds: Subtrees, path: KeyPath, name: String, scheme: Scheme) -> Self {
         SeededSmartcard {
-            root,
-            seed,
-            algorithm,
-            subseed,
-            shared_seed,
-            shared: vec![],
+            seeds,
+            derived: Box::default(),
+            path,
+            algorithm: Algorithm::Curve25519,
             scheme,
-            subkey,
             name,
             pin: None,
-            creation_time: None,
-            subkey_creation_time: None,
+            identity_time: None,
+            legacy_subkey_time: None,
             subkey_validity: None,
             userids: vec![],
             policy: Policy::default(),
+            policy_given: false,
             fixed_touch: false,
+            kdf: Kdf::default(),
+            keys: KeyRole::PGP.to_vec(),
+            card_data: CardData::default(),
         }
-    }
-
-    /// Derive the named subkeys without the subkey id, so every card gets the same ones
-    pub fn with_shared(mut self, shared: Vec<SharedKey>) -> Self {
-        self.shared = shared;
-        self
     }
 
     /// Derive every key with `algorithm`, the primary included
@@ -391,17 +335,37 @@ impl SeededSmartcard {
         }
 
         self.algorithm = algorithm;
-        if self.scheme == Scheme::Current {
-            let label = seed::algorithm_label(NAME_PRIMARY, algorithm.signing_segment());
-            self.seed = self.derive_secret(&self.root, Some(&label), false)?;
-        }
-
+        self.derived = Box::default();
         Ok(self)
+    }
+
+    /// Write, compare and certify only these subkeys, in the card's order
+    pub fn with_keys(mut self, keys: &[KeyRole]) -> Result<Self> {
+        if keys.is_empty() {
+            bail!("No key chosen: name at least one of authentication, signature or decryption");
+        }
+        self.keys = KeyRole::PGP
+            .into_iter()
+            .filter(|role| keys.contains(role))
+            .collect();
+        Ok(self)
+    }
+
+    /// Write this cardholder data with the keys
+    pub fn with_card_data(mut self, data: CardData) -> Self {
+        self.card_data = data;
+        self
+    }
+
+    /// The key path this card derives its subkeys along
+    pub fn path(&self) -> &KeyPath {
+        &self.path
     }
 
     /// Choose the pin and touch requirements `upload` gives the keys
     pub fn with_policy(mut self, policy: Policy) -> Self {
         self.policy = policy;
+        self.policy_given = true;
         self
     }
 
@@ -412,21 +376,32 @@ impl SeededSmartcard {
         self
     }
 
-    /// Set password to protect secret keys
-    pub fn with_pin(mut self, pin: Zeroizing<String>) -> Self {
-        self.pin = Some(pin.as_str().into());
+    /// Choose whether `init` makes the card take hashed pins
+    pub fn with_kdf(mut self, kdf: Kdf) -> Self {
+        self.kdf = kdf;
         self
     }
 
-    /// Set certificate creation time
-    pub fn with_creation_time(mut self, timestamp: SystemTime) -> Self {
-        self.creation_time = Some(timestamp);
+    /// Set the user pin `init` installs and `check` verifies
+    ///
+    /// Fails on a pin no OpenPGP card takes, see [`refuse_unfit_pin`].
+    pub fn with_pin(mut self, pin: Zeroizing<String>) -> Result<Self> {
+        refuse_unfit_pin(&pin)?;
+        self.pin = Some(pin);
+        Ok(self)
+    }
+
+    /// Set the creation time of the primary key, which is part of its fingerprint: the
+    /// identity keeps it for good
+    pub fn with_identity_time(mut self, timestamp: SystemTime) -> Self {
+        self.identity_time = Some(timestamp);
         self
     }
 
-    /// Set subkey creation time
-    pub fn with_subkey_creation_time(mut self, timestamp: SystemTime) -> Self {
-        self.subkey_creation_time = Some(timestamp);
+    /// Set the subkeys' creation time under the legacy scheme, which took it as an option of
+    /// its own; the current scheme takes it from the generation's date
+    pub fn with_legacy_subkey_time(mut self, timestamp: SystemTime) -> Self {
+        self.legacy_subkey_time = Some(timestamp);
         self
     }
 
@@ -451,14 +426,14 @@ impl SeededSmartcard {
     pub fn certify(&self, kind: CertificateKind) -> Result<Cert> {
         use CertificateKind::*;
 
-        let mut cert = self.primary_cert(kind == Primary || kind == Full)?;
+        let mut cert = self.primary_cert(kind == Primary || kind == Full, None)?;
 
-        if kind == Generic || kind == Uids || kind == Full {
+        if kind == Uids || kind == Full {
             cert = self.append_uids(cert)?;
         }
 
-        if kind == Generic || kind == Subkeys || kind == Full {
-            cert = self.append_subkeys(cert)?
+        if kind == Subkeys || kind == Full {
+            cert = self.append_subkeys(cert, None)?
         }
 
         Ok(cert.strip_secret_key_material())
@@ -481,12 +456,13 @@ impl SeededSmartcard {
         self.sign_uids(cert, other, kind)
     }
 
-    /// Export all secret keys
-    pub fn export(&self) -> Result<Cert> {
-        let mut cert = self.primary_cert(false)?;
+    /// Export all secret keys, encrypted under `passphrase` where there is one
+    pub fn export(&self, passphrase: Option<&str>) -> Result<Cert> {
+        let passphrase = passphrase.map(Password::from);
+        let mut cert = self.primary_cert(false, passphrase.as_ref())?;
 
         cert = self.append_uids(cert)?;
-        self.append_subkeys(cert)
+        self.append_subkeys(cert, passphrase.as_ref())
     }
 
     /// Generate a revocation, ready to be armored
@@ -498,7 +474,7 @@ impl SeededSmartcard {
     pub fn revoke(&self, kind: RevocationKind, code: u8, reason: &str) -> Result<Vec<u8>> {
         match kind {
             RevocationKind::Certificate => {
-                let mut cert = self.primary_cert(false)?;
+                let mut cert = self.primary_cert(false, None)?;
                 let revocation = self.generate_revcert(&mut cert, code, reason)?;
 
                 Ok(revocation.to_vec()?)
@@ -509,13 +485,73 @@ impl SeededSmartcard {
 
                 if revocations.is_empty() {
                     bail!(
-                        "Every subkey of this card is shared across the fleet; there is \
-                         nothing to revoke for this card alone"
+                        "Every chosen subkey is shared by every card of the identity; there is \
+                         nothing to revoke for this device alone. Revoke the identity's \
+                         decryption key with --key decryption"
                     );
                 }
 
                 Ok(cert.insert_packets(revocations)?.0.to_vec()?)
             }
         }
+    }
+}
+
+impl Applet for SeededSmartcard {
+    fn name(&self) -> &'static str {
+        "OpenPGP"
+    }
+
+    fn preflight(&self, target: Option<CardTarget>) -> Result<String> {
+        SeededSmartcard::preflight(self, target)
+    }
+
+    fn init(&self, target: Option<CardTarget>) -> Result<()> {
+        SeededSmartcard::init(self, target)
+    }
+
+    fn check(&self, target: Option<CardTarget>) -> Result<()> {
+        SeededSmartcard::check(self, target)
+    }
+
+    fn plan_wipe(&self, target: Option<CardTarget>, force: bool) -> Result<String> {
+        SeededSmartcard::plan_wipe(self, target, force)
+    }
+
+    fn wipe(&self, target: Option<CardTarget>, force: bool) -> Result<()> {
+        SeededSmartcard::wipe(self, target, force)
+    }
+
+    fn reset_pin(&self, target: Option<CardTarget>, new: &str) -> Result<()> {
+        SeededSmartcard::reset_pin(self, target, new)
+    }
+}
+
+impl Backend for SeededSmartcard {
+    type Change = UpdateChange;
+
+    fn plan_upload(&self, target: Option<CardTarget>) -> Result<UpdatePlan> {
+        SeededSmartcard::plan_upload(self, target)
+    }
+
+    fn upload(&self, target: Option<CardTarget>, confirmed: &UpdatePlan) -> Result<UpdatePlan> {
+        SeededSmartcard::upload(self, target, confirmed)
+    }
+
+    fn plan_rotation_from(
+        &self,
+        previous: &Self,
+        target: Option<CardTarget>,
+    ) -> Result<UpdatePlan> {
+        SeededSmartcard::plan_rotation_from(self, previous, target)
+    }
+
+    fn rotate_from(
+        &self,
+        previous: &Self,
+        target: Option<CardTarget>,
+        confirmed: &UpdatePlan,
+    ) -> Result<UpdatePlan> {
+        SeededSmartcard::rotate_from(self, previous, target, confirmed)
     }
 }

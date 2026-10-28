@@ -1,16 +1,18 @@
 //! BIP39 mnemonic handling: from the phrase, plus an optional password, to the root seed.
 //!
 //! [`MnemonicSeed`] wraps `bip39::Mnemonic` to add the password and the argon2id step that
-//! produces the root [`Seed256`]; everything it hands out is [`Zeroizing`], so no plain
+//! produces the root [`SecretSeed`]; everything it hands out is [`Zeroizing`], so no plain
 //! copy of the phrase or the seed escapes it.
 
-use crate::seed::{Seed256, Seed256Derive, argon2id_256};
+use crate::seed::{SecretSeed, Seed256Derive, argon2id_256};
 
 use std::str::FromStr;
 
 use anyhow::{Error, anyhow};
 
 use bip39::{ErrorKind, Language, Mnemonic};
+
+use unicode_normalization::UnicodeNormalization;
 
 use zeroize::Zeroizing;
 
@@ -64,8 +66,15 @@ impl MnemonicSeed {
     }
 
     /// Protect seed with password
+    ///
+    /// The password is taken in Unicode NFKD, as BIP-39 takes its passphrase: `ä` typed as
+    /// one code point or as `a` with a combining diaeresis, as keyboards and systems differ
+    /// on, is the same password and derives the same keys.
     pub fn with_password(mut self, password: &str) -> Self {
-        self.password = String::from(password).into();
+        // Sized up front, so that no reallocation leaves a partial copy behind unwiped
+        let length = password.nfkd().map(char::len_utf8).sum();
+        self.password = Zeroizing::new(String::with_capacity(length));
+        self.password.extend(password.nfkd());
         self
     }
 
@@ -94,12 +103,12 @@ impl MnemonicSeed {
     }
 
     /// Process and return seed
-    pub fn seed(&self) -> Zeroizing<Seed256> {
+    pub fn seed(&self) -> SecretSeed {
         argon2id_256(self.mnemonic.entropy(), Some(self.password.as_bytes()))
     }
 
     /// Process, derive and return seed
-    pub fn derive(&self, path: Option<&[u8]>) -> Zeroizing<Seed256> {
+    pub fn derive(&self, path: Option<&[u8]>) -> SecretSeed {
         self.seed().derive(path)
     }
 }

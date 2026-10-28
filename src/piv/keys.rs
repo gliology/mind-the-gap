@@ -3,13 +3,15 @@
 //! Part of the frozen `mtg1` derivation: the golden vectors in `tests/piv/golden.rs` pin every
 //! label used here.
 
-use super::{SeededSmartcard, SharedSlot, SlotRole, slots::FIRST_RETIRED_SLOT};
-use crate::seed::{self, Algorithm, Seed256, Seed256Derive};
+use super::{SeededSmartcard, SlotRole};
+use crate::backend::cached;
+use crate::role::KeyRole;
+use crate::seed::{self, Algorithm, CardSerial, SecretSeed, Seed256, Seed256Derive};
 
 use anyhow::{Result, anyhow, bail};
 
-use yubikey::piv::{self, AlgorithmId, RetiredSlotId, RsaKeyData, SlotId};
-use yubikey::{MgmAlgorithmId, MgmKey, PinPolicy, TouchPolicy, YubiKey};
+use yubikey::piv::{self, AlgorithmId, RsaKeyData, SlotId};
+use yubikey::{CardId, MgmAlgorithmId, MgmKey, PinPolicy, TouchPolicy, YubiKey};
 
 use p256::ecdsa::SigningKey;
 
@@ -23,31 +25,35 @@ use der::asn1::BitString;
 use spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 use zeroize::Zeroizing;
 
-/// Derivation name for the card management key in slot 9B
-pub(super) const NAME_MANAGEMENT: &str = "management";
+/// Derivation name for the card management key in slot 9B, `pin:management:<kind>:<serial>`
+const NAME_MANAGEMENT: &str = "management";
 
-/// Algorithm segment of the triple DES management key, `key:management:tdes`
-///
-/// The AES-256 key predates the segment and keeps its bare `key:management` label, frozen
-/// with the rest of `mtg1`; the 3DES key is a later, additive label.
-pub(super) const SEGMENT_TDES: &str = "tdes";
+/// Credential kinds of the management key, one per algorithm the card may take
+const KIND_AES256: &str = "aes256";
+const KIND_TDES: &str = "tdes";
 
-/// Derivation name for the key management key, live in slot 9D and archived in a retired slot
+/// Derivation name for the puk, `pin:puk:ascii:<serial>`
+const NAME_PUK: &str = "puk";
+
+/// The longest puk a PIV card takes, in bytes
+pub(super) const PUK_LENGTH: usize = 8;
+
+/// Derivation name for the key management key, live in slot 9D or kept in a retired slot
 pub(super) const NAME_KEY_MANAGEMENT: &str = "key-management";
 
 /// Derivation name for the card identifier printed in the slot 9E subject
 const NAME_CARD_ID: &str = "card";
 
 /// Derivation name for the CHUID Card UUID
-pub(super) const NAME_CHUID_ID: &str = "chuid";
+const NAME_CHUID_ID: &str = "chuid";
 
 /// Derivation name for the CCC card identifier
-pub(super) const NAME_CCC_ID: &str = "ccc";
+const NAME_CCC_ID: &str = "ccc";
 
 /// A slot's private key: what the card imports, and the algorithm it is for
 pub(super) struct SlotKey {
-    algorithm: AlgorithmId,
-    secret: SlotSecret,
+    pub(super) algorithm: AlgorithmId,
+    pub(super) secret: SlotSecret,
 }
 
 /// The secret half of a slot key, in the shape its algorithm family imports
@@ -60,15 +66,18 @@ pub(super) enum SlotSecret {
 }
 
 impl SlotKey {
-    /// Derive the key for `role` under `parent` and `label`
-    fn derive(
-        parent: &Seed256,
-        label: &[u8],
-        role: SlotRole,
-        algorithm: Algorithm,
-    ) -> Result<Self> {
-        let rsa_bits = algorithm.rsa_bits();
-        let algorithm = role.card_algorithm(algorithm);
+    /// Derive a key for the card algorithm `algorithm` under `parent` and `label`
+    ///
+    /// Every key of the chain derives here, the authorities' as well as the slots', so that a
+    /// key that signs its own certificate is the one the card holds.
+    pub(super) fn derive(parent: &Seed256, label: &[u8], algorithm: AlgorithmId) -> Result<Self> {
+        let rsa_bits = match algorithm {
+            AlgorithmId::Rsa1024 => Some(1024),
+            AlgorithmId::Rsa2048 => Some(2048),
+            AlgorithmId::Rsa3072 => Some(3072),
+            AlgorithmId::Rsa4096 => Some(4096),
+            _ => None,
+        };
         let secret = match (algorithm, rsa_bits) {
             (_, Some(bits)) => SlotSecret::Rsa(Box::new(crate::rsa::derive_key(
                 &parent.derive(Some(label)),
@@ -89,7 +98,7 @@ impl SlotKey {
     }
 
     /// The raw bytes of an elliptic curve key
-    fn bytes(&self) -> Result<&Zeroizing<Vec<u8>>> {
+    pub(super) fn bytes(&self) -> Result<&Zeroizing<Vec<u8>>> {
         match &self.secret {
             SlotSecret::Bytes(bytes) => Ok(bytes),
             SlotSecret::Rsa(_) => bail!("{:?} keys are not raw bytes", self.algorithm),
@@ -122,7 +131,7 @@ impl SlotKey {
             AlgorithmId::X25519 => SubjectPublicKeyInfoOwned {
                 algorithm: AlgorithmIdentifierOwned { oid: piv::OID_X25519, parameters: None },
                 subject_public_key: BitString::from_bytes(
-                    X25519PublicKey::from(&StaticSecret::from(*self.seed()?)).as_bytes(),
+                    X25519PublicKey::from(&StaticSecret::from(**self.seed()?)).as_bytes(),
                 )?,
             },
             other => bail!("{other:?} is not a slot key algorithm this backend derives"),
@@ -130,9 +139,9 @@ impl SlotKey {
     }
 
     /// The bytes as the 32-byte seed the Curve25519 keys take
-    fn seed(&self) -> Result<Zeroizing<Seed256>> {
+    pub(super) fn seed(&self) -> Result<SecretSeed> {
         let bytes = self.bytes()?;
-        let mut seed = Zeroizing::new([0u8; 32]);
+        let mut seed: SecretSeed = Box::new(Zeroizing::new([0u8; 32]));
         if bytes.len() != seed.len() {
             bail!("{:?} key is {} bytes, not 32", self.algorithm, bytes.len());
         }
@@ -166,6 +175,16 @@ impl SlotKey {
             (SlotSecret::Bytes(bytes), AlgorithmId::EccP256 | AlgorithmId::EccP384) => {
                 piv::import_ecc_key(token, slot, self.algorithm, bytes, touch_policy, pin_policy)?
             }
+            // Clamped as RFC 7748 has every X25519 implementation do before use: the same key
+            // with the same public half, which a card that uses the bytes as they come
+            // (CanoKey) would otherwise turn into another, all-zero one
+            (SlotSecret::Bytes(bytes), AlgorithmId::X25519) => {
+                let mut clamped = bytes.clone();
+                clamped[0] &= 0b1111_1000;
+                clamped[31] &= 0b0111_1111;
+                clamped[31] |= 0b0100_0000;
+                piv::import_cv_key(token, slot, self.algorithm, &clamped, touch_policy, pin_policy)?
+            }
             (SlotSecret::Bytes(bytes), _) => {
                 piv::import_cv_key(token, slot, self.algorithm, bytes, touch_policy, pin_policy)?
             }
@@ -176,182 +195,180 @@ impl SlotKey {
 }
 
 impl SeededSmartcard {
-    /// Where a slot's key comes from: the seed it derives under and the label it uses
+    /// The private key of one usable key, the same wherever it is kept
     ///
-    /// A retired slot holds a *previous* generation's key management key, so it derives from
-    /// that generation's subseed under the very same label the live 9D key uses. Deriving it
-    /// by role rather than by slot is what lets an archived key be re-derived at all.
-    fn key_source(&self, slot: SlotId) -> Result<(Zeroizing<Seed256>, Vec<u8>)> {
-        let segment = SlotRole::of(slot).algorithm_segment(self.algorithm);
-
-        if let SlotId::Retired(retired) = slot {
-            let index = usize::from(u8::from(retired).saturating_sub(FIRST_RETIRED_SLOT));
-            let generation = self
-                .retired
-                .get(index)
-                .ok_or_else(|| anyhow!("No retired generation for {slot:?}"))?;
-
-            return Ok((
-                self.root.sub(Some(generation)),
-                seed::algorithm_label(NAME_KEY_MANAGEMENT, segment),
-            ));
-        }
-
-        // A deliberate copy of the slot's parent seed, wiped when the caller is done with it
-        Ok((
-            Zeroizing::new(*self.seed_for(slot)),
-            seed::algorithm_label(SlotRole::of(slot).name(), segment),
-        ))
-    }
-
-    /// The private key a slot holds, derived the same way whether it is certified or imported
-    pub(super) fn slot_key(&self, slot: SlotId) -> Result<SlotKey> {
-        let (seed, label) = self.key_source(slot)?;
-        SlotKey::derive(&seed, &label, SlotRole::of(slot), self.algorithm)
-    }
-
-    /// Slot each archived generation is written to, newest first from 0x82
-    pub(super) fn retired_slots(&self) -> Result<Vec<(SlotId, &str)>> {
-        // An archived generation re-derives as that generation's *per-card* key management
-        // key. Under --shared key-management there is no such key: the fleet-wide key is
-        // derived without any subkey id and never rotates with it, so the archive would hold
-        // a key no card ever carried -- and check could not catch it, because it compares
-        // against the same wrong derivation.
-        if !self.retired.is_empty() && self.shared.contains(&SharedSlot::KeyManagement) {
-            bail!(
-                "--retire archives per-card key management generations, which --shared \
-                 key-management does not produce: the shared key never rotates with the \
-                 subkey id, so there is no generation to archive. Drop one of the two flags."
-            );
-        }
-
-        self.retired
+    /// A device's keys derive from its own seed, the decryption key from the seed every card
+    /// of the identity shares; the slot the key ends up in plays no part, so a key kept in a
+    /// retired slot derives exactly as it did in 9D.
+    pub(super) fn role_key(&self, role: KeyRole) -> Result<&SlotKey> {
+        let index = KeyRole::ALL
             .iter()
-            .enumerate()
-            .map(|(index, generation)| {
-                let offset = u8::try_from(index)
-                    .ok()
-                    .and_then(|i| FIRST_RETIRED_SLOT.checked_add(i));
-                let slot = offset
-                    .and_then(|byte| RetiredSlotId::try_from(byte).ok())
-                    .ok_or_else(|| anyhow!("Only 20 generations fit in the retired slots"))?;
-
-                Ok((SlotId::Retired(slot), generation.as_str()))
-            })
-            .collect()
+            .position(|r| *r == role)
+            .expect("every role is among all of them");
+        cached(&self.derived.roles[index], || {
+            let seed = self.seeds.key()?.seed_for(role);
+            let slot_role = SlotRole::from(role);
+            let label = seed::algorithm_label(
+                slot_role.name(),
+                slot_role.algorithm_segment(self.algorithm),
+            );
+            SlotKey::derive(seed, &label, slot_role.card_algorithm(self.algorithm))
+        })
     }
 
-    /// Seed a slot key is derived from, which is the shared one only when asked for
-    fn seed_for(&self, slot: SlotId) -> &Seed256 {
-        if self.shared.iter().any(|entry| SlotId::from(*entry) == slot) {
-            &self.shared_seed
-        } else {
-            &self.subseed
-        }
-    }
-
-    /// Management key derived from the subkey generation seed, in `algorithm`
+    /// Management key of the card with this serial, in `algorithm`
     ///
-    /// Each algorithm derives under its own label, so the two keys share no bytes: the
-    /// 3DES key is not a truncation of the AES-256 one.
-    pub(super) fn management_key(&self, algorithm: MgmAlgorithmId) -> Result<MgmKey> {
-        // Moved in by value so our copy is wiped when `from_bytes` drops it; the `MgmKey`
-        // itself keeps an unwiped internal cipher-key copy, so callers keep it short-lived
+    /// Each algorithm derives under its own credential kind, so the two keys share no bytes:
+    /// the 3DES key is not a truncation of the AES-256 one.
+    pub(super) fn management_key(
+        &self,
+        algorithm: MgmAlgorithmId,
+        serial: &CardSerial,
+    ) -> Result<MgmKey> {
+        let root = self.seeds.card()?;
+        // Lent by reference, so the one copy of ours is wiped where it drops; the `MgmKey`
+        // keeps an unwiped copy of its own until yubikey.rs wipes it on drop, so callers
+        // keep it short-lived
         Ok(match algorithm {
             MgmAlgorithmId::Aes256 => {
-                MgmKey::from_bytes(self.subseed.key(NAME_MANAGEMENT), Some(algorithm))?
+                let key = root.credential(NAME_MANAGEMENT, KIND_AES256, serial);
+                MgmKey::from_bytes(&key[..], Some(algorithm))?
             }
             MgmAlgorithmId::ThreeDes => {
-                let label = seed::algorithm_label(NAME_MANAGEMENT, SEGMENT_TDES);
-                MgmKey::from_bytes(
-                    seed::derive_tdes_key(&self.subseed, Some(&label))?,
-                    Some(algorithm),
-                )?
+                let label = seed::credential_label(NAME_MANAGEMENT, KIND_TDES, serial);
+                MgmKey::from_bytes(seed::derive_tdes_key(root, Some(&label))?, Some(algorithm))?
             }
             other => bail!(
                 "The card's management key is {other:?}, which this tool never installs: \
-                 it was not provisioned by mind-the-gap"
+                 it was not initialized by mind-the-gap"
             ),
         })
     }
 
-    /// Card identifier used in the slot 9E subject.
+    /// The puk of the card with this serial, eight ASCII characters
     ///
-    /// Derived from the subkey generation seed rather than read off the card, so that
-    /// `certify` (which runs without hardware) and `upload` agree and `check` can compare.
-    pub(super) fn card_id(&self) -> String {
+    /// Derived rather than blocked, so that the card seed unblocks a forgotten pin without
+    /// wiping the keys; the card counts its tries like any puk's.
+    pub(super) fn puk(&self, serial: &CardSerial) -> Result<Zeroizing<String>> {
+        Ok(self
+            .seeds
+            .card()?
+            .ascii_credential(NAME_PUK, serial, PUK_LENGTH))
+    }
+
+    /// The card authentication key of the card with this serial, for `algorithm`
+    ///
+    /// The card's own key, from the card seed and bound to the serial: it says which card this
+    /// is, never who holds it, so it is no key of the identity's.
+    pub(super) fn card_authentication_key(
+        &self,
+        algorithm: Algorithm,
+        serial: &CardSerial,
+    ) -> Result<SlotKey> {
+        let label = super::ownership::card_authentication_label(algorithm, serial);
+        let algorithm = SlotRole::CardAuthentication.card_algorithm(algorithm);
+        SlotKey::derive(self.seeds.card()?, &label, algorithm)
+    }
+
+    /// The Card UUID the CHUID of the card with this serial carries
+    ///
+    /// SP 800-73-4 wants a valid UUID there, so the derived bytes carry RFC 4122's version 4
+    /// and variant bits, as a random UUID does, which leaves 122 of them derived.
+    pub(super) fn chuid_guid(&self, serial: &CardSerial) -> Result<Vec<u8>> {
+        let mut guid = self.seeds.card()?.card_id(NAME_CHUID_ID, serial, 16);
+        guid[6] = (guid[6] & 0x0f) | 0x40;
+        guid[8] = (guid[8] & 0x3f) | 0x80;
+        Ok(guid)
+    }
+
+    /// The card identifier the CCC of the card with this serial carries
+    pub(super) fn ccc_id(&self, serial: &CardSerial) -> Result<Vec<u8>> {
+        Ok(self
+            .seeds
+            .card()?
+            .card_id(NAME_CCC_ID, serial, CardId::BYTE_SIZE))
+    }
+
+    /// Card identifier used in the slot 9E subject
+    pub(super) fn card_id(&self, serial: &CardSerial) -> Result<String> {
         let derived: String = self
-            .subseed
-            .id(NAME_CARD_ID, 4)
+            .seeds
+            .card()?
+            .card_id(NAME_CARD_ID, serial, 4)
             .iter()
             .map(|byte| format!("{byte:02X}"))
             .collect();
 
-        seed::stamp(&derived)
+        Ok(seed::stamp(&derived))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::seed::{KeyPath, Seeds};
 
     use sha2::{Digest, Sha256};
-
-    use yubikey::CardId;
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
-    fn card(id: Option<&str>) -> SeededSmartcard {
-        SeededSmartcard::new(&[1u8; 32], id.map(String::from), "Alice".into())
+    fn card() -> SeededSmartcard {
+        SeededSmartcard::new(Seeds::one(&[1u8; 32]), KeyPath::default(), "Alice".into())
     }
 
-    /// The management keys are frozen with the slot keys, in both algorithms.
+    /// The card credentials are frozen with the keys, in both management key algorithms.
     ///
-    /// They are what `check` and a re-upload authenticate with, so a key that moved would
-    /// lock this tool out of every card it provisioned while the chain vectors, which never
-    /// see it, kept passing. Pinned by digest, which says as much as the key itself would
-    /// without putting key material in the source.
+    /// They are what `check`, `upload` and `pin --reset` authenticate with, so a credential
+    /// that moved would lock this tool out of every card it initialized while the chain
+    /// vectors, which never see it, kept passing. Pinned by digest, which says as much as the
+    /// credential itself would without putting key material in the source.
     #[test]
-    fn management_keys_are_frozen() {
-        for (id, aes, tdes) in [
+    fn card_credentials_are_frozen() {
+        for (serial, aes, tdes, puk_digest) in [
             (
-                None,
-                "3927d45938c9de2c4771b497081cb018e010591ecd0d1c5bedbdb5e1a362f3d1",
-                "2229662597d2ad0da01a67244d8eb26d1396dc1f23a3cdb6de2ba39b00508120",
+                12345678,
+                "eb3aa0eeb1c50a330727424f90d254300c7e639176ad12fa19f4f101cbc9f51a",
+                "dd9fcc4c3d0d20935861288b57afcbed8c6a3cb85bcf8aa6a4ef120ce6484c9c",
+                "899f6f310bd5fd0f91f06991500519d8f90c63d78f63169f6920ac79cebca536",
             ),
             (
-                Some("laptop"),
-                "e414ee36e34a924b06c3824cd43f800cb2ce77d82fa554efeccae5c4e8834dbf",
-                "19c18e8759c18c6ba240111e6f85be38e09bd25976a7b35447a4106ff5da5ffc",
+                87654321,
+                "a4b6cca026e29fe4d0c244320a12baf196ae24f26d6ca9fd01633ac5bf336f9f",
+                "1c64034bf0a6e8d80b13c9a3ed8683df4b3154b46c6226f88890c1aa9b2b9573",
+                "8f6177c306ce55a252836765b408a6b230611538fd5f98ceca73723ec5ab126f",
             ),
         ] {
+            let serial = CardSerial::piv(serial);
             let digest = |algorithm| {
-                hex(&Sha256::digest(card(id).management_key(algorithm).unwrap().as_ref()))
+                hex(&Sha256::digest(card().management_key(algorithm, &serial).unwrap().as_ref()))
             };
-            assert_eq!(digest(MgmAlgorithmId::Aes256), aes, "AES-256 key moved for {id:?}");
-            assert_eq!(digest(MgmAlgorithmId::ThreeDes), tdes, "3DES key moved for {id:?}");
+            assert_eq!(digest(MgmAlgorithmId::Aes256), aes, "AES-256 key moved for {serial}");
+            assert_eq!(digest(MgmAlgorithmId::ThreeDes), tdes, "3DES key moved for {serial}");
+            let puk = card().puk(&serial).unwrap();
+            assert_eq!(puk.len(), PUK_LENGTH);
+            assert_eq!(hex(&Sha256::digest(puk.as_bytes())), puk_digest, "puk moved for {serial}");
         }
     }
 
-    /// The CHUID and CCC identifiers are frozen too, at the widths `upload` writes them in.
+    /// The CHUID and CCC identifiers are frozen too, at the widths `init` writes them in.
     ///
     /// Middleware caches a card by them, so an identifier that moved would make a
-    /// re-provisioned card look like a stranger. Published on the card, so pinned as is.
+    /// re-initialized card look like a stranger. Published on the card, so pinned as is.
     #[test]
     fn card_identifiers_are_frozen() {
-        for (id, chuid, ccc) in [
-            (None, "7948e1b285064a006e78113c79e3ad0b", "7b941484fd2661967139968c0e82"),
-            (Some("laptop"), "ff9d6c3b6ca2ef20200ed103429c9a56", "8308caa682cc0b5cbdb426c06166"),
+        for (serial, chuid, ccc) in [
+            (12345678, "5cc4a86390f64577b7970a3c491bf2e8", "0c1905a11faa6fb5236d098b943e"),
+            (87654321, "f6e1e7cddbbb452aaef343236f66abfe", "bc75160cc177aedc6d0da3d28666"),
         ] {
-            let card = card(id);
-            assert_eq!(hex(&card.subseed.id(NAME_CHUID_ID, 16)), chuid, "CHUID moved for {id:?}");
+            let serial = CardSerial::piv(serial);
             assert_eq!(
-                hex(&card.subseed.id(NAME_CCC_ID, CardId::BYTE_SIZE)),
-                ccc,
-                "CCC card identifier moved for {id:?}"
+                hex(&card().chuid_guid(&serial).unwrap()),
+                chuid,
+                "CHUID moved for {serial}"
             );
+            assert_eq!(hex(&card().ccc_id(&serial).unwrap()), ccc, "CCC moved for {serial}");
         }
     }
 }

@@ -7,11 +7,23 @@
 
 use std::ffi::{CStr, CString};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+
+/// A PC/SC context, or the error that names the way out when the resource manager is not
+/// there to give one
+pub(crate) fn context() -> Result<pcsc::Context> {
+    pcsc::Context::establish(pcsc::Scope::User).map_err(|err| match err {
+        pcsc::Error::NoService | pcsc::Error::ServiceStopped => anyhow!(
+            "pcscd is not running: start it (`systemctl start pcscd.socket` where systemd \
+             runs), or see the chapter on cards on a Linux system"
+        ),
+        err => err.into(),
+    })
+}
 
 /// The PC/SC context and the names of every reader it sees
 pub(crate) fn list() -> Result<(pcsc::Context, Vec<CString>)> {
-    let context = pcsc::Context::establish(pcsc::Scope::User)?;
+    let context = context()?;
     let mut names = vec![0; context.list_readers_len()?];
     let readers = context
         .list_readers(&mut names)?
@@ -68,34 +80,41 @@ pub(crate) fn select(aid: &[u8]) -> Vec<u8> {
     apdu
 }
 
-/// The value of the first `tag` in a run of BER-TLV objects, descending into constructed
-/// ones; tags of one or two bytes, lengths in the short or 81/82 form, as the cards here use
+/// One BER-TLV object, split off the front of `data`: its tag, whether it is constructed, its
+/// value and what follows it
+///
+/// Tags of one or two bytes and lengths in the short or 81/82 form, as the cards here use;
+/// `None` for anything else or for an object cut short.
+pub(crate) fn split_tlv(data: &[u8]) -> Option<(u16, bool, &[u8], &[u8])> {
+    let first = *data.first()?;
+    let (tag, header) = match first {
+        first if first & 0x1F == 0x1F => (u16::from_be_bytes([first, *data.get(1)?]), 2),
+        first => (u16::from(first), 1),
+    };
+    let (len, len_size) = match *data.get(header)? {
+        0x81 => (usize::from(*data.get(header + 1)?), 2),
+        0x82 => {
+            (usize::from(u16::from_be_bytes([*data.get(header + 1)?, *data.get(header + 2)?])), 3)
+        }
+        short if short < 0x80 => (usize::from(short), 1),
+        _ => return None,
+    };
+    let start = header + len_size;
+    let value = data.get(start..start + len)?;
+    Some((tag, first & 0x20 != 0, value, &data[start + len..]))
+}
+
+/// The value of the first `tag` in a run of BER-TLV objects, descending into constructed ones
 pub(crate) fn find_tlv(mut data: &[u8], tag: u16) -> Option<&[u8]> {
     while !data.is_empty() {
-        let (found, constructed, header) = match data[0] {
-            first if first & 0x1F == 0x1F => {
-                (u16::from_be_bytes([first, *data.get(1)?]), first & 0x20 != 0, 2)
-            }
-            first => (u16::from(first), first & 0x20 != 0, 1),
-        };
-        let (len, len_size) = match *data.get(header)? {
-            0x81 => (usize::from(*data.get(header + 1)?), 2),
-            0x82 => (
-                usize::from(u16::from_be_bytes([*data.get(header + 1)?, *data.get(header + 2)?])),
-                3,
-            ),
-            short if short < 0x80 => (usize::from(short), 1),
-            _ => return None,
-        };
-        let start = header + len_size;
-        let value = data.get(start..start + len)?;
+        let (found, constructed, value, rest) = split_tlv(data)?;
         if found == tag {
             return Some(value);
         }
         if constructed && let Some(inner) = find_tlv(value, tag) {
             return Some(inner);
         }
-        data = &data[start + len..];
+        data = rest;
     }
     None
 }

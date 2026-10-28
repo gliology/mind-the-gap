@@ -44,7 +44,7 @@ impl FromStr for CardTarget {
         }
         Err(format!(
             "'{text}' names no card: give a PIV serial number (digits), an OpenPGP identifier \
-             (MMMM:SSSSSSSS) or a reader name, as `piv status` and `pgp status` show them"
+             (MMMM:SSSSSSSS) or a reader name, as `list` shows them"
         ))
     }
 }
@@ -56,6 +56,104 @@ impl fmt::Display for CardTarget {
             CardTarget::Ident(ident) => f.write_str(ident),
             CardTarget::Reader(reader) => write!(f, "the card in reader '{reader}'"),
         }
+    }
+}
+
+/// One attached reader, and the applets its card answers to
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attached {
+    /// The reader's name, which addresses the card in it
+    pub reader: String,
+    /// The serial its PIV application reports
+    pub piv: Option<u32>,
+    /// The identifier of its OpenPGP application
+    pub pgp: Option<String>,
+}
+
+impl Attached {
+    /// Whether this is the card `target` names
+    pub fn is(&self, target: &CardTarget) -> bool {
+        match target {
+            CardTarget::Serial(serial) => self.piv == Some(*serial),
+            CardTarget::Ident(ident) => self
+                .pgp
+                .as_ref()
+                .is_some_and(|own| own.eq_ignore_ascii_case(ident)),
+            CardTarget::Reader(reader) => self.reader == *reader,
+        }
+    }
+
+    /// The card as messages name it
+    pub fn describe(&self) -> String {
+        let mut applets = Vec::new();
+        if let Some(serial) = self.piv {
+            applets.push(format!("PIV {serial}"));
+        }
+        if let Some(ident) = &self.pgp {
+            applets.push(format!("OpenPGP {ident}"));
+        }
+        let reader = crate::common::printable(&self.reader);
+        if applets.is_empty() {
+            format!("'{reader}' (no PIV or OpenPGP application)")
+        } else {
+            format!("'{reader}' ({})", applets.join(", "))
+        }
+    }
+}
+
+/// Every reader with a card in it, and the applets each card answers to, asked without
+/// disturbing any of them
+pub fn attached() -> anyhow::Result<Vec<Attached>> {
+    let (context, readers) = crate::readers::list()?;
+    let mut found = Vec::new();
+    for reader in readers {
+        // Both applets in one question; an empty reader cannot be asked and is no card at all
+        let Ok(applets) = crate::readers::ask(&context, &reader, |transaction| {
+            Some((crate::piv::read_serial(transaction), crate::pgp::read_ident(transaction)))
+        }) else {
+            continue;
+        };
+        let (piv, pgp) = applets.unwrap_or_default();
+        found.push(Attached { reader: reader.to_string_lossy().into_owned(), piv, pgp });
+    }
+    Ok(found)
+}
+
+/// The one card `target` names, or the only one attached where it names none
+pub fn locate(target: Option<&CardTarget>) -> anyhow::Result<Attached> {
+    let cards = attached()?;
+    let listing = || {
+        cards
+            .iter()
+            .map(|card| format!("  {}", card.describe()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    match target {
+        Some(target) => cards
+            .iter()
+            .find(|card| card.is(target))
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No card {target} attached; the attached ones:\n{}",
+                    if cards.is_empty() {
+                        "  none".into()
+                    } else {
+                        listing()
+                    }
+                )
+            }),
+        None => match cards.as_slice() {
+            [] => anyhow::bail!("No card attached, please insert one"),
+            [only] => Ok(only.clone()),
+            _ => anyhow::bail!(
+                "{} cards are attached, name one with --card, by its PIV serial, OpenPGP \
+                 identifier or reader:\n{}",
+                cards.len(),
+                listing()
+            ),
+        },
     }
 }
 

@@ -10,7 +10,7 @@ const DEFAULT_HASH: [u8; 32] = [
 
 #[test]
 fn test_argon2() {
-    assert_eq!(*argon2id_256(DEFAULT_INPUT, None), DEFAULT_HASH);
+    assert_eq!(**argon2id_256(DEFAULT_INPUT, None), DEFAULT_HASH);
 }
 
 /// Report the wall-clock cost of one derivation.

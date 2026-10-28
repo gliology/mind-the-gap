@@ -98,8 +98,9 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 ///    65537 (the public exponent, itself prime, so this is `gcd(p - 1, e) = 1`).
 /// 4. `q` is the first later candidate with the same properties that also lies more than
 ///    `2^(bits/2 - 100)` away from `p`.
-/// 5. FIPS 186-5 gives up after `5 · bits` candidates for `p` and `10 · bits` for `q`; so
-///    does this, as an error that no real seed is expected to reach.
+/// 5. It gives up after `5 · bits` candidates for `p` and `10 · bits` for `q`, twice the
+///    bounds of FIPS 186-5 (which counts in half the modulus size), as an error that no
+///    real seed is expected to reach.
 ///
 /// The key is `(p, q)` in that order with `e = 65537`; the private exponent is whatever the
 /// `rsa` crate computes from them, which changes nothing that is published: public keys and

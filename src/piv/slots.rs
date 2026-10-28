@@ -5,6 +5,7 @@ use super::{
     keys::NAME_KEY_MANAGEMENT,
 };
 use crate::policy::{Pin, Touch};
+use crate::role::KeyRole;
 use crate::seed::Algorithm;
 
 use yubikey::piv::{AlgorithmId, SlotId};
@@ -34,6 +35,16 @@ pub enum SlotRole {
     KeyManagement,
     /// Slot 9E: PIN-less card-to-reader authentication
     CardAuthentication,
+}
+
+impl From<KeyRole> for SlotRole {
+    fn from(role: KeyRole) -> Self {
+        match role {
+            KeyRole::Authentication => SlotRole::Authentication,
+            KeyRole::Signature => SlotRole::Signature,
+            KeyRole::Decryption => SlotRole::KeyManagement,
+        }
+    }
 }
 
 impl SlotRole {
@@ -72,8 +83,8 @@ impl SlotRole {
     /// Derivation name for the role's key, by the *role* rather than where it sits
     ///
     /// Positional names (`slot-9d`) would tie a key to one slot, but the retired slots hold
-    /// superseded key management keys: the same key has to derive identically whether it lives
-    /// in 9D or in 0x82, or an archived generation could never be re-derived.
+    /// earlier or other identities' key management keys: the same key has to derive identically
+    /// whether it lives in 9D or in 0x82, or an archived key could never be re-derived.
     pub(super) fn name(self) -> &'static str {
         match self {
             SlotRole::Authentication => "authentication",
@@ -108,14 +119,6 @@ impl SlotRole {
         }
     }
 
-    /// Whether certificates in this role carry the user's alternative names.
-    ///
-    /// Slot 9E authenticates the *card*, not the person, so it stays unbound (FIPS 201-3
-    /// section 4.2.3).
-    pub(super) fn is_user_bound(&self) -> bool {
-        *self != SlotRole::CardAuthentication
-    }
-
     /// Label segment of this role's key under `algorithm`: key management agrees, the rest sign
     pub(super) fn algorithm_segment(&self, algorithm: Algorithm) -> &'static str {
         match self {
@@ -139,7 +142,7 @@ impl SlotRole {
 }
 
 impl SeededSmartcard {
-    /// Effective pin and touch policy for a slot, from the card's [`Policy`](crate::policy::Policy)
+    /// Effective pin and touch policy for a slot, from the [`Policy`](crate::policy::Policy)
     pub(super) fn policies_for(&self, slot: SlotId) -> (PinPolicy, TouchPolicy) {
         match slot {
             // The card authentication key MUST be usable without cardholder verification, and

@@ -1,77 +1,493 @@
-//! The frozen `mtg1` vectors: every algorithm, both subkey ids, pinned by digest.
+//! The frozen `mtg1` vectors: every algorithm, three key paths, the card's own key, pinned by
+//! digest.
 
-use crate::{SEED_A, digest};
+use crate::frozen::{PATHS, key_path};
+use crate::hex::hex;
+use crate::{SEED_A, SEED_B, digest, list_url};
 
 use mind_the_gap::piv::{CertificateKind, SeededSmartcard};
-use mind_the_gap::seed::Algorithm;
+use mind_the_gap::role::KeyRole;
+use mind_the_gap::seed::{Algorithm, CardSerial, KeyPath, Seeds};
 
+use x509_cert::Certificate;
 use x509_cert::der::Encode;
 
-use std::time::{Duration, SystemTime};
+/// One pinned certificate: its SPKI digest, its DER digest, and its subject
+type Pinned = (&'static str, &'static str, &'static str);
 
-use yubikey::piv::SlotId;
+/// One algorithm's chains, a root and three slot certificates per path in [`PATHS`]
+type Vectors = [[Pinned; 4]; 3];
 
 /// The P-256 vectors, the algorithm a card gets when none is chosen
-const P256: [(Option<&str>, [Pinned; 5]); 2] = [
+const P256: Vectors = [
+    [
+        (
+            "ab8c5adc194c66ed2163f08d4606a753133005840f5e5448f602a0af93bd6cf4",
+            "397a1d53f30029fcde4cf20d144066b7d8fd819b5932b32a70850abdc79835f1",
+            "CN=Alice PIV Root CA p256",
+        ),
+        (
+            "f219e92899232df5f5b24cb1eb7bba2b647db7a6fe96c78852aac327bfa8758b",
+            "221c0639b6b74ff11a132a2eed2057cff4f993bdf8f3b890fdaa16b342208952",
+            "CN=Alice",
+        ),
+        (
+            "804fab25c059b02c1297d0e58933ec07b2cac35c8d9fd838c8bea396e5b64cf3",
+            "58508c4d4a4fe20b251f2c5064b1aa389cbd933d7095ad6bbd5804f6e3fb3fc0",
+            "CN=Alice",
+        ),
+        (
+            "27f3fb55442906022080c97a469d8aee53d0ea378dc39fecd12af73fe4d5fdf0",
+            "ebb9b86fba3c7efb92ba4cf1e929d4312dab52f238e260b7238db45d24b25015",
+            "CN=Alice",
+        ),
+    ],
+    [
+        (
+            "ab8c5adc194c66ed2163f08d4606a753133005840f5e5448f602a0af93bd6cf4",
+            "397a1d53f30029fcde4cf20d144066b7d8fd819b5932b32a70850abdc79835f1",
+            "CN=Alice PIV Root CA p256",
+        ),
+        (
+            "5f22bc03848271a3b6e524b9e327eaceef0ae31b379ffa4bb3511bb3f189eda7",
+            "3bc06437c917f7c95c7b4601daff3c3d19c5ddb3914e6beb1bb8ebfc0568f5c8",
+            "CN=Alice",
+        ),
+        (
+            "555ad0a77ef68e4eb556d49551d0a948685077c64956d61fc5bda926c7a751ab",
+            "b260dc6376c23f2f74091876fbb545db4747d4b9b781729ed0217f44af54d92b",
+            "CN=Alice",
+        ),
+        (
+            "27f3fb55442906022080c97a469d8aee53d0ea378dc39fecd12af73fe4d5fdf0",
+            "ebb9b86fba3c7efb92ba4cf1e929d4312dab52f238e260b7238db45d24b25015",
+            "CN=Alice",
+        ),
+    ],
+    [
+        (
+            "ab8c5adc194c66ed2163f08d4606a753133005840f5e5448f602a0af93bd6cf4",
+            "397a1d53f30029fcde4cf20d144066b7d8fd819b5932b32a70850abdc79835f1",
+            "CN=Alice PIV Root CA p256",
+        ),
+        (
+            "6e82560ce4119280ff2de6e63dd06050e29ba33d6d3fdbe695bc715be6a0bd58",
+            "d73efa31ef7931ed7d670f005807cb5c74cc717523aaa120d19e287dfc45d233",
+            "CN=Alice",
+        ),
+        (
+            "c8e706c8636a1f60ba3d228044ae055e8827eff787b1ed005f73c6e5f0e228ce",
+            "94f5dcdc6a92d728efa0aecd3b87871f6367dd9fcca980fb01eb272a3395d36a",
+            "CN=Alice",
+        ),
+        (
+            "45b2815909260e2c175ee7c96353e1f1cbdb42a8a4e65bfe0dcaf35e2c057f28",
+            "5e62b4fe6270ee3c64ce4eacf29dd6505a9320054c8a145082f9dae46f80063e",
+            "CN=Alice",
+        ),
+    ],
+];
+
+/// The Curve25519 vectors: Ed25519 signatures are deterministic, so the DER pins
+const CURVE25519: Vectors = [
+    [
+        (
+            "215875f0a056960c48ab72d9031eb87fef9e56935bc74220d96739f7eb0890cc",
+            "ec0bbd6d762fc5d331f527ae60539c658227809ff82aa5f61efd9acb120d0580",
+            "CN=Alice PIV Root CA curve25519",
+        ),
+        (
+            "d74c39e183bc75865ee4e4dc55c44f63a453d2120a56e284a387ec467ab3c2bb",
+            "c49cc7e1c491afae57945134235578f6ad01df9d2e6f8e497c28f8d9d0b9bf04",
+            "CN=Alice",
+        ),
+        (
+            "d88caf2184002b68071db52db63ad14f9c2b830cdf416bc25ab674b843224170",
+            "e0533ccd1f3dbb174b40b65553b72809b79d1ca60570882ab82e691a85e70922",
+            "CN=Alice",
+        ),
+        (
+            "1e0920baa37055c703589903d8f384b3bd24f50323f3491541495a292e382222",
+            "b3294eda27356b314b474b8d264968ba21c5b369317a8ceeb643160c399bef73",
+            "CN=Alice",
+        ),
+    ],
+    [
+        (
+            "215875f0a056960c48ab72d9031eb87fef9e56935bc74220d96739f7eb0890cc",
+            "ec0bbd6d762fc5d331f527ae60539c658227809ff82aa5f61efd9acb120d0580",
+            "CN=Alice PIV Root CA curve25519",
+        ),
+        (
+            "b29e70e6954f77a46ddbfe461e3b873dd8fdd8df5d93b3b556ad3984dcf72fb4",
+            "6e0bac4aa1ad18dca67a97da3c86fcb29fcc4e2a15608dd4c89bbeb32424ccce",
+            "CN=Alice",
+        ),
+        (
+            "8cfc7e206526f869ef0a551255bcc3267f3be9ff9a6e0900c0a0da6e132568be",
+            "9025536e9a01f966c17c19ec818578c70557f442e58d8e2ddfcf41c73d967845",
+            "CN=Alice",
+        ),
+        (
+            "1e0920baa37055c703589903d8f384b3bd24f50323f3491541495a292e382222",
+            "b3294eda27356b314b474b8d264968ba21c5b369317a8ceeb643160c399bef73",
+            "CN=Alice",
+        ),
+    ],
+    [
+        (
+            "215875f0a056960c48ab72d9031eb87fef9e56935bc74220d96739f7eb0890cc",
+            "ec0bbd6d762fc5d331f527ae60539c658227809ff82aa5f61efd9acb120d0580",
+            "CN=Alice PIV Root CA curve25519",
+        ),
+        (
+            "7f687f06ac2d9632183d3497909d794f3c28999306fdbc89b8fdc7b6be8727b8",
+            "d69c92c34a50347b7596e2b64c91727f5631aad8e13a416fb243a80fb5c7d15e",
+            "CN=Alice",
+        ),
+        (
+            "0d920dfd885f1b4a197d28b377759a7da0766d0a40db3f33dcf4d0967c871c66",
+            "1008bd8b64b98aca15b3319580c54190ae49586837c6f8287296419b4c84a0df",
+            "CN=Alice",
+        ),
+        (
+            "93a11e7570d549e97e0b99106551b53217656eb11229795e8c485dc6d74d4c85",
+            "2917fb8330bf9f9869cb984060f767f63778685143fdab11dcc661f7e9220cc3",
+            "CN=Alice",
+        ),
+    ],
+];
+
+/// The P-384 vectors, under the documented 48-byte construction; ECDSA signatures use RFC 6979
+/// nonces, so the DER pins
+const P384: Vectors = [
+    [
+        (
+            "189c2070280dba26725e96dbb16fb86a20b98115c8aeb18c4656c25f262f4187",
+            "916e42a0dc9a177f83d3698232987f800bfb244ba44bd6044f76f4f4af0c3f25",
+            "CN=Alice PIV Root CA p384",
+        ),
+        (
+            "fe78bdb592d99b5c8d1dc51b2f42d19f4047b546ec4b325bc8207903889c3411",
+            "8d111cec3226685aa0bb883aae849732abcc68c7697a3d34da2105da448e2808",
+            "CN=Alice",
+        ),
+        (
+            "108c4ef0b7d1d74b81e3e6101ff2a006dda65747e69d602f66963674874c38cf",
+            "6b9b285a1a64325c76337c02b57933a2daa1330c861b94187e1013ef4374cd1a",
+            "CN=Alice",
+        ),
+        (
+            "dc1dd215d4c57fe938ccaab3a2d5b3f127976d9d5dfffd77e692aac668244bc3",
+            "998ac765b3bd3b00c8b528abd359ea5d4d5826cfa66fa4142dad202a986b2acf",
+            "CN=Alice",
+        ),
+    ],
+    [
+        (
+            "189c2070280dba26725e96dbb16fb86a20b98115c8aeb18c4656c25f262f4187",
+            "916e42a0dc9a177f83d3698232987f800bfb244ba44bd6044f76f4f4af0c3f25",
+            "CN=Alice PIV Root CA p384",
+        ),
+        (
+            "aaec61040c30ae1e3fdb62590d4ebde9b3f51856aa183db8e6198a9e079e2251",
+            "6136460a3fe0f11bdc5e7827d087bbe4739a02c0464e6c55fff9ba926c55c8ce",
+            "CN=Alice",
+        ),
+        (
+            "224679124975033922323ddb5121c35da9cf86fc0e068bfe7c7f95476769b712",
+            "43220c5192868fb01babfa2be00a9799e53e7483e79c9f4ddaec0e524ca56af6",
+            "CN=Alice",
+        ),
+        (
+            "dc1dd215d4c57fe938ccaab3a2d5b3f127976d9d5dfffd77e692aac668244bc3",
+            "998ac765b3bd3b00c8b528abd359ea5d4d5826cfa66fa4142dad202a986b2acf",
+            "CN=Alice",
+        ),
+    ],
+    [
+        (
+            "189c2070280dba26725e96dbb16fb86a20b98115c8aeb18c4656c25f262f4187",
+            "916e42a0dc9a177f83d3698232987f800bfb244ba44bd6044f76f4f4af0c3f25",
+            "CN=Alice PIV Root CA p384",
+        ),
+        (
+            "9491c2fcb020fb29e00dd79785e2b1c37793ba26fc9571919c24b4a674a4ee4c",
+            "7bd336f1b17a985e9f0228a3e4103942511ac7c02b4fa6335a02f4a7bf5e89c6",
+            "CN=Alice",
+        ),
+        (
+            "e7816e4d584928570f9ebafbb14a33f62b1ec42266a7535226ebe44b1fafa9de",
+            "b5c1a2de404a124e491958cdae2873e983626c8778bb6ea3e108d6767effb5c5",
+            "CN=Alice",
+        ),
+        (
+            "595812b41feff9f8a1ea593e938f9fd9b517d937372824f6d541a8da4275e4c7",
+            "8f58c255b9d1123ae9a4a25af806630b3ecbf19d53b6f8ce947ef2a080fa7b94",
+            "CN=Alice",
+        ),
+    ],
+];
+
+/// The RSA-2048 vectors: PKCS#1 v1.5 signatures are deterministic, so the DER pins
+const RSA2048: Vectors = [
+    [
+        (
+            "f8f92dc72cc7216fe612da655ec461bda33e6f33bddfbbcc668b40c29c867653",
+            "314f75e04a4606f82fdb55b226032446ac7373125020c848c92ee11ae81b1a93",
+            "CN=Alice PIV Root CA rsa2048",
+        ),
+        (
+            "267b03d30c578e34ebbdf3076d29984b7a3246f4fcd34b4ca6c5e0ac9a50ab8d",
+            "7849d7a9368d5f03d350dc3e62f1625c46defa1a6e4e57630b2fcc5782b4336b",
+            "CN=Alice",
+        ),
+        (
+            "f93be5522c884e372ccfc10724e6d0fc06113493e26d4e7b0b8c4416d24f1dd0",
+            "eff8eb1f3fca4af06bb6b43534931a92795c97cf8d04049d722561552dbfc2bd",
+            "CN=Alice",
+        ),
+        (
+            "435bdd3edd6472eac8f5f0387efe9b23e5636c34dd7cf6c2ffc8fcb9f2a1ea32",
+            "167637439fa06cf8919e145b00bf22c8f0787b954b4812ad0bc0364c64442bdb",
+            "CN=Alice",
+        ),
+    ],
+    [
+        (
+            "f8f92dc72cc7216fe612da655ec461bda33e6f33bddfbbcc668b40c29c867653",
+            "314f75e04a4606f82fdb55b226032446ac7373125020c848c92ee11ae81b1a93",
+            "CN=Alice PIV Root CA rsa2048",
+        ),
+        (
+            "ac20c26aba31ca03944fde6dc35821efa76ea55214657f42a90f376281fbd11b",
+            "e5598b957bb025beccfafeefb5c28f899edb065143848fbb08cec2cba7abbaef",
+            "CN=Alice",
+        ),
+        (
+            "169a6af8a2f731f13496aeac4a8b4fb28b8733fa027725ac6454d524d74bd4bd",
+            "84f14449b1252538fc26f9d3e00abf8d07bed6a6c751aca0bd1b65edde7f0c11",
+            "CN=Alice",
+        ),
+        (
+            "435bdd3edd6472eac8f5f0387efe9b23e5636c34dd7cf6c2ffc8fcb9f2a1ea32",
+            "167637439fa06cf8919e145b00bf22c8f0787b954b4812ad0bc0364c64442bdb",
+            "CN=Alice",
+        ),
+    ],
+    [
+        (
+            "f8f92dc72cc7216fe612da655ec461bda33e6f33bddfbbcc668b40c29c867653",
+            "314f75e04a4606f82fdb55b226032446ac7373125020c848c92ee11ae81b1a93",
+            "CN=Alice PIV Root CA rsa2048",
+        ),
+        (
+            "a922fd616beba8694a5b7971df9dc4a32e7769b608d85ff98e4dc62d0adcd06e",
+            "61c227561aeab43b82643a6d546982ac23f68e131cacdc7762b674396dccf5da",
+            "CN=Alice",
+        ),
+        (
+            "65f1e4e63e117cb41997fc502044630bbbe5265d821995ab0768809b139abdac",
+            "0c12f59b9308a2f9eef301cda45c19e0d85b70183ec304d109000899efd36a79",
+            "CN=Alice",
+        ),
+        (
+            "0d5673dcead17098d4d686f078a535c019f116fb619845fc0cb7c99ed775c293",
+            "03dc2503ef4a5a20c831aaa2e792f18c500f5be9e78b0c21f89f67c46b86e730",
+            "CN=Alice",
+        ),
+    ],
+];
+
+/// The RSA-3072 vectors
+const RSA3072: Vectors = [
+    [
+        (
+            "786bfbf1cfa1f0914ac65c021c37bbf445b7cde9e4a5f7b8bdd2cb695103ce84",
+            "feeb26070dd5090ec445d4b58ebf24fb7e4149fdc4137926d9a9b36c8c0faab4",
+            "CN=Alice PIV Root CA rsa3072",
+        ),
+        (
+            "292b3d04ae27d094889dce616d0e8d77ef5d907f16281d9f7897e94ab1fd3d59",
+            "26980822b9b04eda29b90ea780753e8c536a62c33719ff5598d4dd580506ad35",
+            "CN=Alice",
+        ),
+        (
+            "2c34e33a17b3ea667466da96e5c83cfbb3553b69a438edceba7fe4ab21fda1aa",
+            "a67fca775442ecdcf284568593845fdb7ef9f0dfd4f0ede1b48ac0fb97ec7458",
+            "CN=Alice",
+        ),
+        (
+            "ece889633668dc8aef68c0e21a4423ec375a759816fcf1ed754ccd80908712dc",
+            "d4b187844f57bb33b73fbb5b3509d4174b4bbf01a325914dbe7070fd0b8bc29e",
+            "CN=Alice",
+        ),
+    ],
+    [
+        (
+            "786bfbf1cfa1f0914ac65c021c37bbf445b7cde9e4a5f7b8bdd2cb695103ce84",
+            "feeb26070dd5090ec445d4b58ebf24fb7e4149fdc4137926d9a9b36c8c0faab4",
+            "CN=Alice PIV Root CA rsa3072",
+        ),
+        (
+            "52afa0e5a9ea7e9b38350d14b66b8a70308fd391c4f79e8de7e0f46628dcf547",
+            "9fae23421be433eb4e58b49952322b308fef211a5ca3c878d1beb2b41700c2ff",
+            "CN=Alice",
+        ),
+        (
+            "a19ca5869280975fd143704e1e9df7fd088860e2f42d07d07d56af1754e4a313",
+            "56c4b7d566765ab7c2362a562ea325c3e779db199b9c12059487d0660d9f0a27",
+            "CN=Alice",
+        ),
+        (
+            "ece889633668dc8aef68c0e21a4423ec375a759816fcf1ed754ccd80908712dc",
+            "d4b187844f57bb33b73fbb5b3509d4174b4bbf01a325914dbe7070fd0b8bc29e",
+            "CN=Alice",
+        ),
+    ],
+    [
+        (
+            "786bfbf1cfa1f0914ac65c021c37bbf445b7cde9e4a5f7b8bdd2cb695103ce84",
+            "feeb26070dd5090ec445d4b58ebf24fb7e4149fdc4137926d9a9b36c8c0faab4",
+            "CN=Alice PIV Root CA rsa3072",
+        ),
+        (
+            "bfa372e4cf2b9165cbbcb6943cced77781ce132ab8bd33b206e21fe9fca330db",
+            "f863c39cccdc6ab56d420e7dfed4980bb797e8f4b053cc01068627b5c19e4e69",
+            "CN=Alice",
+        ),
+        (
+            "106bb89c03b4e687fbfe07df030d596d0f348bdb4b4a2c57172923496b12679b",
+            "af4194b8cef5e0c0e16ff2cc382c0f5ed798447adacf7cf16127b2ab8f15d735",
+            "CN=Alice",
+        ),
+        (
+            "5a435bc3ae33bc6ea92bd10df22df93b98f91426adb82a6cabbd3b3678128222",
+            "bccfa3daac89b25d5cbcb7baf460876258bfc4478754ab40329bd1e35b2ac90c",
+            "CN=Alice",
+        ),
+    ],
+];
+
+/// The RSA-4096 vectors
+const RSA4096: Vectors = [
+    [
+        (
+            "5ca3d47b84ae42da24b5c625342bc5298de67d439f325bd7acb3e2d3002a0d15",
+            "2f40b23f1088b0f0c93d54903f7df2e57c7daf64d16529feb87dc2132cfc20d1",
+            "CN=Alice PIV Root CA rsa4096",
+        ),
+        (
+            "94ab772d8f424f89bcef086fdb85bd54f3e9a5c6b0590eaaf0a3b88f32965412",
+            "43321385b5e8035f883effa5659535e02d72b3c0cba50a0050e4ea1ef20421ac",
+            "CN=Alice",
+        ),
+        (
+            "df081c02e4b4b0b4e4be4226c238a5badab2ee280263483d0723bf8a538495ec",
+            "f7d17be6bf6fdd931a690a67c9fbfa72ba8f1c44c861bbf154dd5d82d3ec4d2e",
+            "CN=Alice",
+        ),
+        (
+            "d4661eee029d85b2d21400cc2875514ab65ab73464355227260ff8068ea0821e",
+            "616e8779d61cdaf0541ba7fcb22f3a65db559a05a86b5f5ee04934fe1c040612",
+            "CN=Alice",
+        ),
+    ],
+    [
+        (
+            "5ca3d47b84ae42da24b5c625342bc5298de67d439f325bd7acb3e2d3002a0d15",
+            "2f40b23f1088b0f0c93d54903f7df2e57c7daf64d16529feb87dc2132cfc20d1",
+            "CN=Alice PIV Root CA rsa4096",
+        ),
+        (
+            "28e6664817841e7c7b126703ff1587f3a8c00479e7a326aa6143781468b8617e",
+            "6ab6ec05a8fdd583115dbc083749b159bddfb631b76febae6237231ed469a8e8",
+            "CN=Alice",
+        ),
+        (
+            "f526a2bf452f04e5e29df964590002846f34c9d722191b0f38a3c21c5da4e336",
+            "db79bfd696b7ed3c54bb23cde9c8184f743e391bb92d9f4b82f08e472e136e85",
+            "CN=Alice",
+        ),
+        (
+            "d4661eee029d85b2d21400cc2875514ab65ab73464355227260ff8068ea0821e",
+            "616e8779d61cdaf0541ba7fcb22f3a65db559a05a86b5f5ee04934fe1c040612",
+            "CN=Alice",
+        ),
+    ],
+    [
+        (
+            "5ca3d47b84ae42da24b5c625342bc5298de67d439f325bd7acb3e2d3002a0d15",
+            "2f40b23f1088b0f0c93d54903f7df2e57c7daf64d16529feb87dc2132cfc20d1",
+            "CN=Alice PIV Root CA rsa4096",
+        ),
+        (
+            "9953e449aca29753b2a4f64809dd2d27e4eb5ddf555449c898e492f6bf112e00",
+            "5f784c40c539f293c3efc5433491d58bd1f591ae568ae180cd0c8de74f024513",
+            "CN=Alice",
+        ),
+        (
+            "ce5fd450879d9515d2051f1a6d668c40ef89bec95e91b65eaaf2a800ecb43036",
+            "b86ef73a4a0290c85b3299fbecfec02dcbfbea26ba05dd83f52522fcb98b8c1c",
+            "CN=Alice",
+        ),
+        (
+            "8edeb9c2c172924092761a1dfb9b8cfb1ae18a90e996166ef41fe2951bbeb87d",
+            "2a80328d86c4767c602c234466a175d7ded48ac8d06fcef49744a5d5070c88c0",
+            "CN=Alice",
+        ),
+    ],
+];
+
+/// The card authentication certificate of card 12345678, per algorithm
+const CARD_AUTHENTICATION: [(Algorithm, Pinned); 6] = [
     (
-        None,
-        [
-            (
-                "ab8c5adc194c66ed2163f08d4606a753133005840f5e5448f602a0af93bd6cf4",
-                "861b8296ec2ebe1cb370b18db1e0ade1bc55b4eeb7f117aee85e7260be782c08",
-                "CN=Alice PIV Root CA",
-            ),
-            (
-                "c55a30e8647a8912b07ba6f76d6abb6fcb4efad9dfaa0f7d691320d64c11d6ea",
-                "15c3cd1d34a5be9499f195b6f0a6daa0455b28f15f419335e0bc67a0a8a07c0f",
-                "CN=Alice",
-            ),
-            (
-                "ec7e41c73cd76ec8b7283332a0202a775dbf616096d05d18732ff0a211dfc0b1",
-                "f97b5ee9339aa13a79ff5fe962261c0e6fcff9760d5c96a0043410eb554c8de6",
-                "CN=Alice",
-            ),
-            (
-                "db4389e005f73edf3cfa500c81c9e28683c4beae122192c2ee21ebaedf2fdd00",
-                "6e764fe53fc1c906afc7cf2c215d9c07355fd7d84bdf6600ce91d993f54e38e4",
-                "CN=Alice",
-            ),
-            (
-                "93d0d7b044eb08ad6f62a20668e1f17b0838dc918c472a9cd7020d223f3970c3",
-                "5c2d5504506e5eafec3a6e1d86d6623ccbaca96f6e1d51ab3b89d3204d0c986b",
-                "CN=PIV Card mtg1:5D168619",
-            ),
-        ],
+        Algorithm::P256,
+        (
+            "8916821c3f4fbabb5e2b462593f58981abdd51a579103ed5af13b8b45f4a3026",
+            "58aa4ca70d4c49b7a00e11264e85ebb775c6337630409f3645f0847a4f6434e4",
+            "CN=PIV Card mtg1:CC85C2FB",
+        ),
     ),
     (
-        Some("laptop"),
-        [
-            (
-                "ab8c5adc194c66ed2163f08d4606a753133005840f5e5448f602a0af93bd6cf4",
-                "861b8296ec2ebe1cb370b18db1e0ade1bc55b4eeb7f117aee85e7260be782c08",
-                "CN=Alice PIV Root CA",
-            ),
-            (
-                "5f22bc03848271a3b6e524b9e327eaceef0ae31b379ffa4bb3511bb3f189eda7",
-                "d004f480344e9ea8d889cffd004158c1027ba2def6d116a3c08fa6a291d594d1",
-                "CN=Alice,DNQUALIFIER=mtg1:laptop",
-            ),
-            (
-                "555ad0a77ef68e4eb556d49551d0a948685077c64956d61fc5bda926c7a751ab",
-                "2765c5a08e03db99b74fb7b82fbefbd564e54083bf669f36529e254c9b2cdf37",
-                "CN=Alice,DNQUALIFIER=mtg1:laptop",
-            ),
-            (
-                "e274fd327152f629470240f968efc8a42fe133a1b6816a920a03aedf422e0cd3",
-                "fbd4b7ffc16fb0622bdad2d2478976148346d3655cdadcb26ee5c9514b3abe2a",
-                "CN=Alice,DNQUALIFIER=mtg1:laptop",
-            ),
-            (
-                "d8498196b0d80ec125cc48549465624b0eb9d15f2f35c9d98cedbf434a124036",
-                "36f92866b4769436a85e775eeccf50c7f3b187756c92aac6dc75771e2614bd5e",
-                "CN=PIV Card mtg1:95BCA3CF",
-            ),
-        ],
+        Algorithm::Curve25519,
+        (
+            "799d79e088f49ca53809a725c2587e72ece166f261cecf0c48a5cfdcf9c59f05",
+            "9eb443b310cc651e8de861bd5c098002195e3031a3120d30a6fb51b581f14482",
+            "CN=PIV Card mtg1:CC85C2FB",
+        ),
+    ),
+    (
+        Algorithm::P384,
+        (
+            "fa4e7e9cc44e4594569b07d874804166170f933c0f9fa5a66d93b4545701f4d6",
+            "9f44e767ee48b455b90327b87f7c4fb1bad52564dc3a7b1c38bf13a31c16b978",
+            "CN=PIV Card mtg1:CC85C2FB",
+        ),
+    ),
+    (
+        Algorithm::Rsa2048,
+        (
+            "144d098124b29cc53b6f5794a4a19859101a60a7e7ba2cea45090ecde6f64af5",
+            "afff5e28ae5e8d2f5bcd6d4acd8cbd593f7268a78b2553a31edf37719120c46a",
+            "CN=PIV Card mtg1:CC85C2FB",
+        ),
+    ),
+    (
+        Algorithm::Rsa3072,
+        (
+            "89c3e9795cd0dbbc4b388e1b245d26aaee1c1a87ad00a0b1e4a0059b85f6e633",
+            "d2a6748f0dbc70b1ee697c8f0dd3cc4c22e3d0e04eaaa82ac4ee06a58f293ede",
+            "CN=PIV Card mtg1:CC85C2FB",
+        ),
+    ),
+    (
+        Algorithm::Rsa4096,
+        (
+            "9493e6cac1cf3f50ef93d2bbdb235de15b06f1d6b77b1e8484b979298ff06c2b",
+            "01cb722e57a18d745bd73c6f2bdecf9b02bcdc0688ab1116e32dca4599200be1",
+            "CN=PIV Card mtg1:CC85C2FB",
+        ),
     ),
 ];
 
@@ -88,511 +504,224 @@ const P256: [(Option<&str>, [Pinned; 5]); 2] = [
 /// behind a new major.
 #[test]
 fn current_scheme_is_frozen() {
-    assert_current_scheme_frozen(Algorithm::P256, P256);
+    assert_current_scheme_frozen(Algorithm::P256, &P256);
 }
 
 /// What a card gets when nothing is chosen is frozen with the rest.
 ///
 /// The default algorithm decides every key and the default creation time lands in every
 /// certificate's validity, so a drifting default would fail `check` on every card
-/// provisioned without `--algorithm` or `--date` while each vector above, which sets both,
-/// kept passing. Built with neither set; this also keeps `certify` without `--date` byte
-/// reproducible, which it once was not, when the validity was anchored at the current time.
+/// provisioned without `--algorithm` or `--date` while each vector above, which sets the
+/// algorithm, kept passing.
 #[test]
 fn defaults_are_frozen() {
-    assert_frozen(&P256, |id| SeededSmartcard::new(&SEED_A, id, "Alice".into()));
+    assert_frozen(&P256, |path| SeededSmartcard::new(Seeds::one(&SEED_A), path, "Alice".into()));
 }
 
-/// The Curve25519 half of the same promise: `--algorithm curve25519` is part of `mtg1` and
-/// frozen with it, Ed25519 signatures included (they are deterministic, so the DER pins).
 #[test]
 fn current_scheme_is_frozen_on_curve25519() {
-    assert_current_scheme_frozen(
-        Algorithm::Curve25519,
-        [
-            (
-                None,
-                [
-                    (
-                        "215875f0a056960c48ab72d9031eb87fef9e56935bc74220d96739f7eb0890cc",
-                        "614b41693fc5d41a9241b3f900737cb38b46aa82d065301cc50e0fad2a1a2618",
-                        "CN=Alice PIV Root CA",
-                    ),
-                    (
-                        "39d78d631f03041f9da16a4588cbfbea092404f25cdadae8895c807307e9cc5e",
-                        "fcfe945cff1a90da139c9eec97320eb336630495526a11e94600180e33a0b784",
-                        "CN=Alice",
-                    ),
-                    (
-                        "d303bcbb992f935e68ba7ea07f8a846410fe13e58169550c3dae3f61c0209f95",
-                        "40fa233d768183c48704c0efe1da9120f6f9a87cecd29edb7ad36b7cbde18c85",
-                        "CN=Alice",
-                    ),
-                    (
-                        "d32cf40d03e67f4de0ea55541e673b0c64bb3d1861ebc039735e7684ac5e4791",
-                        "5d807a2cc1d5b96848925078c051d0c4a6c10345c1ccb6bf56d1942a3e4a7b85",
-                        "CN=Alice",
-                    ),
-                    (
-                        "374b218d39ed4756bd703891fc765fbb75b97e3f3e5a3b110423547a622d1c59",
-                        "57f022cbbb2c3c69107fecfbd13b1028fe49fa9c42fcd8412c29c592e6f4c810",
-                        "CN=PIV Card mtg1:5D168619",
-                    ),
-                ],
-            ),
-            (
-                Some("laptop"),
-                [
-                    (
-                        "215875f0a056960c48ab72d9031eb87fef9e56935bc74220d96739f7eb0890cc",
-                        "614b41693fc5d41a9241b3f900737cb38b46aa82d065301cc50e0fad2a1a2618",
-                        "CN=Alice PIV Root CA",
-                    ),
-                    (
-                        "b29e70e6954f77a46ddbfe461e3b873dd8fdd8df5d93b3b556ad3984dcf72fb4",
-                        "e68f98eb34a215c78c965ea92aaee4a6952626aca990bf2fdf3e5fcc856308e1",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "8cfc7e206526f869ef0a551255bcc3267f3be9ff9a6e0900c0a0da6e132568be",
-                        "2d70219c85a1a174556eee0cfd9c073cfec06987fb03a499a97fe355c6ac0ca6",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "db0dbbf7d26cdbddc439020ba9e717e24459204e53e7c1597935cb9a10b747a4",
-                        "bdd7bdcb938dff7fb1abdbe6f37fb04996775bae0892684e2754082909846fab",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "630220975eccb9267282b921887a9166958e837506053a6a2c7398a59b0a4c5e",
-                        "82b30e1aa6300c20d27576494ef2e4dd32c844f9851674077392fb835e504a4a",
-                        "CN=PIV Card mtg1:95BCA3CF",
-                    ),
-                ],
-            ),
-        ],
-    );
+    assert_current_scheme_frozen(Algorithm::Curve25519, &CURVE25519);
 }
 
-/// The P-384 third of the same promise: `--algorithm p384` derives under its own labels and the
-/// documented 48-byte construction, and is frozen with the rest of `mtg1`. ECDSA signatures
-/// use RFC 6979 nonces, so the certificate DER pins as well.
 #[test]
 fn current_scheme_is_frozen_on_p384() {
-    assert_current_scheme_frozen(
-        Algorithm::P384,
-        [
-            (
-                None,
-                [
-                    (
-                        "189c2070280dba26725e96dbb16fb86a20b98115c8aeb18c4656c25f262f4187",
-                        "b5cc125940a7bd667bfc3fe9035a84ededce92f6918490416183aa869c78a04a",
-                        "CN=Alice PIV Root CA",
-                    ),
-                    (
-                        "2b3fd7575f7799de806830f0452b473647b42eab745b117c451460e9e0f56302",
-                        "8ebbafc08a686ba6822ef7892a76bb44915c82f2f233853e7e81da9db6de583b",
-                        "CN=Alice",
-                    ),
-                    (
-                        "bd7177425a6d6234a9b1872b3cafd4d70e399481bab163e50d2ddf967e6ae175",
-                        "9f6b68ef3662a2be96ea69b6973f083ff0ddbe948a51e7e1351077850d814fcc",
-                        "CN=Alice",
-                    ),
-                    (
-                        "9430d9eda51e0e30bd85972ce5d6584ef35bb48751a3d631fd514e1b0067ee92",
-                        "f9264506cdc9cf78b1dbd707e303e307035141eb49c910d5e7b5322b5c193f96",
-                        "CN=Alice",
-                    ),
-                    (
-                        "77f5cf472efe6df02b9ff7a0512488575bd384934d41b1702e8adbc71c733d40",
-                        "3b57d967b44279224150515024408d298930d8934eda117b3779e794992fa8a7",
-                        "CN=PIV Card mtg1:5D168619",
-                    ),
-                ],
-            ),
-            (
-                Some("laptop"),
-                [
-                    (
-                        "189c2070280dba26725e96dbb16fb86a20b98115c8aeb18c4656c25f262f4187",
-                        "b5cc125940a7bd667bfc3fe9035a84ededce92f6918490416183aa869c78a04a",
-                        "CN=Alice PIV Root CA",
-                    ),
-                    (
-                        "aaec61040c30ae1e3fdb62590d4ebde9b3f51856aa183db8e6198a9e079e2251",
-                        "3d18d4459c45ec40abc62990509ac1cc2f07d67d08607cd40d9fa4207ae6f231",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "224679124975033922323ddb5121c35da9cf86fc0e068bfe7c7f95476769b712",
-                        "014312b4000489bed5bbee0411134ea978489330d9d1d99b3c87c166fa56b030",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "ab47865be4c685cb325786744390d17a36c2cdc910c2cc5b3046b72ec29bba6c",
-                        "e0487b0eeac20e62b53e367611c38a79b2f0e89bbd7c6479aa6b3eb4ab99313e",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "dd2ae81a0cb116f6b0ca40756d99d0b13ff8a90bae404d2b7d840f7fb19db7d6",
-                        "73eb90f051f4d81e19873642a1f80ca7da18f5d868e681ef8c327a59ac4a9906",
-                        "CN=PIV Card mtg1:95BCA3CF",
-                    ),
-                ],
-            ),
-        ],
-    );
+    assert_current_scheme_frozen(Algorithm::P384, &P384);
 }
 
-/// The RSA-2048 half of the same promise: `--algorithm rsa2048` is part of `mtg1` and
-/// frozen with it; PKCS#1 v1.5 signatures are deterministic, so the DER pins.
 #[test]
 fn current_scheme_is_frozen_on_rsa2048() {
-    assert_current_scheme_frozen(
-        Algorithm::Rsa2048,
-        [
-            (
-                None,
-                [
-                    (
-                        "f8f92dc72cc7216fe612da655ec461bda33e6f33bddfbbcc668b40c29c867653",
-                        "e8437057bb53f127398f9a214d050d85cf3671fb7a4b3761e2168a770c13cf72",
-                        "CN=Alice PIV Root CA",
-                    ),
-                    (
-                        "fa82004283512aa88deca524bfb31294fc740ec805f04548c0a6945bc60fa83c",
-                        "e199da4d759d6bfb1f4fcad381fb6e31f30264ca977b82b2bdbebbd2920aee90",
-                        "CN=Alice",
-                    ),
-                    (
-                        "7b576a6b37ffd8a8db0035ce1d5032179f9d270118bfb5b49742cd74a5c77ed1",
-                        "eada816127afb7d6e42197ac70dd36283ce10190555cd1087d359290849e2079",
-                        "CN=Alice",
-                    ),
-                    (
-                        "8038d7304881dea2f3d9056a3d8ef04b75b32c591199644d2e938ea9fa310512",
-                        "864adc4bec8815d5e5559f7644884f591769aba7678bc76faa870b790e868a1a",
-                        "CN=Alice",
-                    ),
-                    (
-                        "8d62743df0f626d811d81577e34e2725a600c5bea97f6cb65445dca8a6ccdde2",
-                        "3c5c2bce6925d789de855f276395a9748618ea4e732029aa0d586ae679d37ac5",
-                        "CN=PIV Card mtg1:5D168619",
-                    ),
-                ],
-            ),
-            (
-                Some("laptop"),
-                [
-                    (
-                        "f8f92dc72cc7216fe612da655ec461bda33e6f33bddfbbcc668b40c29c867653",
-                        "e8437057bb53f127398f9a214d050d85cf3671fb7a4b3761e2168a770c13cf72",
-                        "CN=Alice PIV Root CA",
-                    ),
-                    (
-                        "ac20c26aba31ca03944fde6dc35821efa76ea55214657f42a90f376281fbd11b",
-                        "ffedba909488e7a785e4c48507ca5cfa75c82e3f15011f512f6f80f61203c297",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "169a6af8a2f731f13496aeac4a8b4fb28b8733fa027725ac6454d524d74bd4bd",
-                        "40ebc3db2ad9fed817a834993eeb7357115f95c4cab2cd1aaa5a2538f9c9cc5a",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "c5a56600e39c0c982cf86350c566e18866bb20477353b48357d380ca67da125d",
-                        "c55499eef3155d1641a4cbdc1acc161e61c9c0c3f1a42308bce3447ea9126557",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "830e144a0a672398841369d897b4fd52baeea8e0385343f98ec998b0bfbd562a",
-                        "7e327ddd3cdd8dadbd0c8a38e41ec1d6214954d4ea4fe28c2d4e169e601b12c8",
-                        "CN=PIV Card mtg1:95BCA3CF",
-                    ),
-                ],
-            ),
-        ],
-    );
+    assert_current_scheme_frozen(Algorithm::Rsa2048, &RSA2048);
 }
 
-/// The RSA-3072 half of the same promise: `--algorithm rsa3072` is part of `mtg1` and
-/// frozen with it; PKCS#1 v1.5 signatures are deterministic, so the DER pins.
 #[test]
 fn current_scheme_is_frozen_on_rsa3072() {
-    assert_current_scheme_frozen(
-        Algorithm::Rsa3072,
-        [
-            (
-                None,
-                [
-                    (
-                        "786bfbf1cfa1f0914ac65c021c37bbf445b7cde9e4a5f7b8bdd2cb695103ce84",
-                        "1cf3729b088afab970d2ad0438ec0ef49f443a299f33d6bb6bc9fcbd0c037d2c",
-                        "CN=Alice PIV Root CA",
-                    ),
-                    (
-                        "c1f0c998660faacf1ed69a931109319d7f3ed8c722e5574d2f06594fc23d0b8b",
-                        "40a9aed8ab1138da05b490bfb7e2257c9b4ed765f65b0fe6dbe658bcbc22ff2c",
-                        "CN=Alice",
-                    ),
-                    (
-                        "a082ca0830cad754c5568d4efc68fe56bc1226256e568f9135d9cca99ed69794",
-                        "49eb127f76606c06fb58cd3ba046c6d9ba1681b083eca826e1f9a2755f379998",
-                        "CN=Alice",
-                    ),
-                    (
-                        "b7254f486cbc64a923bf35c807512d8a82397502f1bdf62d08dc3f608004b00a",
-                        "51382f1f5432b3169968d330a51f960cebdcf407148ecb032f11b351c8e154eb",
-                        "CN=Alice",
-                    ),
-                    (
-                        "942df91e7773589a5984ccc4a9f4752757c7451ce0572da939cf3bb8e83aff28",
-                        "7214127db7c2e4d844188b10c3d69f62959b35b1180b9fdfc9eab892ad2f390d",
-                        "CN=PIV Card mtg1:5D168619",
-                    ),
-                ],
-            ),
-            (
-                Some("laptop"),
-                [
-                    (
-                        "786bfbf1cfa1f0914ac65c021c37bbf445b7cde9e4a5f7b8bdd2cb695103ce84",
-                        "1cf3729b088afab970d2ad0438ec0ef49f443a299f33d6bb6bc9fcbd0c037d2c",
-                        "CN=Alice PIV Root CA",
-                    ),
-                    (
-                        "52afa0e5a9ea7e9b38350d14b66b8a70308fd391c4f79e8de7e0f46628dcf547",
-                        "f7a73e449bf6668dbf8d7844b861bd7eea938f2f17f70ad548a6a96e81d49c02",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "a19ca5869280975fd143704e1e9df7fd088860e2f42d07d07d56af1754e4a313",
-                        "1fdd1355c4ad2c7f42ca8cca9e1b889f5e77fad72c54a9c804f474621d629a97",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "63e9944c269d5e57dedecca133378f1bc0207451d77cd3fc4578c5091ae8120a",
-                        "7f1361a3e4bfd83bf5c5ecfd3885281d2e4d48c84aef3b73156377171f9750a8",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "e1e51e6ab76fbc1d6f37fad3485e6875afd17f6c0a9792dcb045dc48a1a04349",
-                        "d709ba609d85c1266c191c9cdd8093239a650bb0d4c33d81140b7e3bd7df9e4c",
-                        "CN=PIV Card mtg1:95BCA3CF",
-                    ),
-                ],
-            ),
-        ],
-    );
+    assert_current_scheme_frozen(Algorithm::Rsa3072, &RSA3072);
 }
 
-/// The RSA-4096 half of the same promise: `--algorithm rsa4096` is part of `mtg1` and
-/// frozen with it; PKCS#1 v1.5 signatures are deterministic, so the DER pins.
 #[test]
 fn current_scheme_is_frozen_on_rsa4096() {
-    assert_current_scheme_frozen(
-        Algorithm::Rsa4096,
-        [
-            (
-                None,
-                [
-                    (
-                        "5ca3d47b84ae42da24b5c625342bc5298de67d439f325bd7acb3e2d3002a0d15",
-                        "bf5dac6b1bc47187d8a7b8566e5ada6803a099da67185ee589c938ce83f5f666",
-                        "CN=Alice PIV Root CA",
-                    ),
-                    (
-                        "36058b180932f23f9c8b6d6e1e47d2185720ace9006cf8d6c1cb93206a606dfa",
-                        "5cd5107ba2f7f893e484b6df64e1f76f63e64ddc2b9464f7578057a1d2f50f5d",
-                        "CN=Alice",
-                    ),
-                    (
-                        "f5618904fb6336661186dc52923c6dc2f668141864d5b0dbce0b3d9ebafa99f2",
-                        "25a2d97fa6b6b00d906aa5465a53c69e8b928fb810086305cd49a9980b608b6f",
-                        "CN=Alice",
-                    ),
-                    (
-                        "2d2e63a582d426216ff4e75a6eb838143f103ca4e5bb470616b0a53d881d30b1",
-                        "b12ded0af6128a2f29f7ef91b793ef11a4455685754f3ab551536946f9ff3b24",
-                        "CN=Alice",
-                    ),
-                    (
-                        "de3f72accdea9ecdc62a9158f9d27a3c1ec91e70ad8866ce1fde2f64cbf6ba23",
-                        "4991b1bd20cad414304920cbd113e0487e611550a9957bb8d26b4e2ed914addb",
-                        "CN=PIV Card mtg1:5D168619",
-                    ),
-                ],
-            ),
-            (
-                Some("laptop"),
-                [
-                    (
-                        "5ca3d47b84ae42da24b5c625342bc5298de67d439f325bd7acb3e2d3002a0d15",
-                        "bf5dac6b1bc47187d8a7b8566e5ada6803a099da67185ee589c938ce83f5f666",
-                        "CN=Alice PIV Root CA",
-                    ),
-                    (
-                        "28e6664817841e7c7b126703ff1587f3a8c00479e7a326aa6143781468b8617e",
-                        "460437b4a816d579d2e5c932233dd8fb4bb86c6a54afad7d2fb08a29e6910a2c",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "f526a2bf452f04e5e29df964590002846f34c9d722191b0f38a3c21c5da4e336",
-                        "1e88d09481d725f0dc6795b97afe4e89208f09c587b874e4bf6f494381e3b9df",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "51faad5bf1bdd03d2a45d9e2069876e80be8c723f05f090781587ba6eaa2ce58",
-                        "b4b85885449f9ac0ae52d162c7233174738cf462d8e6a170e552484f6cc0ae58",
-                        "CN=Alice,DNQUALIFIER=mtg1:laptop",
-                    ),
-                    (
-                        "f0f97f6e17d65793a3e80eafe682fbc224a3b339ca382d37cd810a17e25cb4e1",
-                        "6830b51d07b1b5a3a09c551370e0685ed4cc97645e6fdda3236812bd796217dc",
-                        "CN=PIV Card mtg1:95BCA3CF",
-                    ),
-                ],
-            ),
-        ],
-    );
+    assert_current_scheme_frozen(Algorithm::Rsa4096, &RSA4096);
 }
 
-/// One pinned certificate: its SPKI digest, its DER digest, and its subject
-type Pinned = (&'static str, &'static str, &'static str);
+/// The card's own key is frozen too, per algorithm and bound to the card's serial.
+///
+/// `check` and `list` recognise a card by it when its CHUID is gone, and it is the one key a
+/// door reader enrols; a 9E that moved would make every initialized card a stranger.
+#[test]
+fn card_authentication_is_frozen() {
+    let card = SeededSmartcard::new(Seeds::one(&SEED_A), KeyPath::default(), String::new());
+    for (algorithm, expected) in CARD_AUTHENTICATION {
+        let cert = card
+            .card_authentication_certificate(algorithm, &CardSerial::piv(12345678))
+            .unwrap();
+        assert_pinned(&cert, &expected, &format!("{algorithm:?} 9E"));
+    }
+}
 
-/// Assert that `algorithm` still derives exactly `vectors`: for each subkey id, the pins for
-/// the root and the four slots
-fn assert_current_scheme_frozen(algorithm: Algorithm, vectors: [(Option<&str>, [Pinned; 5]); 2]) {
-    assert_frozen(&vectors, |id| {
-        SeededSmartcard::new(&SEED_A, id, "Alice".into())
-            .with_algorithm(algorithm)
-            .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+/// Assert that `algorithm` still derives exactly `vectors`
+fn assert_current_scheme_frozen(algorithm: Algorithm, vectors: &Vectors) {
+    assert_frozen(vectors, |path| {
+        SeededSmartcard::new(Seeds::one(&SEED_A), path, "Alice".into()).with_algorithm(algorithm)
     });
 }
 
-/// Assert that the chain `build` makes for each subkey id is still exactly `vectors`: the
-/// root first, then the issuing authority if there is one, then the slots in chain order
-fn assert_frozen<const N: usize>(
-    vectors: &[(Option<&str>, [Pinned; N])],
-    build: impl Fn(Option<String>) -> SeededSmartcard,
-) {
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-
-    for (id, expected) in vectors {
-        let chain = build(id.map(|v| v.to_string()))
+/// Assert that the chain `build` makes for each path of [`PATHS`] is still exactly `vectors`:
+/// the root first, then the slots in chain order
+fn assert_frozen(vectors: &Vectors, build: impl Fn(KeyPath) -> SeededSmartcard) {
+    for ((subkey, date), expected) in PATHS.into_iter().zip(vectors) {
+        let chain = build(key_path((subkey, date)))
             .add_email("alice@example.com")
             .unwrap()
             .certify(CertificateKind::Chain)
             .unwrap();
-
-        let mut certs = vec![(&chain.root, "root".to_string())];
-        certs.extend(
-            chain
-                .intermediate
-                .iter()
-                .map(|cert| (cert, "intermediate".into())),
+        let certs: Vec<_> = std::iter::once(&chain.root)
+            .chain(chain.leaves.iter().map(|(_, cert)| cert))
+            .collect();
+        assert_eq!(
+            certs.len(),
+            expected.len(),
+            "chain for {subkey:?} {date:?} has the wrong length"
         );
-        certs.extend(chain.leaves.iter().map(|(slot, cert)| {
-            (
-                cert,
-                match slot {
-                    SlotId::Authentication => "9A".into(),
-                    SlotId::Signature => "9C".into(),
-                    SlotId::KeyManagement => "9D".into(),
-                    SlotId::CardAuthentication => "9E".into(),
-                    SlotId::Retired(retired) => format!("{:02X}", u8::from(*retired)),
-                    other => panic!("unexpected slot {other:?}"),
-                },
-            )
-        }));
-        assert_eq!(certs.len(), N, "chain for {id:?} has the wrong number of certificates");
-
-        for ((cert, slot), (spki, der, subject)) in certs.into_iter().zip(expected) {
-            let got_spki = hex(&digest_bytes(
-                cert.tbs_certificate()
-                    .subject_public_key_info()
-                    .to_der()
-                    .unwrap(),
-            ));
-            assert_eq!(got_spki, *spki, "{slot} KEY moved for {id:?} -- derivation broke");
-            assert_eq!(
-                hex(&digest(cert)),
-                *der,
-                "{slot} certificate encoding moved for {id:?} -- check will fail on provisioned cards"
-            );
-            assert_eq!(
-                cert.tbs_certificate().subject().to_string(),
-                *subject,
-                "{slot} subject moved for {id:?}"
-            );
+        for (index, (cert, pinned)) in certs.into_iter().zip(expected).enumerate() {
+            assert_pinned(cert, pinned, &format!("certificate {index} for {subkey:?} {date:?}"));
         }
-    }
-
-    fn digest_bytes(der: Vec<u8>) -> Vec<u8> {
-        use sha2::{Digest, Sha256};
-        Sha256::digest(der).to_vec()
     }
 }
 
-/// The optional parts of the chain are frozen too: the issuing authority `--intermediate`
-/// inserts, and the retired slot `--retire` archives an earlier generation's key in.
+/// Assert one certificate is still `pinned`, saying whether the key or its encoding moved
+fn assert_pinned(cert: &Certificate, (spki, der, subject): &Pinned, what: &str) {
+    let key = cert
+        .tbs_certificate()
+        .subject_public_key_info()
+        .to_der()
+        .unwrap();
+    {
+        use sha2::{Digest, Sha256};
+        assert_eq!(hex(&Sha256::digest(key)), *spki, "{what}: KEY moved -- derivation broke");
+    }
+    assert_eq!(
+        hex(&digest(cert)),
+        *der,
+        "{what}: certificate encoding moved -- check will fail on provisioned cards"
+    );
+    assert_eq!(cert.tbs_certificate().subject().to_string(), *subject, "{what}: subject moved");
+}
+
+/// The optional parts of a card are frozen too: the issuing authority `--intermediate`
+/// inserts, and another identity's decryption key kept in a retired slot with `--slot`.
 ///
-/// Both derive under labels of their own and change the chain around them -- the root's
-/// path length, every slot's issuer -- so the vectors above, which have neither, cannot
-/// see them move. Pinned on a card rotated to a second generation with the first archived,
-/// which is what `--retire` is for.
+/// Both change what the vectors above cannot see: the intermediate every slot's issuer, the
+/// retired slot where a key is certified for and under whose root. The root is the one the
+/// vectors above pin, `--intermediate` or not.
 #[test]
 fn intermediate_and_retired_slots_are_frozen() {
-    assert_frozen(
-        &[(
-            Some("gen1"),
-            [
-                (
-                    "ab8c5adc194c66ed2163f08d4606a753133005840f5e5448f602a0af93bd6cf4",
-                    "22d22fdc1b76a2ebfa9cdd57c82338eecab77898fdb24907aa15673a0909b7dc",
-                    "CN=Alice PIV Root CA",
-                ),
-                (
-                    "05f3dc628b1954524442d52f21fe505606eba6cb7c366b889b9be3e76208926c",
-                    "226793b19b61501d3597579280a07ae9af5ff1f891e5eff27b1e72e7b4c6e26a",
-                    "CN=Alice PIV Issuing CA gen1",
-                ),
-                (
-                    "ec4c228b0c390cb5743e494dccfb5a62743dc8ef8ebfb56e1fafd1821272ff14",
-                    "279b428985c8b7b451195cbb796434f05dbd50e74944240848d12dd73d8e1bf2",
-                    "CN=Alice,DNQUALIFIER=mtg1:gen1",
-                ),
-                (
-                    "42d11ccd87019c6d4862c267de60e237dd262545bff54be34f6d8282fbe54552",
-                    "98884c39d1c89e0ddcc0414ef8880515d9766495d558daf73af3cfbfe0904e79",
-                    "CN=Alice,DNQUALIFIER=mtg1:gen1",
-                ),
-                (
-                    "954e710c5ca02fde70b55055bc81f1607bcef455478fb4839e0190a5719589be",
-                    "9457466acc3e5ef5443ffa122722a99c1571779334d189252fe87a1511161be8",
-                    "CN=Alice,DNQUALIFIER=mtg1:gen1",
-                ),
-                (
-                    "424bdabce072ff74040aeea71b481480e8ed409bad9be8b26a8f8323e0b13660",
-                    "57253413dd091b15ac8c604a78065dc5068a1ca984c5dea361839f0983ac54f0",
-                    "CN=PIV Card mtg1:D4713663",
-                ),
-                (
-                    "cf27b43e8cf40709f836b7806333df9d166b130b764795f54b71d27ed6fdf90f",
-                    "d32527a33a2c748c2d341cdfadda7ab5efd09f6cab9109dc63429ec0bdf62b1e",
-                    "CN=Alice,DNQUALIFIER=mtg1:gen0",
-                ),
-            ],
-        )],
-        |id| {
-            SeededSmartcard::new(&SEED_A, id, "Alice".into())
-                .with_intermediate(true)
-                .with_retired(vec!["gen0".into()])
-                .with_creation_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
-        },
+    let chain = SeededSmartcard::new(
+        Seeds::one(&SEED_A),
+        KeyPath { subkey: Some("gen1".into()), date: None },
+        "Alice".into(),
+    )
+    .add_email("alice@example.com")
+    .unwrap()
+    .with_intermediate(true)
+    .certify(CertificateKind::Chain)
+    .unwrap();
+    let certs = std::iter::once(&chain.root)
+        .chain(chain.intermediate.iter())
+        .chain(chain.leaves.iter().map(|(_, cert)| cert));
+    let expected: [Pinned; 5] = [
+        (
+            "ab8c5adc194c66ed2163f08d4606a753133005840f5e5448f602a0af93bd6cf4",
+            "397a1d53f30029fcde4cf20d144066b7d8fd819b5932b32a70850abdc79835f1",
+            "CN=Alice PIV Root CA p256",
+        ),
+        (
+            "05f3dc628b1954524442d52f21fe505606eba6cb7c366b889b9be3e76208926c",
+            "02bd92cb95bd0e57516d1cae3f062f7ea27e04ed577614ac2eb18fb1b1e2527a",
+            "CN=Alice PIV Issuing CA 6027DDE7",
+        ),
+        (
+            "ec4c228b0c390cb5743e494dccfb5a62743dc8ef8ebfb56e1fafd1821272ff14",
+            "642b85436787146cffb7cbec0773e31eb6868d1bf2408ee585c811c06907b520",
+            "CN=Alice",
+        ),
+        (
+            "42d11ccd87019c6d4862c267de60e237dd262545bff54be34f6d8282fbe54552",
+            "6052165aef09a9278c1a8b21cf24540fa2ffbce27d7014b08719bdae1aae629c",
+            "CN=Alice",
+        ),
+        (
+            "27f3fb55442906022080c97a469d8aee53d0ea378dc39fecd12af73fe4d5fdf0",
+            "ce221898bccae08c77878a761235ebd1b0ed7409ebd5576cb283fe28f3078e61",
+            "CN=Alice",
+        ),
+    ];
+    for (index, (cert, pinned)) in certs.zip(&expected).enumerate() {
+        assert_pinned(cert, pinned, &format!("intermediate chain certificate {index}"));
+    }
+
+    // A team's decryption key on Alice's card: administered by her card seed, derived from
+    // the team's key seed, certified by the team's root
+    let chain = SeededSmartcard::new(
+        Seeds { card: Some(&SEED_A), key: Some(&SEED_B) },
+        KeyPath::default(),
+        "Team".into(),
+    )
+    .add_email("team@example.com")
+    .unwrap()
+    .with_keys(&[KeyRole::Decryption])
+    .unwrap()
+    .with_slot(0x82)
+    .unwrap()
+    .certify(CertificateKind::Chain)
+    .unwrap();
+    let certs = std::iter::once(&chain.root).chain(chain.leaves.iter().map(|(_, cert)| cert));
+    let expected: [Pinned; 2] = [
+        (
+            "67f5bb008aa64e330806b2c4bf74e9eb6af9f22ee3d5e81cab95e2d98ccf4823",
+            "de89449006891e4ab874a4b452ec5c7988d5e0a692188d7c8416f643eee9db52",
+            "CN=Team PIV Root CA p256",
+        ),
+        (
+            "203ccd2ff8f7fee897bc77ab4e704268b650769915c9c484fc973f683becf259",
+            "cbd2bf222af2ffd4dae20c6a52a6bf7124bb3201e167f7180da368555314c925",
+            "CN=Team",
+        ),
+    ];
+    for (index, (cert, pinned)) in certs.zip(&expected).enumerate() {
+        assert_pinned(cert, pinned, &format!("retired slot chain certificate {index}"));
+    }
+}
+
+/// Where an issuing authority's revocation list is, and the list itself, are frozen too.
+///
+/// The slot certificates of a device with `--intermediate` and `--crl-url` name the list's
+/// URL, which carries the authority's tag, and that list is published once and kept: a URL
+/// that moved would leave every such certificate pointing at nothing, and a list that moved
+/// would be one more to publish. Pinned on a device in a dated generation, so that both steps
+/// of the path reach the tag.
+#[test]
+fn issuing_list_is_frozen() {
+    use sha2::{Digest, Sha256};
+
+    let card = SeededSmartcard::new(Seeds::one(&SEED_A), key_path(PATHS[2]), "Alice".into())
+        .add_email("alice@example.com")
+        .unwrap()
+        .with_crl_url("http://example.org/alice.crl")
+        .unwrap()
+        .with_intermediate(true);
+    let chain = card.certify(CertificateKind::Chain).unwrap();
+    for (slot, leaf) in &chain.leaves {
+        assert_eq!(
+            list_url(leaf),
+            "http://example.org/alice-p256-issuing-0e4d15ab.crl",
+            "{slot:?}: list URL moved"
+        );
+    }
+    let (suffix, list) = card.issuing_revocation_list().unwrap().unwrap();
+    assert_eq!(suffix, "-p256-issuing-0e4d15ab", "list suffix moved");
+    assert_eq!(
+        hex(&Sha256::digest(list)),
+        "8f285b9e5eda92ef321bcc6586a078cd283551bc654dd3d249e403301ddce981",
+        "issuing list moved"
     );
 }

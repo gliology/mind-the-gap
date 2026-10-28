@@ -1,7 +1,8 @@
 //! The PIV backend: an X.509 chain from seeds, and uploads to YubiKeys.
 //!
 //! [`SeededSmartcard`] derives a root certificate authority, an optional issuing authority
-//! and the four slot keys (9A, 9C, 9D, 9E) on NIST P-256, on NIST P-384 with
+//! and the three usable slot keys (9A, 9C, 9D) from the key seed, and the card's own
+//! credentials, identifiers and 9E key from the card seed, on NIST P-256, on NIST P-384 with
 //! [`Algorithm::P384`], as Ed25519 and X25519 keys with [`Algorithm::Curve25519`], or as
 //! RSA keys. The chain is signed with RFC 6979 deterministic ECDSA, pure Ed25519 or PKCS#1
 //! v1.5, all deterministic, so re-runs are byte-identical, and keys, certificates,
@@ -9,14 +10,18 @@
 //! The chain layout and its constraints are documented in the certificates chapter,
 //! <https://gliology.github.io/mind-the-gap/piv-certificates.html>.
 
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
+use crate::backend::{Applet, Backend, Subtrees};
 use crate::policy::Policy;
-use crate::seed::{Algorithm, Seed256, Seed256Derive};
+use crate::role::KeyRole;
+use crate::seed::{Algorithm, KeyPath, Seeds};
+use crate::target::CardTarget;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 
-use yubikey::piv::SlotId;
+use yubikey::piv::{RetiredSlotId, SlotId};
 
 use x509_cert::ext::pkix::name::GeneralName;
 
@@ -24,61 +29,81 @@ use der::asn1::Ia5String;
 
 use zeroize::Zeroizing;
 
+mod algorithms;
 mod card;
 mod chain;
 mod check;
+mod export;
 mod keys;
+mod ownership;
 mod slots;
+mod update;
 
-pub use card::status;
-pub use chain::CertChain;
-use chain::SubjectName;
+pub(crate) use algorithms::algorithm_of;
+pub(crate) use card::read_serial;
+pub use card::{change_pin, list, refuse_unfit_pin};
+pub use chain::{
+    CertChain, PublishedList, read_revocation_list, refuse_unfit_crl_url, refuse_unfit_names,
+};
+use chain::{IssuerKey, SubjectName};
+use keys::SlotKey;
 pub use slots::SlotRole;
+pub use update::generation_on_card;
+pub use update::{Change as UpdateChange, KeyReason, UpdatePlan};
 
-/// Which part of the certificate chain to export
+/// Why a slot is refused that would take another key with the decryption key
+const MISPLACED_SLOT: &str =
+    "--slot places one key, the decryption key: pass --key decryption with it";
+
+/// The slot the decryption key goes to by its number: 9d, or 82 to 95
+fn decryption_slot(slot: u8) -> Result<SlotId> {
+    Ok(match slot {
+        0x9d => SlotId::KeyManagement,
+        slots::FIRST_RETIRED_SLOT..=slots::LAST_RETIRED_SLOT => SlotId::Retired(
+            RetiredSlotId::try_from(slot).map_err(|err| anyhow!("Slot {slot:02x}: {err}"))?,
+        ),
+        0x9a | 0x9c => bail!(
+            "Slot {slot:02x} holds the {} key, which has no other slot; --slot moves the \
+             decryption key only, to 9d or a retired slot from 82 to 95",
+            if slot == 0x9a {
+                "authentication"
+            } else {
+                "signature"
+            }
+        ),
+        other => bail!(
+            "Slot {other:02x} takes no key of the identity: the decryption key goes to 9d or a \
+             retired slot from 82 to 95"
+        ),
+    })
+}
+
+/// Refuse a `--slot` the builder would refuse, without the seeds a builder needs: one no
+/// decryption key goes to, or one given with `keys` (as `--key` names them, all three where
+/// none) other than the decryption key alone
+pub fn refuse_unfit_slot(slot: u8, keys: &[KeyRole]) -> Result<()> {
+    decryption_slot(slot)?;
+    if keys.is_empty() || keys.iter().any(|key| *key != KeyRole::Decryption) {
+        bail!(MISPLACED_SLOT);
+    }
+    Ok(())
+}
+
+/// Which part of the certificate chain to publish
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq)]
 pub enum CertificateKind {
-    /// The certificate authorities plus all four slot certificates
+    /// The certificate authorities plus the slot certificates
     #[default]
     Chain,
     /// The self-signed root certificate authority, i.e. the trust anchor to distribute
     Root,
     /// The intermediate issuing certificate authority only
     Intermediate,
-    /// The four slot certificates only
+    /// The slot certificates only
     Leaves,
 }
 
-/// Slots whose key can be derived without the subkey id, so it comes out the same on every card
-///
-/// Sharing the key management slot is the usual reason to reach for this. A sender encrypts to
-/// one specific 9D certificate, so per-card key management keys mean a message can only be
-/// opened on the card whose certificate the sender chose. Authentication and signature have no
-/// such problem: the verifier checks whichever certificate was presented.
-///
-/// Slot 9E is deliberately absent. It identifies the *card*, carrying the card id in its
-/// subject rather than the cardholder, so a shared one would defeat its only purpose.
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SharedSlot {
-    /// Authentication slot (9A)
-    Authentication,
-    /// Signature slot (9C)
-    Signature,
-    /// Key management slot (9D)
-    KeyManagement,
-}
-
-impl From<SharedSlot> for SlotId {
-    fn from(shared: SharedSlot) -> Self {
-        match shared {
-            SharedSlot::Authentication => SlotId::Authentication,
-            SharedSlot::Signature => SlotId::Signature,
-            SharedSlot::KeyManagement => SlotId::KeyManagement,
-        }
-    }
-}
-
-/// Algorithm of the derived management key `upload` installs in slot 9B
+/// Algorithm of the derived management key `init` installs in slot 9B
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ManagementKeyArg {
     /// AES-256 when the card reports firmware 5.4 or later, triple DES before
@@ -92,28 +117,24 @@ pub enum ManagementKeyArg {
 
 /// Config to create a PIV certificate chain
 pub struct SeededSmartcard {
-    /// Application seed the root authority and every generation's subseed descend from
+    /// The card seed's and the key seed's PIV subtrees
     ///
-    /// The root authority is a *sibling* of the subseeds, not their parent: were it the
-    /// parent, anyone holding the authority key could re-derive every slot key. Kept so
-    /// that a *previous* generation can be re-derived for archival, too.
-    root: Zeroizing<Seed256>,
+    /// The card seed's is apart from the key seed's on purpose: whoever administers the card
+    /// holds it, which opens the card but derives no key the identity uses. Under the key
+    /// seed's, the root authority is a *sibling* of the device and shared seeds, not their
+    /// parent: were it the parent, anyone holding the authority key could re-derive every
+    /// slot key.
+    seeds: Subtrees,
+
+    /// The keys derived so far, on the heap, where a builder moved on to its next option
+    /// moves only the pointer
+    derived: Box<Derived>,
+
+    /// Where the usable keys sit under the key seed
+    path: KeyPath,
 
     /// Algorithm every asymmetric key in the chain is derived with
     algorithm: Algorithm,
-
-    /// Seed used for the issuing authority, management key and all slot keys
-    subseed: Zeroizing<Seed256>,
-    /// Seed the subkey id is *not* mixed into, for slots listed in `shared`
-    shared_seed: Zeroizing<Seed256>,
-    /// Slots whose key is derived from `shared_seed` rather than `subseed`
-    shared: Vec<SharedSlot>,
-
-    /// Subkey id, used to keep issuing authority subjects distinguishable
-    subkey: Option<String>,
-
-    /// Superseded subkey ids whose key management key is archived, newest first
-    retired: Vec<String>,
 
     /// Distinguished name attributes for every tier of the chain
     identity: SubjectName,
@@ -121,11 +142,15 @@ pub struct SeededSmartcard {
     /// Alternative names, e.g. emails addresses, to use in the leaf certificates
     alternatives: Vec<GeneralName>,
 
-    /// Creation time of certificates
-    creation_time: Option<SystemTime>,
+    /// Creation time of the root authority, which the identity keeps for good
+    identity_time: Option<SystemTime>,
 
     /// Validity duration of the leaf certificates
     validity_duration: Option<Duration>,
+
+    /// The URL `--crl-url` gives without its `.crl`: the stem every revocation list's URL is
+    /// made from, which the certificates name where relying parties fetch their issuer's list
+    list_stem: Option<String>,
 
     /// User pin to set on the card
     pin: Option<Zeroizing<String>>,
@@ -136,50 +161,69 @@ pub struct SeededSmartcard {
     /// Pin and touch requirements of every slot but 9E, and of management access
     policy: Policy,
 
+    /// Whether the policy was chosen rather than defaulted: `upload` changes a card's
+    /// policies only when asked to, and otherwise keeps what the card has
+    policy_given: bool,
+
     /// Whether to write the certificate authorities to the card's `msroots` object
     msroots: bool,
 
-    /// Algorithm of the management key `upload` installs
+    /// Algorithm of the management key `init` installs
     management_algorithm: ManagementKeyArg,
+
+    /// The keys `upload` writes, `check` compares and `publish` certifies
+    keys: Vec<KeyRole>,
+
+    /// Where the decryption key goes instead of 9D: a retired slot, for a key kept to read
+    /// what was encrypted to it
+    slot: Option<SlotId>,
+}
+
+/// The keys of the identity a builder has derived, each derived once however often a command
+/// uses it: an RSA key takes seconds to find
+///
+/// Secret, and wiped with the builder as every key type here wipes itself on drop.
+#[derive(Default)]
+struct Derived {
+    /// The root authority's key
+    root: OnceLock<IssuerKey>,
+    /// The issuing authority's key
+    issuing: OnceLock<IssuerKey>,
+    /// The usable keys, in [`KeyRole::ALL`] order
+    roles: [OnceLock<SlotKey>; 3],
 }
 
 impl SeededSmartcard {
-    /// Initialize a new seeded smartcard config
-    pub fn new(seed: &Seed256, subkey: Option<String>, name: String) -> Self {
-        // Derive application specific root seed
-        let root = seed.app("piv");
-
-        // Derive everything below the subkey id
-        let subseed = root.sub(subkey.as_deref());
-
-        // What the subseed would have been with no subkey id at all. Identical to `subseed`
-        // when none was given, which is what makes `--shared` a no-op for a single card.
-        let shared_seed = root.sub(None);
-
+    /// Initialize a new seeded smartcard config from the seeds a command has
+    pub fn new(seeds: Seeds<'_>, path: KeyPath, name: String) -> Self {
         SeededSmartcard {
-            root,
+            seeds: Subtrees::new(seeds, "piv", &path),
+            derived: Box::default(),
+            path,
             algorithm: Algorithm::P256,
-            subseed,
-            shared_seed,
-            retired: vec![],
-            shared: vec![],
-            subkey,
             identity: SubjectName { name, ..Default::default() },
             alternatives: vec![],
-            creation_time: None,
+            identity_time: None,
             validity_duration: None,
+            list_stem: None,
             pin: None,
             intermediate: false,
             policy: Policy::default(),
+            policy_given: false,
             msroots: true,
             management_algorithm: ManagementKeyArg::Auto,
+            keys: KeyRole::ALL.to_vec(),
+            slot: None,
         }
     }
 
-    /// Set the pin to install on the card in place of the PIV default
-    pub fn with_pin(mut self, pin: Zeroizing<String>) -> Self {
+    /// Set the user pin `init` installs in place of the PIV default and `check` verifies
+    ///
+    /// Fails on a pin no PIV card takes, see [`refuse_unfit_pin`].
+    pub fn with_pin(mut self, pin: Zeroizing<String>) -> Result<Self> {
+        refuse_unfit_pin(&pin)?;
         self.pin = Some(pin);
-        self
+        Ok(self)
     }
 
     /// Derive the whole chain with `algorithm`, authorities included
@@ -188,6 +232,7 @@ impl SeededSmartcard {
     /// no key material between the two chains.
     pub fn with_algorithm(mut self, algorithm: Algorithm) -> Self {
         self.algorithm = algorithm;
+        self.derived = Box::default();
         self
     }
 
@@ -226,30 +271,14 @@ impl SeededSmartcard {
         self
     }
 
-    /// Archive the key management keys of superseded generations, newest first
-    ///
-    /// Each lands in a retired key management slot, 0x82 upward, so data encrypted to an older
-    /// generation stays readable after the live key rotates. Only the key management key is
-    /// archived: an old signing key would merely allow backdated signatures, and old
-    /// authentication keys have no historical use.
-    pub fn with_retired(mut self, retired: Vec<String>) -> Self {
-        self.retired = retired;
-        self
-    }
-
-    /// Derive the named slots without the subkey id, so every card gets the same key
-    pub fn with_shared(mut self, shared: Vec<SharedSlot>) -> Self {
-        self.shared = shared;
-        self
-    }
-
     /// Choose the pin and touch requirements `upload` gives the slots and management access
     pub fn with_policy(mut self, policy: Policy) -> Self {
         self.policy = policy;
+        self.policy_given = true;
         self
     }
 
-    /// Pick the algorithm of the management key `upload` installs
+    /// Pick the algorithm of the management key `init` installs
     ///
     /// `check` ignores this and derives for whatever algorithm the card reports, so it needs
     /// no flag to verify either kind.
@@ -264,9 +293,9 @@ impl SeededSmartcard {
         self
     }
 
-    /// Set certificate creation time
-    pub fn with_creation_time(mut self, timestamp: SystemTime) -> Self {
-        self.creation_time = Some(timestamp);
+    /// Set the creation time of the identity's root authority
+    pub fn with_identity_time(mut self, timestamp: SystemTime) -> Self {
+        self.identity_time = Some(timestamp);
         self
     }
 
@@ -275,17 +304,141 @@ impl SeededSmartcard {
         self.validity_duration = Some(duration);
         self
     }
+
+    /// Name where the identity's revocation lists are published, by a URL whose last segment
+    /// ends in `.crl`: each list is published beside it, under that name with its own
+    /// suffix (see [`Self::revocation_list_suffix`]), and every certificate names the list of
+    /// the authority that issued it
+    ///
+    /// Fails on a URL the lists cannot be named from, see [`refuse_unfit_crl_url`].
+    pub fn with_crl_url(mut self, url: &str) -> Result<Self> {
+        refuse_unfit_crl_url(url)?;
+        let stem = url.strip_suffix(".crl").unwrap_or(url);
+        self.list_stem = Some(stem.to_owned());
+        Ok(self)
+    }
+
+    /// Write, compare and certify only these keys, in slot order
+    pub fn with_keys(mut self, keys: &[KeyRole]) -> Result<Self> {
+        if keys.is_empty() {
+            bail!("No key chosen: name at least one of authentication, signature or decryption");
+        }
+        self.keys = KeyRole::ALL
+            .into_iter()
+            .filter(|role| keys.contains(role))
+            .collect();
+        self.refuse_misplaced_slot()?;
+        Ok(self)
+    }
+
+    /// Put the decryption key into `slot` instead of 9D, by its number: 9d, or 82 to 95
+    pub fn with_slot(mut self, slot: u8) -> Result<Self> {
+        self.slot = Some(decryption_slot(slot)?);
+        self.refuse_misplaced_slot()?;
+        Ok(self)
+    }
+
+    /// Refuse a slot choice that does not name the decryption key alone
+    fn refuse_misplaced_slot(&self) -> Result<()> {
+        if self.slot.is_some() && self.keys != [KeyRole::Decryption] {
+            bail!(MISPLACED_SLOT);
+        }
+        Ok(())
+    }
+
+    /// The slot a role's key is written to
+    pub(super) fn slot_of(&self, role: KeyRole) -> SlotId {
+        match (role, self.slot) {
+            (KeyRole::Decryption, Some(slot)) => slot,
+            (role, _) => SlotRole::from(role).slot(),
+        }
+    }
+
+    /// The key path this card derives its keys along
+    pub fn path(&self) -> &KeyPath {
+        &self.path
+    }
+
+    /// Whether every usable key is chosen and in its own slot, which is what a card that
+    /// carries this identity holds; only such an upload stores the authorities in msroots
+    pub(super) fn whole_identity(&self) -> bool {
+        self.keys == KeyRole::ALL && self.slot.is_none()
+    }
+}
+
+impl Applet for SeededSmartcard {
+    fn name(&self) -> &'static str {
+        "PIV"
+    }
+
+    fn preflight(&self, target: Option<CardTarget>) -> Result<String> {
+        SeededSmartcard::preflight(self, target)
+    }
+
+    fn init(&self, target: Option<CardTarget>) -> Result<()> {
+        SeededSmartcard::init(self, target)
+    }
+
+    fn check(&self, target: Option<CardTarget>) -> Result<()> {
+        SeededSmartcard::check(self, target)
+    }
+
+    fn plan_wipe(&self, target: Option<CardTarget>, force: bool) -> Result<String> {
+        SeededSmartcard::plan_wipe(self, target, force)
+    }
+
+    fn wipe(&self, target: Option<CardTarget>, force: bool) -> Result<()> {
+        SeededSmartcard::wipe(self, target, force)
+    }
+
+    fn reset_pin(&self, target: Option<CardTarget>, new: &str) -> Result<()> {
+        SeededSmartcard::reset_pin(self, target, new)
+    }
+}
+
+impl Backend for SeededSmartcard {
+    type Change = UpdateChange;
+
+    fn plan_upload(&self, target: Option<CardTarget>) -> Result<UpdatePlan> {
+        SeededSmartcard::plan_upload(self, target)
+    }
+
+    fn upload(&self, target: Option<CardTarget>, confirmed: &UpdatePlan) -> Result<UpdatePlan> {
+        SeededSmartcard::upload(self, target, confirmed)
+    }
+
+    fn plan_rotation_from(
+        &self,
+        previous: &Self,
+        target: Option<CardTarget>,
+    ) -> Result<UpdatePlan> {
+        SeededSmartcard::plan_rotation_from(self, previous, target)
+    }
+
+    fn rotate_from(
+        &self,
+        previous: &Self,
+        target: Option<CardTarget>,
+        confirmed: &UpdatePlan,
+    ) -> Result<UpdatePlan> {
+        SeededSmartcard::rotate_from(self, previous, target, confirmed)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::seed;
+    use crate::seed::{self, CardSerial};
     use yubikey::piv::RetiredSlotId;
     use yubikey::{MgmAlgorithmId, PinPolicy, TouchPolicy};
 
     fn card() -> SeededSmartcard {
-        SeededSmartcard::new(&[3u8; 32], Some("builder".into()), "Builder".into())
+        let path = KeyPath { subkey: Some("builder".into()), date: None };
+        SeededSmartcard::new(Seeds::one(&[3u8; 32]), path, "Builder".into())
+    }
+
+    fn serial() -> CardSerial {
+        CardSerial::piv(12345678)
     }
 
     /// Without overrides every slot keeps the policy SP 800-73 asks for, retired slots that of
@@ -355,12 +508,18 @@ mod tests {
 
     /// The 3DES management key: 24 bytes, reproducible, not weak, and sharing nothing with
     /// the AES-256 key of the same card. The values of both are pinned with the other card
-    /// access secrets, in `keys.rs`.
+    /// credentials, in `keys.rs`.
     #[test]
     fn tdes_management_key_is_independent_of_aes() {
-        let tdes = card().management_key(MgmAlgorithmId::ThreeDes).unwrap();
-        let again = card().management_key(MgmAlgorithmId::ThreeDes).unwrap();
-        let aes = card().management_key(MgmAlgorithmId::Aes256).unwrap();
+        let tdes = card()
+            .management_key(MgmAlgorithmId::ThreeDes, &serial())
+            .unwrap();
+        let again = card()
+            .management_key(MgmAlgorithmId::ThreeDes, &serial())
+            .unwrap();
+        let aes = card()
+            .management_key(MgmAlgorithmId::Aes256, &serial())
+            .unwrap();
 
         assert_eq!(tdes.algorithm_id(), MgmAlgorithmId::ThreeDes);
         assert_eq!(aes.algorithm_id(), MgmAlgorithmId::Aes256);
@@ -375,17 +534,41 @@ mod tests {
             assert!(!aes.as_ref().windows(8).any(|other| other == window));
         }
 
-        // A different card gets a different key
-        let other = SeededSmartcard::new(&[3u8; 32], Some("other".into()), "Builder".into())
-            .management_key(MgmAlgorithmId::ThreeDes)
+        // Another card gets another key, and the key seed has no part in it
+        let other = card()
+            .management_key(MgmAlgorithmId::ThreeDes, &CardSerial::piv(87654321))
             .unwrap();
         assert_ne!(tdes.as_ref(), other.as_ref());
+        let split = SeededSmartcard::new(
+            Seeds { card: Some(&[3u8; 32]), key: Some(&[4u8; 32]) },
+            KeyPath::default(),
+            "Builder".into(),
+        )
+        .management_key(MgmAlgorithmId::ThreeDes, &serial())
+        .unwrap();
+        assert_eq!(tdes.as_ref(), split.as_ref());
+    }
+
+    /// A command without the card seed cannot reach a credential, and says which seed it lacks
+    #[test]
+    fn credentials_need_the_card_seed() {
+        let keys_only = SeededSmartcard::new(
+            Seeds { card: None, key: Some(&[3u8; 32]) },
+            KeyPath::default(),
+            "Builder".into(),
+        );
+        let err = match keys_only.management_key(MgmAlgorithmId::Aes256, &serial()) {
+            Ok(_) => panic!("a management key without the card seed"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("card seed"), "{err}");
+        assert!(keys_only.generate_chain().is_ok());
     }
 
     /// Algorithms this tool never installs are refused with a reason, not guessed at.
     #[test]
     fn foreign_management_key_algorithms_are_refused() {
-        let err = match card().management_key(MgmAlgorithmId::Aes192) {
+        let err = match card().management_key(MgmAlgorithmId::Aes192, &serial()) {
             Ok(_) => panic!("an AES-192 management key was derived"),
             Err(err) => err,
         };
@@ -413,15 +596,18 @@ mod tests {
         // AES-256, 3DES, P-256, P-384, Ed25519 and X25519: a build without RSA
         let no_rsa = listing(&[0x0c, 0x03, 0x11, 0x14, 0xe0, 0xe1]);
 
-        assert_eq!(card().unlisted(&no_rsa), Some(vec![]));
+        let roles = SlotRole::ALL;
+        assert_eq!(card().unlisted(&no_rsa, &roles, true), Some(vec![]));
         assert_eq!(
             card()
                 .with_algorithm(Algorithm::Curve25519)
-                .unlisted(&no_rsa),
+                .unlisted(&no_rsa, &roles, true),
             Some(vec![])
         );
         assert_eq!(
-            card().with_algorithm(Algorithm::Rsa3072).unlisted(&no_rsa),
+            card()
+                .with_algorithm(Algorithm::Rsa3072)
+                .unlisted(&no_rsa, &roles, true),
             Some(vec!["RSA-3072".to_string()])
         );
 
@@ -430,17 +616,24 @@ mod tests {
         assert_eq!(
             card()
                 .with_algorithm(Algorithm::Curve25519)
-                .unlisted(&no_x25519),
+                .unlisted(&no_x25519, &roles, true),
             Some(vec!["X25519".to_string()])
         );
 
         // `auto` takes either management key algorithm; an explicit one needs exactly it
         let tdes_only = listing(&[0x03, 0x11]);
-        assert_eq!(card().unlisted(&tdes_only), Some(vec![]));
+        assert_eq!(card().unlisted(&tdes_only, &roles, true), Some(vec![]));
+        // An upload installs no management key, so it asks for none
         assert_eq!(
             card()
                 .with_management_key(ManagementKeyArg::Aes256)
-                .unlisted(&tdes_only),
+                .unlisted(&tdes_only, &roles[..3], false),
+            Some(vec![])
+        );
+        assert_eq!(
+            card()
+                .with_management_key(ManagementKeyArg::Aes256)
+                .unlisted(&tdes_only, &roles, true),
             Some(vec!["an AES-256 management key".to_string()])
         );
     }
@@ -453,6 +646,11 @@ mod tests {
             0xa0, 0x00, 0x00, 0x03, 0x08,
         ])
         .unwrap();
-        assert_eq!(card().with_algorithm(Algorithm::Rsa4096).unlisted(&yubikey), None);
+        assert_eq!(
+            card()
+                .with_algorithm(Algorithm::Rsa4096)
+                .unlisted(&yubikey, &SlotRole::ALL, true),
+            None
+        );
     }
 }

@@ -1,14 +1,23 @@
 //! The derivation layer: argon2id and the labelled seed tree.
 //!
 //! Every derivation funnels through [`argon2id_256`]; the [`Seed256Derive`] trait spells the
-//! step out as a label grammar (`app:`, `sub:`, `key:`, `id:`, `pin:`) whose prefixes keep
-//! outputs of different kinds apart by construction. Results come back wrapped in
-//! [`Zeroizing`] so every copy wipes itself. The tree and its rationale are documented in
-//! the derivation chapter, <https://gliology.github.io/mind-the-gap/derivation.html>.
+//! step out as a label grammar (`app:`, `sub:`, `date:`, `key:`, `id:`, `pin:`) whose prefixes
+//! keep outputs of different kinds apart by construction. Results come back wrapped in
+//! [`Zeroizing`] so every copy wipes itself.
+//!
+//! Two seeds feed the tree, and one phrase may well be both: the *card seed* derives what
+//! administers a card (credentials and identifiers, each bound to the card's serial), the
+//! *key seed* an identity and its usable keys, along a [`KeyPath`]. The tree and its rationale
+//! are documented in the derivation chapter,
+//! <https://gliology.github.io/mind-the-gap/derivation.html>.
 
 use argon2::{Argon2, Params, Version};
 
 use anyhow::{Result, bail};
+
+use chrono::NaiveDate;
+
+use std::time::{Duration, SystemTime};
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD_NO_PAD;
@@ -17,6 +26,20 @@ use zeroize::Zeroizing;
 
 /// Type alias for raw seeds
 pub type Seed256 = [u8; 32];
+
+/// A derived seed, wiped when dropped and kept on the heap
+///
+/// On the heap the 32 bytes stay where they were written: a seed handed on, returned or
+/// stored in a struct moves only its pointer, where an array would be copied, and each copy
+/// would be a stack slot nothing wipes.
+pub type SecretSeed = Box<Zeroizing<Seed256>>;
+
+/// A seed copied straight onto the heap, where the copy is wiped like any derived seed
+fn secret_copy(seed: &Seed256) -> SecretSeed {
+    let mut copy: SecretSeed = Box::new(Zeroizing::new([0u8; 32]));
+    copy.copy_from_slice(seed);
+    copy
+}
 
 /// Constant to be used in all 256bit seed derivations
 const DERIVATION_CONTEXT: &[u8] = b"MINDTHEGAP256HDKD";
@@ -33,16 +56,17 @@ const DERIVATION_CONTEXT: &[u8] = b"MINDTHEGAP256HDKD";
 /// The parameters are frozen constants of the scheme named by [`SCHEME_VERSION`], the
 /// same way the label grammar is: changing any of them moves every key and therefore
 /// ships as a new major, never as a tuning tweak.
-pub fn argon2id_256(input: &[u8], salt: Option<&[u8]>) -> Zeroizing<Seed256> {
+pub fn argon2id_256(input: &[u8], salt: Option<&[u8]>) -> SecretSeed {
     // Chosen for memory-constrained environments; comfortably above the OWASP floor,
     // and part of the frozen mtg1 scheme (see above)
     let params = Params::new(64 * 1024, 3, 1, None).unwrap();
 
-    let salt = &[DERIVATION_CONTEXT, salt.unwrap_or(b"")].concat();
+    // At the root the salt carries the seed's password, so the joined copy is wiped too
+    let salt = Zeroizing::new([DERIVATION_CONTEXT, salt.unwrap_or(b"")].concat());
 
-    let mut hash = Zeroizing::new([0u8; 32]);
+    let mut hash: SecretSeed = Box::new(Zeroizing::new([0u8; 32]));
     Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(input, salt, hash.as_mut())
+        .hash_password_into(input, &salt, &mut hash[..])
         .expect("Parameters are valid");
     hash
 }
@@ -82,28 +106,50 @@ pub const PREFIX_APP: &str = "app";
 /// the subkey id sits at, that neighbour is the primary key.
 pub const PREFIX_SUB: &str = "sub";
 
+/// Subtree of one key generation, named by the day it was created
+pub const PREFIX_DATE: &str = "date";
+
 /// 256 bits of raw key material
 pub const PREFIX_KEY: &str = "key";
 
 /// Identifier material, truncated by the caller to the width its format allows
 pub const PREFIX_ID: &str = "id";
 
-/// An ASCII pin
+/// A credential: a pin, a puk or a management key, always bound to one card
 pub const PREFIX_PIN: &str = "pin";
+
+/// Whether `segment` fits the label grammar: lowercase letters, digits and hyphens
+fn is_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
 
 /// Compose a derivation label from its prefix and a lowercase hyphenated name
 ///
 /// For the fixed labels this crate defines. The grammar is asserted rather than enforced,
 /// since every caller passes a literal -- a violation is a bug here, not bad input.
 pub fn label(prefix: &str, name: &str) -> Vec<u8> {
-    debug_assert!(
-        !name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
-        "derivation labels are lowercase and hyphenated: {name:?}",
-    );
+    debug_assert!(is_segment(name), "derivation labels are lowercase and hyphenated: {name:?}");
     format!("{prefix}:{name}").into_bytes()
+}
+
+/// Compose a label of several segments after its prefix: `<prefix>:<a>:<b>:...`
+///
+/// Every segment follows the grammar of [`label`]; a card serial is spelled into it by
+/// [`CardSerial`], which is how a label that names a card stays inside the grammar.
+pub fn segments_label(prefix: &str, segments: &[&str]) -> Vec<u8> {
+    debug_assert!(
+        !segments.is_empty() && segments.iter().all(|segment| is_segment(segment)),
+        "derivation labels are lowercase and hyphenated: {segments:?}",
+    );
+    let mut label = prefix.to_string();
+    for segment in segments {
+        label.push(':');
+        label.push_str(segment);
+    }
+    label.into_bytes()
 }
 
 /// Compose the label for key material bound to one algorithm: `key:<name>:<segment>`
@@ -113,47 +159,180 @@ pub fn label(prefix: &str, name: &str) -> Vec<u8> {
 /// `key:signature:ed25519` are different keys, and a card switched from one algorithm to the
 /// other shares no secret with its former self.
 pub fn algorithm_label(name: &str, segment: &str) -> Vec<u8> {
-    debug_assert!(
-        !segment.is_empty()
-            && segment
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
-        "derivation labels are lowercase and hyphenated: {segment:?}",
-    );
-    let mut label = label(PREFIX_KEY, name);
-    label.push(b':');
-    label.extend_from_slice(segment.as_bytes());
-    label
+    segments_label(PREFIX_KEY, &[name, segment])
 }
 
-/// Compose the label for the subtree scoped to a user-supplied subkey id
+/// Compose the label of a credential bound to one card: `pin:<name>:<kind>:<serial>`
+///
+/// The kind says what the derived bytes become (`aes256`, `tdes`, `ascii`), so one name can
+/// never hand the same bytes to two encodings; the serial makes the credential the card's
+/// own, so one card's credential opens no other card.
+pub fn credential_label(name: &str, kind: &str, serial: &CardSerial) -> Vec<u8> {
+    segments_label(PREFIX_PIN, &[name, kind, serial.segment()])
+}
+
+/// Compose the label of an identifier bound to one card: `id:<name>:<serial>`
+pub fn card_id_label(name: &str, serial: &CardSerial) -> Vec<u8> {
+    segments_label(PREFIX_ID, &[name, serial.segment()])
+}
+
+/// Compose the label for the subtree scoped to a user-supplied subkey id, `sub:<id>`
 ///
 /// Deliberately not [`label`]: the id is arbitrary text a user chose, so it is neither checked
 /// against the label grammar nor required to be valid UTF-8 beyond what the CLI already
 /// accepts. The prefix is what matters: no fixed label begins with it, so an id can never
-/// collide with one however exotic it is.
+/// collide with one however exotic it is. The empty id is an id like any other; no id at all
+/// is no step, see [`KeyPath`].
+pub fn sub_label(id: &str) -> Vec<u8> {
+    [PREFIX_SUB.as_bytes(), b":", id.as_bytes()].concat()
+}
+
+/// Compose the label for the subtree of one key generation, `date:<YYYY-MM-DD>`
+pub fn date_label(date: NaiveDate) -> Vec<u8> {
+    format!("{PREFIX_DATE}:{}", date.format("%Y-%m-%d")).into_bytes()
+}
+
+/// A card's hardware serial, spelled as the last segment of the labels bound to that card
 ///
-/// No id at all derives under the bare prefix, with no separator; a supplied id, the
-/// empty string included, derives under `sub:<id>`. The two must not coincide: they
-/// produce different certificates, and keys that differ from certificates that agree
-/// is exactly the confusion the label grammar exists to rule out. `--shared` keys and
-/// a card without a subkey id both take the `None` side, so they keep agreeing.
-pub fn sub_label(id: Option<&str>) -> Vec<u8> {
-    match id {
-        Some(id) => [PREFIX_SUB.as_bytes(), b":", id.as_bytes()].concat(),
-        None => PREFIX_SUB.as_bytes().to_vec(),
+/// The serial is the card's own: what a PIV card reports for itself (a YubiKey's serial
+/// number, the trussed app's), or the manufacturer and serial of an OpenPGP card's
+/// application identifier. Spelled in decimal for PIV and as `mmmm-ssssssss` in lowercase hex
+/// for OpenPGP, so that both stay inside the label grammar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardSerial(String);
+
+impl CardSerial {
+    /// A PIV card's serial number
+    pub fn piv(serial: u32) -> Self {
+        CardSerial(serial.to_string())
+    }
+
+    /// An OpenPGP card's manufacturer and serial, from its application identifier
+    pub fn pgp(manufacturer: u16, serial: u32) -> Self {
+        CardSerial(format!("{manufacturer:04x}-{serial:08x}"))
+    }
+
+    /// The label segment
+    pub fn segment(&self) -> &str {
+        &self.0
     }
 }
+
+impl std::fmt::Display for CardSerial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The two seeds a command derives from, each present only when the command needs it
+///
+/// One phrase is usually both. They part where administering cards and holding an identity
+/// are different people or different risks: a team's administrator issues every member's card
+/// from the card seed, while the team's signing keys come from the team's own key seed.
+#[derive(Clone, Copy, Default)]
+pub struct Seeds<'a> {
+    /// What administers a card: its credentials and identifiers
+    pub card: Option<&'a Seed256>,
+    /// What an identity and its usable keys derive from
+    pub key: Option<&'a Seed256>,
+}
+
+impl<'a> Seeds<'a> {
+    /// One seed in both roles
+    pub fn one(seed: &'a Seed256) -> Self {
+        Seeds { card: Some(seed), key: Some(seed) }
+    }
+}
+
+/// Where usable keys sit under a key seed's application subtree
+///
+/// Two optional steps, each skipped when not given: `sub:<id>` for a device or application,
+/// then `date:<YYYY-MM-DD>` for a key generation. A key bound to one device takes both; the
+/// keys an identity shares across its devices (the decryption key) take the date alone, so
+/// every card of the identity carries the same one and rotation still moves it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeyPath {
+    /// The device or application the keys are bound to
+    pub subkey: Option<String>,
+    /// The key generation, which is also when its keys and certificates were created
+    pub date: Option<NaiveDate>,
+}
+
+impl KeyPath {
+    /// The seed a device's own keys derive from: `[sub:<id>] / [date:<iso>]`
+    pub fn device(&self, app: &Seed256) -> SecretSeed {
+        let seed = match &self.subkey {
+            Some(id) => app.sub(id),
+            None => secret_copy(app),
+        };
+        match self.date {
+            Some(date) => seed.date(date),
+            None => seed,
+        }
+    }
+
+    /// The seed an identity's shared keys derive from: `[date:<iso>]`
+    pub fn shared(&self, app: &Seed256) -> SecretSeed {
+        match self.date {
+            Some(date) => app.date(date),
+            None => secret_copy(app),
+        }
+    }
+
+    /// When the keys of this generation were created: midnight UTC of its date, or one
+    /// second after the unix epoch without one, so that an undated generation reproduces
+    pub fn creation_time(&self) -> SystemTime {
+        match self.date {
+            Some(date) => midnight(date),
+            None => epoch_creation(),
+        }
+    }
+}
+
+/// The creation time of everything derived without a date: one second after the unix epoch,
+/// since OpenPGP reads a zero creation time as none at all
+pub fn epoch_creation() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1)
+}
+
+/// Midnight UTC of a day, as a system time; never local time, so that derivation inputs do
+/// not depend on the time zone of the machine they are typed on
+pub fn midnight(date: NaiveDate) -> SystemTime {
+    let seconds = date
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight exists")
+        .and_utc()
+        .timestamp();
+    // Dates before 1970 cannot be key generations: OpenPGP stores creation times unsigned
+    SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(seconds).unwrap_or(0))
+}
+
+/// The day a generation was created on, read back from a creation time
+///
+/// The inverse of [`KeyPath::creation_time`]: `None` for the undated epoch time, the day for a
+/// time at its midnight UTC, and an error for anything else, which no generation produces.
+pub fn generation_of(time: SystemTime) -> Option<Option<NaiveDate>> {
+    if time == epoch_creation() {
+        return Some(None);
+    }
+    let seconds = time.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
+    let date = chrono::DateTime::from_timestamp(i64::try_from(seconds).ok()?, 0)?;
+    (seconds % 86_400 == 0).then(|| Some(date.date_naive()))
+}
+
+/// Derivation name of the seed's own identifier, see [`Seed256Derive::seed_id`]
+const NAME_SEED_ID: &str = "seed";
 
 /// Abstract derivation step
 ///
 /// Every label is `<prefix>:<name>`, and the prefix says what comes out: `key` is raw key
-/// material, `id` is an identifier, `pin` is something a person types. `app` and `sub` name
-/// subtrees rather than outputs. Keeping the shape in the label means two derivations can
-/// never agree by accident just because their names happen to match across use cases.
+/// material, `id` is an identifier, `pin` is a credential that opens one card. `app`, `sub`
+/// and `date` name subtrees rather than outputs. Keeping the shape in the label means two
+/// derivations can never agree by accident just because their names happen to match across
+/// use cases.
 pub trait Seed256Derive {
     /// Derive a child seed under the given path
-    fn derive(&self, path: Option<&[u8]>) -> Zeroizing<Seed256>;
+    fn derive(&self, path: Option<&[u8]>) -> SecretSeed;
 
     /// Derive a child seed and encode it as base64
     fn base64(&self, path: Option<&[u8]>) -> Zeroizing<String> {
@@ -161,22 +340,50 @@ pub trait Seed256Derive {
     }
 
     /// Derive an application subtree, which is itself only ever used to derive further
-    fn app(&self, name: &str) -> Zeroizing<Seed256> {
+    fn app(&self, name: &str) -> SecretSeed {
         self.derive(Some(&label(PREFIX_APP, name)))
     }
 
     /// Derive the subtree scoped to a user-supplied subkey id
-    fn sub(&self, id: Option<&str>) -> Zeroizing<Seed256> {
+    fn sub(&self, id: &str) -> SecretSeed {
         self.derive(Some(&sub_label(id)))
     }
 
+    /// Derive the subtree of one key generation
+    fn date(&self, date: NaiveDate) -> SecretSeed {
+        self.derive(Some(&date_label(date)))
+    }
+
+    /// Derive the raw bytes of a credential bound to one card, see [`credential_label`]
+    fn credential(&self, name: &str, kind: &str, serial: &CardSerial) -> SecretSeed {
+        self.derive(Some(&credential_label(name, kind, serial)))
+    }
+
+    /// Derive an identifier bound to one card, truncated to the width the format allows
+    fn card_id(&self, name: &str, serial: &CardSerial, bytes: usize) -> Vec<u8> {
+        self.derive(Some(&card_id_label(name, serial)))[..bytes].to_vec()
+    }
+
+    /// The seed's own identifier, `id:seed` in hex, for telling whether a phrase and its
+    /// password were entered as they were written down
+    ///
+    /// A password has no checksum, so a typo in it silently derives other keys; this short,
+    /// public value is what a record kept with the phrase can be compared with first. Eight
+    /// bytes say nothing about the seed that the derived public keys do not.
+    fn seed_id(&self) -> String {
+        self.derive(Some(&label(PREFIX_ID, NAME_SEED_ID)))[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     /// Derive 256 bits of raw key material
-    fn key(&self, name: &str) -> Zeroizing<Seed256> {
+    fn key(&self, name: &str) -> SecretSeed {
         self.derive(Some(&label(PREFIX_KEY, name)))
     }
 
     /// Derive 256 bits of key material for one algorithm, see [`algorithm_label`]
-    fn algorithm_key(&self, name: &str, segment: &str) -> Zeroizing<Seed256> {
+    fn algorithm_key(&self, name: &str, segment: &str) -> SecretSeed {
         self.derive(Some(&algorithm_label(name, segment)))
     }
 
@@ -188,15 +395,23 @@ pub trait Seed256Derive {
         self.derive(Some(&label(PREFIX_ID, name)))[..bytes].to_vec()
     }
 
-    /// Derive an ASCII pin
-    fn pin(&self, name: &str) -> Zeroizing<String> {
-        Zeroizing::new(base64_encode(&self.derive(Some(&label(PREFIX_PIN, name)))[..]))
+    /// Derive an ASCII credential bound to one card, `pin:<name>:ascii:<serial>`, in base64
+    /// and at most `length` characters long
+    fn ascii_credential(
+        &self,
+        name: &str,
+        serial: &CardSerial,
+        length: usize,
+    ) -> Zeroizing<String> {
+        let mut text = Zeroizing::new(base64_encode(&self.credential(name, "ascii", serial)[..]));
+        text.truncate(length);
+        text
     }
 }
 
 // ... and implement it using argon2
 impl Seed256Derive for Seed256 {
-    fn derive(&self, path: Option<&[u8]>) -> Zeroizing<Seed256> {
+    fn derive(&self, path: Option<&[u8]>) -> SecretSeed {
         argon2id_256(self, path)
     }
 }
@@ -302,15 +517,15 @@ const MAX_SCALAR_TRIES: usize = 8;
 /// Derive a *valid* P-256 secret scalar, re-deriving deterministically on rejection.
 ///
 /// A uniform 256-bit string is only a valid NIST P-256 private key when it lies in
-/// `[1, n-1]`; `SecretKey::from_bytes` performs exactly that range and zero check. Ed25519
+/// `[1, n-1]`; `SecretKey::from_slice` performs exactly that range and zero check. Ed25519
 /// and X25519 need nothing of the kind, any 32 bytes are a key, which is why this lives
 /// here for P-256 alone.
-pub fn derive_p256_scalar(parent: &Seed256, path: Option<&[u8]>) -> Result<Zeroizing<Seed256>> {
+pub fn derive_p256_scalar(parent: &Seed256, path: Option<&[u8]>) -> Result<SecretSeed> {
     let mut candidate = parent.derive(path);
 
     for _ in 0..MAX_SCALAR_TRIES {
-        // `into()` hands p256 a transient `FieldBytes` copy that is beyond our wiping
-        if p256::SecretKey::from_bytes(&(*candidate).into()).is_ok() {
+        // From the slice, which p256 reads in place rather than as a copy of its own
+        if p256::SecretKey::from_slice(&candidate[..]).is_ok() {
             return Ok(candidate);
         }
 
