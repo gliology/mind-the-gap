@@ -1,274 +1,165 @@
-# One seed, several cards
+# Several cards and identities
 
-Provisioning more than one card from a single seed is the normal case — a laptop, a desktop, a
-spare in a drawer — and it forces a handful of choices that are easier to make deliberately
-than to discover later. This document walks through them for both backends.
+Provisioning more than one card is the normal case: a laptop, a desktop, a spare in a drawer,
+a team's key on every member's card. This chapter walks through what that takes, and what each
+choice costs. The [flows](flows.md) say which combination to start from.
 
-Everything below was measured against the tool rather than reasoned about.
+## One subkey id per device
 
-## Start an interactive session
-
-Every command in this document needs the seed, and a provisioning session runs many of them.
-Start an interactive session instead of retyping the phrase per command:
-
-```
-mind-the-gap
-```
-
-The session asks for the phrase once, on the first command that needs it, follows up with
-the optional derivation password (empty for none), and keeps both in process memory only:
-nothing reaches the environment, and it is gone when you leave. The commands below then
-read exactly as written, one per prompt line:
+**Give every device its own subkey id.** Without one, every card of an identity is a clone of
+the others: the same signing and authentication keys, so nothing tells which card signed or
+logged in, and losing one card means revoking the keys of all of them.
 
 ```
-mtg> piv upload -k laptop
-mtg> piv upload -k desktop
+mtg> upload -k laptop
+mtg> upload -k desktop
 ```
 
-Each upload asks for the card's user pin on a hidden prompt (leaving it empty keeps the
-factory pin, with a warning). The pin can also be given inline as `-i <pin>`, but a pin on
-the line enters the session history like any other argument, so the prompt is the better
-habit; a `MIND_THE_PIN` variable set when the session started suppresses the question
-entirely.
+The subkey id changes the device's own keys and nothing above them:
 
-The two backends verify in opposite orders, visibly so when a card was provisioned from
-the wrong seed: `pgp check` compares fingerprints before spending any pin attempt, so a
-mismatch costs nothing; `piv check` must authenticate the management key first (and take
-its touch, where required), so the wrong seed surfaces as a failed authentication rather
-than a mismatch report.
+| | `-k laptop` | `-k desktop` |
+|---|---|---|
+| PIV root authority, OpenPGP primary key | the identity's | the same |
+| 9A, 9C, OpenPGP signing and authentication | the laptop's | the desktop's |
+| 9D, OpenPGP decryption | the identity's | the same |
+| management key, puk, admin pin, card identifiers | the card's own, from its serial | the card's own |
 
-## Give every card a subkey id
+So one trust anchor, or one OpenPGP identity, covers every device, while each card holds keys
+of its own. One per algorithm, that is: the algorithm is part of every derivation, the root's
+too, so a card on another algorithm chains to a root of its own, named by it
+(`CN=Jane Doe PIV Root CA rsa2048` beside `CN=Jane Doe PIV Root CA p256`), with a revocation
+list of its own, and relying parties install each root their cards chain to. The card's credentials never depend on the subkey id: they come from the card seed
+and the card's serial, so `upload -k desktop` can go onto any card the card seed initialized,
+and re-running it reproduces that card's keys byte for byte, which is how a lost card is
+replaced.
 
-**Do this first.** Without `--subkey`, every card provisioned from one seed is a cryptographic
-clone of the others: same keys, same certificates, same card id.
+The subkey id is a step of the derivation and appears in nothing published: the PIV
+certificates of every card carry the identity's subject, as the OpenPGP subkeys carry no device
+name, and a device's certificates are told apart by their keys. It is no secret either, so
+treat it as a name.
+
+## Which card is which
+
+With several cards on the desk, `list` says which of them a card seed initialized and which
+keys are a key seed's, on the device `-k` names:
 
 ```
-mtg> piv -k laptop upload
-mtg> piv -k desktop upload
+mtg> list -k laptop
+Yubico YubiKey OTP+FIDO+CCID 00 00
+  PIV card 20381784
+    initialized by this card seed
+    Authentication key: 4f1c... (CN=Jane Doe), this key seed's
+    ...
+  OpenPGP card 0006:20381784
+    initialized by this card seed
+    ...
+Nitrokey Nitrokey 3 [CCID/ICCD Interface] 01 00
+  OpenPGP card 000F:A1B2C3D4
+    not initialized by this card seed
 ```
 
-Everything below the subkey id changes with it; the authority above it does not:
+It reads only what a card shows without a pin, so it spends no pin try, asks for no touch, and
+leaves every card as it was found. A PIV card shows which card seed initialized it in its
+CHUID and its 9E certificate, an OpenPGP card in the card identifier `init` writes into data
+object 0102: identifiers derived from the card seed and the card's serial, which reveal
+nothing of the seed (see [derivation](derivation.md#published-identifiers)). The other
+verdicts are in the [commands chapter](commands.md#list).
 
-| `--subkey` | root CA | 9A key | card id |
-|---|---|---|---|
-| *(none)* | `8689cddf…` | `f3450d17…` | `mtg1:9482DB69` |
-| `laptop` | `8689cddf…` | `4fc4587c…` | `mtg1:E1FE3429` |
-| `desktop` | `8689cddf…` | `094d61dc…` | `mtg1:C40CBAD3` |
+No certificate names its device, so a device's keys are recognized by deriving them: `list -k
+laptop` marks the laptop's own keys (9A and 9C) as this key seed's and a desktop's not, while
+the decryption key, the identity's, shows as this key seed's on every card; `check -k laptop`
+compares a card with everything the laptop's subkey id derives. On the air-gapped side,
+`publish -k laptop`, with the generation's `-d` for a dated one, reproduces the laptop's
+certificates, with their fingerprints and serials, to compare with a certificate met
+elsewhere.
 
-OpenPGP behaves the same way: the primary key is identical across ids, the three subkeys are
-not. So one trust anchor — or one OpenPGP identity — covers every machine, while each card
-holds distinct key material.
+`--card` then names one, in any of three ways: a PIV serial, an OpenPGP identifier
+(`0006:12345678`), or the reader as `list` shows it. A serial or an identifier is looked up by
+asking every attached card who it is, without disturbing it; a reader is opened directly, and is
+the way to address a card while other programs work on the cards next to it. One `--card`
+covers both applets of a card.
 
-Clones are not merely untidy. You cannot tell which card signed or authenticated anything,
-losing one card means revoking the identity on every machine, and on the PIV side every card
-gets the same CHUID GUID, which Windows keys its smartcard cache on.
+## Encryption: one key for the identity
 
-Re-running `upload` with the *same* id is a different matter: it reproduces that card byte for
-byte, which is how a lost card is replaced.
-
-### The subkey id is public
-
-It appears in the derivation labels and, once a card is provisioned, in the certificates
-themselves — `dnQualifier=mtg1:laptop` on PIV, a subkey binding notation on OpenPGP. Treat it
-as a name, not a secret. "Which card is this" is exactly what it is for.
-
-If you want a second secret that separates one set of exported keys from another, that is what
-`--password` is for. It feeds the root entropy derivation, above everything discussed here.
-
-## Signing is easy, encryption is not
-
-This is the asymmetry that drives every remaining decision.
-
-**Signing and authentication work per card without any thought.** The verifier checks whichever
-key was actually used, so four cards with four signing keys all just work.
-
-**Encryption does not.** The *sender* chooses one key, and clients choose exactly one. Encrypt
-to an OpenPGP certificate carrying three encryption subkeys and you get a single recipient:
+Signing and authentication work per card without any thought: the verifier checks whichever key
+was used. Encryption does not, because the sender chooses the key, and chooses one:
 
 ```
 :pubkey enc packet: version 3, algo 18, keyid E4D4C05ABCB4171A
 ```
 
-One packet, one card. The others cannot open that message. With equal subkey creation dates the
-choice is effectively arbitrary; stagger them with `--subdate` and it becomes deterministic —
-newest wins — but it is still one card.
-
-PIV has the same problem wearing different clothes: a sender encrypts to one specific 9D
-certificate, so mail encrypted for the laptop cannot be read on the desktop.
-
-There are two answers, and they are mirror images.
-
-## Answer one: share the decryption key
-
-```
-mtg> pgp -k laptop  --shared decryption upload
-mtg> pgp -k desktop --shared decryption upload
-```
-
-`--shared` derives the named keys without the subkey id, so they come out identical on every
-card while the rest stay card specific. Merging the two certificates gives what you want:
+One packet, one key. With a decryption key per card, mail encrypted for the laptop could not be
+read on the desktop. So mind-the-gap derives the decryption key without the device step: it is
+the identity's, the same on every card, and without `--intermediate` its PIV certificate is the
+same too. Merging the certificates every device publishes gives what a correspondent needs:
 
 ```
 Subkey: CC769FDA… signing                          <- laptop
 Subkey: 38699EF0… authentication                   <- laptop
 Subkey: EBDD6E10… signing                          <- desktop
-Subkey: 377199446… authentication                  <- desktop
+Subkey: 37719944… authentication                   <- desktop
 Subkey: 4677E8FF… transport + data-at-rest         <- one, on both cards
 ```
 
-One encryption subkey, four card-specific signing and authentication subkeys, one identity. Any
-sender can encrypt to you and either card opens it, while signatures and SSH logins remain
-attributable to a particular card.
+**The cost** is that a shared key is shared: a card lost with its pin exposes the decryption
+key of every card. It is then [rotated](rotation.md): a new generation on every card, with the
+old key kept in a retired PIV slot for the mail already encrypted to it.
 
-PIV takes the same flag with `--shared key-management`. Slot 9E is deliberately not offered:
-it identifies the card, so a shared one would defeat its only purpose.
+## Retired slots
 
-**The cost** is that a shared key is shared. Losing one card exposes the decryption key for
-every card, and replacing it means re-provisioning all of them.
+PIV keeps twenty retired key management slots, `0x82` to `0x95`, for decryption keys that are no
+longer current but must keep decrypting. mind-the-gap fills them two ways:
 
-## Answer two: rotate, and archive the old keys
-
-The alternative is to let each card have its own decryption key and keep the superseded ones
-readable. That is precisely what the PIV retired slots are for: `0x82`–`0x95` are *Retired Key
-Management* keys, twenty of them.
-
-Name the superseded generations while provisioning the new one, newest first:
+- `rotate` moves the previous generation's decryption key into the first free one, with its
+  certificate, before it uploads the new generation ([rotation](rotation.md)).
+- `upload --key decryption --slot 82` puts the decryption key of the chosen key seed and
+  generation there, which is how a person's card carries a team's decryption key next to their
+  own, or a generation that was rotated on another card:
 
 ```
-mtg> piv -k gen3 --retire gen2 --retire gen1 upload
-  0x82 <- sub:gen2 -> key:key-management
-  0x83 <- sub:gen1 -> key:key-management
+mtg> upload --key-seed --key decryption --slot 82
 ```
 
-The archived key is byte for byte the key that generation used live, because slot keys derive
-by the *role* they serve rather than the slot they sit in: `key:key-management` under an older
-subseed is the same key whether it lives in 9D or in 0x82. Each archived slot gets its own
-certificate, qualified by the generation it belongs to rather than the one running the card, so
-an old certificate says which rotation it came from:
+The card seed authenticates the card, the key seed derives the key, and the key seed's root
+authority certifies it. A key derives the same in a retired slot as in 9D, so `check --key
+decryption --slot 82` verifies it later.
+
+Only decryption keys are kept this way; old signing and authentication keys are retired, for
+the reasons [rotation and cryptoperiods](best-practice.md#rotation-and-cryptoperiods) gives.
+
+OpenPGP cards have one decryption slot. A team's decryption key there would replace the
+person's, so a team key on an OpenPGP card wants a card of its own.
+
+## An issuing authority per device
+
+`--intermediate` inserts an issuing authority between the PIV root authority and the slot
+certificates, one per device and generation. As no certificate names a device, each is named by
+a tag of its own key, the first four bytes of its subject key identifier
+([derivation](derivation.md#piv-certificates-from-the-seed)):
 
 ```
-dnQualifier=mtg1:gen1, CN=Florian Franzen
+laptop   CN=Jane Doe PIV Issuing CA 9B3E5D17
+desktop  CN=Jane Doe PIV Issuing CA D27E0B65
 ```
 
-Archived slots are ordinary parts of the chain, so `certify` reproduces them offline and
-`check` verifies them alongside the live slots. They keep slot 9D's policies, since that is
-what they are. Twenty generations fit; a twenty-first is an error rather than a silent drop.
+Which device an authority is for is told on the air-gapped side: `publish --app piv -k laptop
+--intermediate`, with the generation's `-d` for a dated one, writes the laptop's chain, its
+issuing authority included.
 
-Declaring them during provisioning is not an arbitrary choice. `upload` factory-resets the
-card, so a second invocation to add an archived key would wipe what it was meant to preserve,
-and the management key authorising the write belongs to the generation running the card while
-the archived key belongs to an older one. Doing it in one pass is the only place both are
-known.
-
-**Retire decryption keys, destroy signing keys.** The intuition usually runs the other way, so
-it is worth stating plainly. Old decryption keys must be kept or old ciphertext is lost. Old
-signing keys should be destroyed: an old signature is verified against its archived
-certificate, never against the private key, so keeping the key only creates the ability to
-forge backdated signatures. Authentication keys are live credentials with no historical value.
-
-### Choosing between them
-
-| | share | rotate and archive |
-|---|---|---|
-| new mail readable on | every card | the current card |
-| old mail readable on | every card | the card that held the key, via its retired slot |
-| losing one card exposes | the shared decryption key, everywhere | that card's generation only |
-| replacing a card | re-provision all cards | provision the new one, archive the old |
-| available today | yes | yes |
-
-Share when the cards are peers you use interchangeably. Rotate when they are a succession, or
-when a lost card must not compromise the others.
-
-## What `--intermediate` changes
-
-`--intermediate` inserts an issuing CA between the root and the slot certificates. With several
-cards it does something more useful than adding a tier: **each subkey id gets its own issuing
-CA**, with a distinct subject and a distinct key.
-
-```
-laptop   CN=Florian Franzen PIV Issuing CA laptop    key b550201d…
-desktop  CN=Florian Franzen PIV Issuing CA desktop   key 9707e372…
-```
-
-That turns a card into a single revocable unit. Without an intermediate, retiring a card means
-revoking four leaf certificates, all listed on the root's CRL. With one, you revoke that card's
-issuing CA — one entry — and its four leaves fall with it.
-
-It costs an extra tier in every path, and the root must assert `pathLenConstraint: 1`, which the
-tool handles. For a single card it buys little. For a fleet it is the difference between a CRL
-that lists four entries per lost card and one that lists one.
-
-## Revocation, and what you would have to host
-
-### OpenPGP
-
-`mind-the-gap pgp revoke` exists and works. It re-derives the primary key from the seed, so a
-revocation certificate can be produced **at any time, air-gapped, without the card** — you do
-not need to pre-generate one and store it somewhere safe, which is the usual ceremony. Reason
-codes follow the OpenPGP set (`0` unspecified, `1` superseded, `2` compromised, `3` retired),
-and `--kind` has no default: `certificate` retires the whole identity, `subkeys` one card.
-
-Hosting requirement: none beyond publishing the updated certificate wherever people fetch it —
-a keyserver, WKD, your website.
-
-`--kind subkeys` narrows it to one card. A subkey is revoked by its primary, and the primary is
-re-derivable from the seed, so a lost card can be retired without it present and without
-touching the identity or any other card:
-
-```
-mtg> pgp -k laptop revoke --kind subkeys --code 3 --reason "laptop lost"
-```
-
-What comes out is the certificate carrying the revocations, because a lone subkey revocation
-signature has nothing to attach to. Import or publish it and that card's three subkeys read as
-revoked while the user id and every other card stay live. This is the payoff for giving each
-card its own subkey id.
-
-### PIV
-
-Nothing today. X.509 has no self-revocation: a certificate is revoked by its issuer publishing
-a statement, which means a CRL or OCSP.
-
-**A static CRL file is the right answer for most people**, and it is feasible — but it needs
-three things, and the tool currently provides none of them.
-
-1. **A CRL, signed by the issuing authority.** Derivable offline like everything else, so this
-   part fits the air-gapped model: the root key comes back from the seed, and the certificate
-   serial numbers are deterministic, so a CRL can be issued for a card that is not present.
-2. **A URL in the certificates.** This is the part people miss. The chain currently carries
-   **no `cRLDistributionPoints` extension** — verified: no CDP and no AIA on any certificate in
-   the chain — so no verifier will look for a CRL, and one published today would be ignored by
-   everything. The extension has to be baked in at issuance, which means deciding the URL
-   *before* provisioning. Adding it later means re-issuing and re-uploading every card.
-3. **Somewhere to serve it.** Any static host will do: object storage, a web server, GitHub
-   Pages. It is one file, fetched over plain HTTP by design — a CRL is signed, so it needs no
-   transport security.
-
-The wrinkle in "static" is that a CRL expires. It carries `thisUpdate` and `nextUpdate`, and
-clients reject one that is past `nextUpdate`, so the file has to be re-signed periodically
-whether or not anything was revoked — and re-signing needs the seed, which means an air-gapped
-session on a schedule. A long `nextUpdate` reduces that burden but lengthens the window in
-which clients keep trusting a cached CRL after you revoke something. Somewhere around 90 days
-is the usual compromise.
-
-OCSP is strictly worse here: it needs a responder that is online and signing, which defeats the
-point of deriving everything from an offline seed.
-
-**The cheapest alternative is not to revoke at all.** Because each card's keys derive from its
-own subkey id, retiring a card can simply mean re-provisioning under a new one and no longer
-trusting the old certificates — which needs no infrastructure whatsoever. With
-`--intermediate`, "no longer trusting" has a natural unit: that card's issuing CA. This is a
-perfectly respectable answer for a personal fleet, and it is the only reason the missing CRL
-support is not urgent.
+That turns a device's certificates into one revocable unit: revoking a card without one lists
+each of its certificates on the root's revocation list; with one, that card's issuing authority
+is the single entry, and its certificates fall with it, for verifiers that check the issuing
+authority's status. It costs an extra tier in every path, and with `--crl-url` a second,
+never-changing list to publish ([revocation](rotation.md#piv)). The root asserts
+`pathLenConstraint: 1` either way, so it is one certificate whether or not a device has an
+issuing authority.
 
 ## Summary
 
-- Run `mind-the-gap` without arguments for an interactive session that asks for the
-  phrase once and keeps it only in memory.
-- Always set `--subkey`, one per card. The machine name is a good id.
-- It is public, and appears in certificates. Use `--password` if you want secrecy.
-- Signing and authentication need no further thought.
-- For encryption, pick: `--shared decryption` for interchangeable cards, or rotate and archive
-  for a succession.
-- Use `--intermediate` once you have a fleet, so a card is one revocable unit.
-- Decide your CRL URL *before* provisioning, or plan to re-issue.
+- One subkey id per device; it is no secret, and no certificate names it.
+- Signing and authentication need no further thought; the decryption key is the identity's,
+  on every card.
+- `list` tells cards apart without spending a pin try; `--card` names one.
+- Retired PIV slots keep previous generations' and other identities' decryption keys.
+- `--intermediate` makes a device one revocable unit; [revocation](rotation.md#revocation)
+  covers what revoking one takes.

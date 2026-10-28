@@ -1,16 +1,19 @@
 # Pin and touch policies
 
 Every key on a card can ask for the pin, for a touch of the card's button, for both or for
-neither, and both applets fix that per key when the key is imported. `upload` takes the
+neither, and both applets fix that per key when the key is imported. mind-the-gap takes the
 decision as one word, `--policy`, and maps it onto what each applet can express:
 
 ```
-mind-the-gap ... piv --policy strict upload -c <serial>
-mind-the-gap ... pgp --policy never-touch upload -c <ident>
+mtg> init --policy strict
+mtg> upload --policy strict
+mtg> upload --app pgp --policy never-touch
 ```
 
-Without `--policy` both backends use `relaxed`. In a session, `set --policy` makes a mode
-the default for both, and `unset policy` forgets it.
+`init` applies the mode to PIV management access, `upload` to the keys (and to management
+access again, when `--policy` is given). Without `--policy` both use `relaxed`, and keys already
+on a card keep what they have. `set policy=strict` makes a mode the default for a session, a
+[config file](configuration.md) for good.
 
 ## The modes
 
@@ -34,7 +37,7 @@ alike.
 | `never` | no pin, no touch | no pin, no touch | no touch | once per session | off |
 
 A cached touch is valid for about fifteen seconds, so a burst of operations takes one press.
-Management access is what `check` and `upload` authenticate with; it asks for a touch
+Management access is what `check` and `upload` authenticate with on PIV; it asks for a touch
 whenever the mode asks for touch at all, since administering the card weighs at least as
 much as using one of its keys.
 
@@ -43,24 +46,24 @@ Two things hold in every mode:
 - **Slot 9E** stays without pin and touch. The standard requires the card authentication key
   to work without the cardholder, for door readers and the like.
 - **An OpenPGP card cannot drop the pin.** Every key wants it at least once per session, so
-  the modes without a pin mean once per session there, and `pgp upload` says so.
+  the modes without a pin mean once per session there, and `upload` says so.
 
 `upload` warns about what a mode gives up before it touches the card: `never` loudly, since
 whoever holds the card can then use every key on it, and every mode that lets 9C sign
 without a fresh pin, since the standard asks for that pin so that a signature stays
-non-repudiable. A build server's card is the usual reason to accept that (see [PIV cards
-for build servers](piv-build-server.md), which uses `once-pin`).
+non-repudiable. A host's card is the usual reason to accept that (see [unattended
+hosts](unattended-host.md), which use `once-pin`).
 
-PIV on YubiKey firmware before 4.3 has no cached touch, and the PIV upload refuses a cached
-mode there before the reset. Several OpenPGP applications lack it as well (a YubiKey 4's,
-the Nitrokey 3's opcard, Gnuk); there the OpenPGP upload falls back to touch always and says
+PIV on YubiKey firmware before 4.3 has no cached touch, and `upload` refuses a cached mode
+there before it writes anything. Several OpenPGP applets lack it as well (a YubiKey 4's,
+the Nitrokey 3's opcard, Gnuk); there `upload` falls back to touch always on OpenPGP and says
 so.
 
 ### Fixed touch
 
-`pgp upload --fixed-touch` makes the OpenPGP touch setting unchangeable but by replacing the
-key, where the card offers that (YubiKeys); elsewhere the plain setting is used and the
-upload says so. A PIV touch policy is fixed by nature: it can only change with the key.
+`upload --fixed-touch` makes the OpenPGP touch setting unchangeable but by replacing the
+key, where the card offers that (YubiKeys); elsewhere the plain setting is used and
+`upload` says so. A PIV touch policy is fixed by nature: it can only change with the key.
 
 ## What other tools do
 
@@ -76,4 +79,4 @@ default.
 | ykman, yubico-piv-tool | the card decides | | | | | | |
 
 The YubiKey row was read back from a freshly reset key with keys generated under the default
-policy; the others come from the applications' sources.
+policy; the others come from the applets' sources.
