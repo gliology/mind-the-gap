@@ -40,7 +40,7 @@ let
 in
 {
   # Provision a virtual OpenPGP card (Nitrokey's opcard behind vpcd) end to end:
-  # upload, check and config through the real binary, with no hardware involved
+  # init, upload and check through the real binary, with no hardware involved
   virtual-pgp = vmTest (
     import ./virtual-pgp.nix {
       inherit pkgs pgp-suite;
@@ -69,12 +69,21 @@ in
   virtual-piv-rsa3072 = virtualPiv "rsa3072";
   virtual-piv-rsa4096 = virtualPiv "rsa4096";
 
-  # The build server profile (docs/piv-build-server.md) on the same card: P-384, pin once,
+  # The build server profile (docs/unattended-host.md) on the same card: P-384, pin once,
   # touch never, management access without a touch, with the policies read back through
   # yubikit. YubiKey 4 behaviour is covered on a real YubiKey 4, see docs/hardware-tests.md;
   # its triple DES management key is forced onto the virtual card by the second variant.
   virtual-piv-builder = virtualPivBuilder null;
   virtual-piv-builder-tdes = virtualPivBuilder "tdes";
+
+  # The NixOS module's defaults and ceremony on an image, run against a virtual PIV card:
+  # a bare `mind-the-gap` runs the ceremony, dry, recorded and in plumbing mode
+  image-ceremony = vmTest (
+    import ./image-ceremony.nix {
+      inherit pkgs;
+      inherit (cards) piv-vpicc;
+    }
+  );
 
   # A whole simulated Nitrokey 3 attached over USB/IP: PIV and OpenPGP provisioned
   # through the kernel's USB stack, libccid and the firmware's own dispatcher
@@ -89,6 +98,13 @@ in
     import ./usbip-gnuk.nix {
       inherit pkgs pgp-suite;
       inherit (cards) gnuk-usbip;
+    }
+  );
+  # CanoKey, a third PIV and OpenPGP card and the first PIV one outside trussed, emulated
+  # by QEMU as a USB device of the machine
+  canokey = vmTest (
+    import ./canokey.nix {
+      inherit pkgs piv-suite pgp-suite;
     }
   );
 }

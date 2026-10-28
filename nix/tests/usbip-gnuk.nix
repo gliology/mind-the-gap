@@ -67,7 +67,7 @@
     # Written to a file rather than piped: under pipefail an early-exiting grep -q would
     # fail the pipeline even though the card is there
     machine.wait_until_succeeds(
-        "mind-the-gap pgp status > /tmp/pgp-status && grep -q 'Card FFFE:F1420A7A' /tmp/pgp-status",
+        "mind-the-gap list > /tmp/list && grep -q 'OpenPGP card FFFE:F1420A7A' /tmp/list",
         timeout=60,
     )
 
@@ -77,23 +77,39 @@
         "abandon abandon abandon abandon abandon abandon abandon abandon "
         "abandon abandon abandon abandon abandon abandon abandon art"
     )
-    identity = f"-s '{seed}' -n 'Gnuk Test' -m gnuk@example.com"
+    # The card seed's commands take the seed alone, the key seed's the identity's names too
+    secret = f"-s '{seed}'"
+    identity = f"{secret} -n 'Gnuk Test' -m gnuk@example.com"
+    options = "--app pgp"
     card = "-c FFFE:F1420A7A"
 
-    # Provision through the command line, read back, refuse a wrong subkey id
-    machine.succeed(f"mind-the-gap {identity} pgp upload --pin 471120 --yes {card} -o /tmp/cert.asc")
+    # Initialize and provision through the command line. The emulation is built as a stock
+    # Gnuk 2, which imports no key before the KDF data object is set, so init sets it up.
+    # Gnuk takes a new user pin only once it holds keys, so init leaves the factory pin and
+    # says so, and the pin is changed after the upload
+    machine.succeed(
+        f"mind-the-gap init {secret} {options} --pin 471120 --yes {card} "
+        "--log-level info 2> /tmp/init.log"
+    )
+    machine.succeed("grep -q 'takes its pins hashed' /tmp/init.log")
+    machine.succeed("grep -q 'until .pin. changes it after .upload.' /tmp/init.log")
+    machine.succeed(f"mind-the-gap upload {identity} {options} --yes {card}")
+    machine.succeed(
+        f"mind-the-gap pin {options} {card} --current-pin 123456 --pin 471120"
+    )
+    machine.succeed(f"mind-the-gap publish {identity} {options} --to /tmp/cert.asc")
     machine.succeed("grep -q 'BEGIN PGP PUBLIC KEY BLOCK' /tmp/cert.asc")
-    machine.succeed(f"mind-the-gap {identity} pgp check {card}")
-    machine.fail(f"mind-the-gap {identity} -k other pgp check {card}")
+    machine.succeed(f"mind-the-gap check {identity} {options} --pin 471120 {card}")
+    machine.fail(f"mind-the-gap check {identity} -k other {options} {card}")
 
-    # The algorithms Gnuk 2 dropped are refused before the reset: the keys stay in place
-    for algorithm in ["p256", "rsa2048"]:
+    # The algorithms Gnuk 2 dropped are refused before anything is written: the keys stay
+    for algorithm in ["p256", "rsa2048", "rsa3072", "rsa4096"]:
         machine.fail(
-            f"mind-the-gap {identity} pgp --algorithm {algorithm} upload --pin 471120 --yes {card} "
+            f"mind-the-gap upload {identity} {options} --algorithm {algorithm} --yes {card} "
             "2> /tmp/refused.log"
         )
         machine.succeed("grep -q 'the card was not touched' /tmp/refused.log")
-        machine.succeed(f"mind-the-gap {identity} pgp check {card}")
+        machine.succeed(f"mind-the-gap check {identity} {options} {card}")
 
     # The OpenPGP checklist on Curve25519, as in virtual-pgp: provisioning, the card read
     # back independently, every key at work on the card, gpg using it end to end

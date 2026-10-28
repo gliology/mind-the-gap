@@ -14,12 +14,12 @@ pkgs.stdenv.mkDerivation {
   ];
 
   # Life cycle management, so mind-the-gap can factory-reset the applet as on any card.
-  # The KDF data object is made optional: Gnuk 2 otherwise refuses every key import until
-  # one is set, and mind-the-gap does not set one up yet (TODO.md)
+  # The KDF data object stays required, as in a stock build: no key import before `init`
+  # has set it up
   configurePhase = ''
     runHook preConfigure
     cd src
-    kdf_do=optional bash ./configure --target=GNU_LINUX --enable-factory-reset
+    bash ./configure --target=GNU_LINUX --enable-factory-reset
     runHook postConfigure
   '';
 

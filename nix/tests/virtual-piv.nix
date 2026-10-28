@@ -13,8 +13,8 @@
 # `algorithm` picks the chain the card is provisioned with: P-256, P-384, Curve25519 for
 # the Ed25519 (0xE0) and X25519 (0xE1) import, or RSA-2048 through the Yubico import layout.
 # After the command line round trip the card-level half of the destructive hardware suite
-# runs against the same card, which is what proves the keys *work* -- `piv check` only
-# reads them back.
+# runs against the same card, which is what proves the keys *work* -- `check` only reads
+# them back.
 {
   pkgs,
   piv-vpicc,
@@ -33,6 +33,7 @@
     environment.systemPackages = [
       pkgs.mind-the-gap
       piv-suite
+      pkgs.opensc
     ];
 
     # pcscd with vpcd as its only reader: a TCP listener on localhost that virtual cards
@@ -73,7 +74,7 @@
     # serial. Written to a file rather than piped: under pipefail an early-exiting
     # grep -q would fail the pipeline even though the card is there.
     machine.wait_until_succeeds(
-        "mind-the-gap piv status > /tmp/status && grep -q 'Serial: 5437251' /tmp/status",
+        "mind-the-gap list > /tmp/list && grep -q 'PIV card 5437251' /tmp/list",
         timeout=120,
     )
 
@@ -83,39 +84,50 @@
         "abandon abandon abandon abandon abandon abandon abandon abandon "
         "abandon abandon abandon abandon abandon abandon abandon art"
     )
-    identity = f"-s '{seed}' -n 'Virt Test'"
-    # The algorithm is a backend option, so it sits behind the `piv` word
-    piv = "piv --algorithm ${algorithm}"
+    # The card seed's commands take the seed alone, the key seed's the identity's name too
+    secret = f"-s '{seed}'"
+    identity = f"{secret} -n 'Virt Test'"
+    options = "--app piv --algorithm ${algorithm}"
     card = "-c 5437251"
 
-    # Provision the virtual card: reset by pin exhaustion, derived AES-256 management
-    # key (with required touch), user pin, four imported keys in the chosen algorithm with
-    # their pin and touch policies verified through metadata read-back, the certificate
-    # chain, and the certificate authorities in msroots
-    machine.succeed(
-        f"mind-the-gap {identity} {piv} upload --pin 471120 --yes {card} -o /tmp/chain.pem"
-    )
+    # Initialize the virtual card from the card seed: reset by pin exhaustion, derived
+    # AES-256 management key (with required touch), user pin, derived puk, CHUID, CCC and
+    # the 9E key with its certificate
+    machine.succeed(f"mind-the-gap init {secret} {options} --pin 471120 --yes {card}")
+
+    # Then the key seed's keys: three imported keys in the chosen algorithm with their pin
+    # and touch policies verified through metadata read-back, the certificate chain, and
+    # the certificate authorities in msroots
+    machine.succeed(f"mind-the-gap upload {identity} {options} --yes {card}")
+    machine.succeed(f"mind-the-gap publish {identity} {options} --to /tmp/chain.pem")
     machine.succeed("grep -q 'BEGIN CERTIFICATE' /tmp/chain.pem")
 
-    # The card must hold exactly the derived chain, byte for byte -- including the slot
-    # policies and msroots, whose mismatches only warn, so assert on the log
+    # The card must hold exactly what both seeds derive, byte for byte -- including the
+    # slot policies and msroots, whose mismatches only warn, so assert on the log
     machine.succeed(
-        f"mind-the-gap {identity} {piv} check --pin 471120 {card} 2> /tmp/check.log"
+        f"mind-the-gap check {identity} {options} --pin 471120 {card} 2> /tmp/check.log"
     )
     machine.fail("grep -Eq 'Policy mismatch|WARN.*msroots' /tmp/check.log")
 
-    # Re-provisioning must converge to the same card: a lost card is replaceable
-    machine.succeed(
-        f"mind-the-gap {identity} {piv} upload --pin 471120 --yes {card}"
-    )
-    machine.succeed(f"mind-the-gap {identity} {piv} check --pin 471120 {card}")
+    # An upload again finds nothing to write, and the listing names the card seed's card
+    machine.succeed(f"mind-the-gap upload {identity} {options} --dry-run {card} > /tmp/again")
+    machine.succeed("grep -q 'nothing to change' /tmp/again")
+    machine.succeed(f"mind-the-gap list {secret} --app piv > /tmp/owned")
+    machine.succeed("grep -q '^ *initialized by this card seed' /tmp/owned")
 
-    # A wrong subkey id derives a different management key and chain, and must fail. As
-    # often as the card has pin retries, and the right pin still opens it afterwards: a
-    # mistyped subkey id costs nothing on the card.
+    # Initializing again must converge to the same card: a lost card is replaceable
+    machine.succeed(f"mind-the-gap init {secret} {options} --pin 471120 --yes {card}")
+    machine.succeed(f"mind-the-gap upload {identity} {options} --yes {card}")
+    machine.succeed(f"mind-the-gap check {identity} {options} --pin 471120 {card}")
+
+    # A mistyped password derives another card seed, which the card refuses before any
+    # credential is tried: as often as the card has pin retries, and the right seed still
+    # opens it afterwards. A wrong subkey id finds other keys, and no credential is spent
+    # on it either.
     for _ in range(3):
-        machine.fail(f"mind-the-gap {identity} -k other {piv} check --pin 471120 {card}")
-    machine.succeed(f"mind-the-gap {identity} {piv} check --pin 471120 {card}")
+        machine.fail(f"mind-the-gap check {identity} -p typo {options} --pin 471120 {card}")
+        machine.fail(f"mind-the-gap check {identity} -k other {options} --pin 471120 {card}")
+    machine.succeed(f"mind-the-gap check {identity} {options} --pin 471120 {card}")
 
     # The card-level half of the destructive suite, against the same card: it provisions
     # its own identity, then has the card sign in 9A, 9C and 9E under their pin policies
@@ -139,6 +151,34 @@
           "|| { cat /tmp/touch.log; exit 1; }"
       )
       machine.succeed("grep -q 'test result: ok. 1 passed' /tmp/touch.log")
+
+      # Uploaded to again, without a reset: a new validity and another policy with the keys
+      # untouched, and a team's decryption key from another key seed in retired slot 82
+      machine.succeed(
+          "MTG_HARDWARE_TEST_SERIAL=5437251 "
+          "piv-suite --ignored --exact upload_in_place "
+          "--nocapture > /tmp/upload.log 2>&1 "
+          "|| { cat /tmp/upload.log; exit 1; }"
+      )
+      machine.succeed("grep -q 'test result: ok. 1 passed' /tmp/upload.log")
+
+      # Middleware finds the kept key: OpenSC reads retired keys as far as the key history
+      # object counts them, which the upload of slot 82 set to one
+      objects = machine.succeed(
+          "pkcs11-tool --module ${pkgs.opensc}/lib/opensc-pkcs11.so --list-objects 2>&1"
+      )
+      print(objects)
+      assert "Retired KEY MAN 1" in objects, "OpenSC does not see the key in slot 82"
+
+      # Then rotated to a new generation with the old 9D kept, its user pin changed and
+      # reset with the derived puk, and the card wiped
+      machine.succeed(
+          "MTG_HARDWARE_TEST_SERIAL=5437251 "
+          "piv-suite --ignored --exact rotate_in_place change_user_pin "
+          "--nocapture > /tmp/rotate.log 2>&1 "
+          "|| { cat /tmp/rotate.log; exit 1; }"
+      )
+      machine.succeed("grep -q 'test result: ok. 2 passed' /tmp/rotate.log")
     ''}
   '';
 }

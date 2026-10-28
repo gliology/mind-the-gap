@@ -95,6 +95,11 @@
         in
         {
           inherit pkgs toolchain rust;
+          harness = import ./harness {
+            inherit pkgs rust;
+            inherit (pkgs) lib;
+            src = ./.;
+          };
           docs = import ./nix/docs.nix {
             inherit pkgs;
             rustdoc = rust.doc;
@@ -135,9 +140,13 @@
             docs
             live
             cards
+            harness
             ;
         in
         rust.checks
+        // {
+          test-results = harness.check;
+        }
         // import ./nix/lint.nix { inherit pkgs; }
         // docs.checks
         // live.checks
@@ -151,6 +160,12 @@
       # `nix fmt`: nixfmt over the whole tree, through the treefmt wrapper nixpkgs ships
       # for exactly this, so it needs no file arguments
       formatter = forEachSystem (system: perSystem.${system}.pkgs.nixfmt-tree);
+
+      # `nix run .#hardware-tests`: the hardware suites against a named card, the simulated
+      # cards' checks, and the results rendered into the book (docs/hardware-tests.md)
+      apps = forEachSystem (system: {
+        hardware-tests = perSystem.${system}.harness.app;
+      });
 
       # Shells used for development
       devShells = forEachSystem (
@@ -166,6 +181,12 @@
       # Simple overlay to provide command line derivation
       overlays.default = final: prev: {
         inherit (self.packages.${prev.stdenv.hostPlatform.system}) mind-the-gap;
+      };
+
+      # The NixOS module: the package, and the defaults and ceremony a machine ships with
+      nixosModules.default = {
+        imports = [ ./nix/module.nix ];
+        nixpkgs.overlays = [ self.overlays.default ];
       };
 
       # Buildable outputs are:

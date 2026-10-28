@@ -2,7 +2,7 @@
 #
 # The same card and machine as virtual-piv.nix -- the trussed piv-authenticator behind
 # vsmartcard's vpcd -- provisioned with the build server profile from
-# docs/piv-build-server.md: every key on P-384, pin once and touch never on the person
+# docs/unattended-host.md: every key on P-384, pin once and touch never on the person
 # slots, and management access without a touch. yubikit then reads back what the card
 # reports, so the policies are seen on the card rather than taken from our own log.
 #
@@ -105,7 +105,7 @@ in
     machine.wait_for_unit("pcscd.service")
 
     machine.wait_until_succeeds(
-        "mind-the-gap piv status > /tmp/status && grep -q 'Serial: 5437251' /tmp/status",
+        "mind-the-gap list > /tmp/list && grep -q 'PIV card 5437251' /tmp/list",
         timeout=120,
     )
 
@@ -115,29 +115,34 @@ in
         "abandon abandon abandon abandon abandon abandon abandon abandon "
         "abandon abandon abandon abandon abandon abandon abandon art"
     )
-    # The card id is kept apart, so the last step can swap it for another
-    identity = f"-s '{seed}' -n 'pavlov builder'"
+    # The card seed's commands take the seed alone, the key seed's the identity too
+    secret = f"-s '{seed}'"
+    identity = f"{secret} -n 'pavlov builder'"
     builder = f"{identity} -k pavlov-1"
-    # The build server profile from docs/piv-build-server.md
-    piv = (
-        "piv --algorithm p384 --policy once-pin${
+    options = (
+        "--app piv --algorithm p384 --policy once-pin${
           if managementKey == null then "" else " --management-algorithm ${managementKey}"
         }"
     )
+    # What publishing derives with, without the card's policy
+    chain = "--app piv --algorithm p384"
     card = "-c 5437251"
     pin = "--pin 471120"
 
-    machine.succeed(
-        f"mind-the-gap {builder} {piv} upload {card} {pin} --yes -o /tmp/chain.pem "
-        "2> /tmp/upload.log"
-    )
+    # The build server profile, as docs/unattended-host.md provisions it: initialized on
+    # the air-gapped side with management access left touch-free, then the host's keys
+    machine.succeed(f"mind-the-gap init {secret} {options} {card} {pin} --yes 2> /tmp/init.log")
+    machine.succeed("grep -q 'Management access stays touch-free' /tmp/init.log")
+    machine.succeed("grep -q 'derived ${management.log} management key' /tmp/init.log")
+    machine.succeed(f"mind-the-gap upload {builder} {options} {card} --yes")
+    machine.succeed(f"mind-the-gap publish {builder} {chain} --to /tmp/chain.pem")
     machine.succeed("grep -q 'BEGIN CERTIFICATE' /tmp/chain.pem")
-    machine.succeed("grep -q 'Management access stays touch-free' /tmp/upload.log")
 
+    # What the card holds, read back through yubikit rather than this tool: every slot P-384
+    # with the pin once and no touch, 9E without either, and the management key in the
+    # algorithm asked for, no touch and not the default
     policies = machine.succeed("piv-policies")
     print(policies)
-
-    machine.succeed("grep -q 'derived ${management.log} management key' /tmp/upload.log")
     info = machine.succeed("ykman --reader 'Virtual PCD 00 00' piv info 2>&1")
     print(info)
     assert "PIV version:              6.6.6" in info, info
@@ -151,29 +156,37 @@ in
     ):
         assert line in policies, f"{line!r} missing from:\n{policies}"
 
-    # The card holds exactly the derived chain
-    machine.succeed(f"mind-the-gap {builder} {piv} check {card} {pin} 2> /tmp/check.log")
+    # check agrees, without a policy warning or a key it could not prove
+    machine.succeed(f"mind-the-gap check {builder} {options} {card} {pin} 2> /tmp/check.log")
     machine.fail("grep -Eq 'Policy mismatch|WARN.*msroots|without --pin' /tmp/check.log")
 
-    # A slot key the card does not hold is caught, by metadata or by the challenge: with
-    # 9A derived without the card id, the management key still opens the card but the
-    # authentication key no longer matches
+    # Another host's subkey id derives other keys, and check names the slot that differs
     machine.succeed(
-        f"! mind-the-gap {builder} {piv} --shared authentication check {card} {pin} "
-        "2> /tmp/shared.log"
+        f"! mind-the-gap check {identity} -k pavlov-2 {options} {card} {pin} "
+        "2> /tmp/other-host.log"
     )
     machine.succeed(
-        "grep -q 'Authentication slot: public key is not the derived one' /tmp/shared.log"
+        "grep -q 'Authentication slot: public key is not the derived one' /tmp/other-host.log"
     )
 
-    # Re-provisioning converges to the same card: a lost card is replaceable from the seed
-    machine.succeed(f"mind-the-gap {builder} {piv} upload {card} {pin} --yes")
-    machine.succeed(f"mind-the-gap {builder} {piv} check {card} {pin}")
+    # Initializing again converges on the same card
+    machine.succeed(f"mind-the-gap init {secret} {options} {card} {pin} --yes")
+    machine.succeed(f"mind-the-gap upload {builder} {options} {card} --yes")
+    machine.succeed(f"mind-the-gap check {builder} {options} {card} {pin}")
 
-    # A different card id derives a different management key and chain, and must fail
+    # Another card seed does not administer the card, and says so before trying a key
     machine.succeed(
-        f"! mind-the-gap {identity} -k other {piv} check {card} {pin} 2> /tmp/other.log"
+        f"! mind-the-gap check {builder} -p typo {options} {card} {pin} 2> /tmp/other.log"
     )
-    machine.succeed("grep -q 'authentication error' /tmp/other.log")
+    machine.succeed("grep -q 'not initialized by this card seed' /tmp/other.log")
+
+    # The host rotates its own pin in plumbing mode, with the current pin and no seed, and
+    # gets a report it can read
+    machine.succeed(
+        f"mind-the-gap pin --plumbing --app piv {card} --current-pin 471120 --pin 582231 "
+        "> /tmp/pin.json"
+    )
+    machine.succeed("grep -q '\"ok\":true' /tmp/pin.json")
+    machine.succeed(f"mind-the-gap check {builder} {options} {card} --pin 582231")
   '';
 }

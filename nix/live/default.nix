@@ -14,6 +14,21 @@ let
     nixpkgs.overlays = [ self.overlays.default ];
   };
 
+  # The image as released names its source revision in `mind-the-gap --version` and in every
+  # ceremony transcript. This image alone: the checks, the instrumented iso among them, build
+  # the package without it, so that a commit which changes no source rebuilds none of them
+  revision = self.rev or self.dirtyRev or null;
+  released = {
+    nixpkgs.overlays = [
+      self.overlays.default
+    ]
+    ++ pkgs.lib.optional (revision != null) (
+      final: prev: {
+        mind-the-gap = prev.mind-the-gap.overrideAttrs { MIND_THE_GAP_REVISION = revision; };
+      }
+    );
+  };
+
   # The live iso with the nixos test backdoor baked in, used by the boot checks only;
   # packages.iso remains the clean image
   instrumentedIso =
@@ -35,7 +50,7 @@ in
   configuration = nixpkgs.lib.nixosSystem {
     inherit system;
     modules = [
-      overlay
+      released
       (import ./system.nix)
     ];
   };

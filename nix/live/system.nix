@@ -15,9 +15,19 @@ let
     ${builtins.readFile ../../assets/motd.ansi}
      mind-the-gap ${pkgs.mind-the-gap.version} · image ${config.system.nixos.label}
 
-     mind-the-gap opens an interactive session; `forget` clears screen, scrollback and
-     shell history; power off and let the machine sit before walking away.
+     ${start}; `forget` clears screen,
+     scrollback and shell history; power off and let the machine sit before walking away.
   '';
+
+  # What a bare `mind-the-gap` does on this image: the configured ceremony, or a session
+  start =
+    let
+      recipe = config.programs.mind-the-gap.defaultRecipe;
+    in
+    if recipe == null then
+      "mind-the-gap opens an interactive session"
+    else
+      "mind-the-gap runs the ceremony `${recipe}` (`mind-the-gap run --dry-run` shows its steps)";
 
   # The medium announces itself to file managers when plugged into a running system:
   # Windows Explorer and GVfs read autorun.inf (only its icon and label; execution
@@ -66,6 +76,8 @@ in
     # and udev coldplugs whatever matches, which no profile choice here can prevent. The
     # nftables table below is what actually keeps such an interface mute.
     (modulesPath + "/profiles/all-hardware.nix")
+    # The tool, with the defaults and ceremony an image may ship
+    ../module.nix
   ];
 
   # Adds terminus_font for people with HiDPI displays
@@ -309,7 +321,7 @@ in
   services.pcscd.enable = true;
 
   # scdaemon through pcscd rather than its own CCID driver, which would take the token away
-  # from pcscd and with it from mind-the-gap; see docs/linux.md. This also makes the udev
+  # from pcscd and with it from mind-the-gap; see docs/after-the-gap.md. This also makes the udev
   # rules that driver needs (hardware.gpgSmartcards) unnecessary.
   environment.etc."gnupg/scdaemon.conf".text = ''
     disable-ccid
@@ -327,21 +339,21 @@ in
   # registers and stack contents. The kernel parameter above keeps the EFI backend from
   # registering at all, so nothing can be deposited there in the first place.
 
-  # Add any tools we might need. Nothing here may be able to reach a network: the image is
-  # air-gapped by configuration, and a downloader on board would only invite excuses.
+  # Add any tools we might need. Nothing here may need a network: the image is air-gapped
+  # by its firewall, which also holds the curl every NixOS system carries.
   environment.systemPackages = with pkgs; [
     # Clear the traces a session leaves on the terminal: scrollback, screen and, via the
     # shell alias below, the shell history. For leaving a machine mid-session; powering
     # off does strictly more.
     (writeShellScriptBin "forget" ''
-      # 2J clears the screen, 3J the scrollback, H homes the cursor; reset restores
-      # whatever state a crashed ceremony might have left
-      printf '\033[2J\033[3J\033[H'
+      # RIS (ESC c) is what clears kmscon's scrollback: its libtsm takes no 3J. 2J clears
+      # the screen, 3J the scrollback of terminals that honour it, H homes the cursor;
+      # reset restores whatever state a crashed ceremony might have left
+      printf '\033c\033[2J\033[3J\033[H'
       tput reset 2>/dev/null || true
     '')
     gnupg
     man
-    mind-the-gap
     openssl
     paperkey
     pwgen
@@ -355,6 +367,10 @@ in
     "/share/bash"
     "/share/man"
   ];
+
+  # The tool itself, its defaults and ceremony empty unless an image sets them through
+  # programs.mind-the-gap.{config,ceremony}
+  programs.mind-the-gap.enable = true;
 
   programs = {
     # Provide some sensible aliases. `forget` must run in the interactive shell itself:

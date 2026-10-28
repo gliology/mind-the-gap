@@ -69,7 +69,7 @@
     # Written to a file rather than piped: under pipefail an early-exiting grep -q would
     # fail the pipeline even though the card is there
     machine.wait_until_succeeds(
-        "mind-the-gap piv status > /tmp/piv-status && grep -q 'Serial: 1592614637' /tmp/piv-status",
+        "mind-the-gap list > /tmp/list && grep -q 'PIV card 1592614637' /tmp/list",
         timeout=120,
     )
 
@@ -80,19 +80,24 @@
         "abandon abandon abandon abandon abandon abandon abandon art"
     )
 
-    # PIV, as in virtual-piv: provision, read back byte for byte without warnings,
-    # converge on a second upload, refuse a wrong subkey id
-    identity = f"-s '{seed}' -n 'Usbip Test'"
+    # PIV, as in virtual-piv: initialize and provision, read back byte for byte without
+    # warnings, converge on a second upload, refuse a wrong subkey id
+    # The card seed's commands take the seed alone, the key seed's the identity's names too
+    secret = f"-s '{seed}'"
+    identity = f"{secret} -n 'Usbip Test'"
+    options = "--app piv"
     card = "-c 1592614637"
-    machine.succeed(
-        f"mind-the-gap {identity} piv upload --pin 471120 --yes {card} -o /tmp/chain.pem"
-    )
+    machine.succeed(f"mind-the-gap init {secret} {options} --pin 471120 --yes {card}")
+    machine.succeed(f"mind-the-gap upload {identity} {options} --yes {card}")
+    machine.succeed(f"mind-the-gap publish {identity} {options} --to /tmp/chain.pem")
     machine.succeed("grep -q 'BEGIN CERTIFICATE' /tmp/chain.pem")
-    machine.succeed(f"mind-the-gap {identity} piv check --pin 471120 {card} 2> /tmp/check.log")
+    machine.succeed(
+        f"mind-the-gap check {identity} {options} --pin 471120 {card} 2> /tmp/check.log"
+    )
     machine.fail("grep -Eq 'Policy mismatch|WARN.*msroots' /tmp/check.log")
-    machine.succeed(f"mind-the-gap {identity} piv upload --pin 471120 --yes {card}")
-    machine.succeed(f"mind-the-gap {identity} piv check --pin 471120 {card}")
-    machine.fail(f"mind-the-gap {identity} -k other piv check --pin 471120 {card}")
+    machine.succeed(f"mind-the-gap upload {identity} {options} --dry-run {card} > /tmp/again")
+    machine.succeed("grep -q 'nothing to change' /tmp/again")
+    machine.fail(f"mind-the-gap check {identity} -k other {options} --pin 471120 {card}")
 
     # The card-level half of the destructive suite on every algorithm: the card signs in
     # 9A, 9C and 9E and agrees or decrypts in 9D, each result compared with the same
@@ -114,15 +119,18 @@
     machine.wait_until_succeeds("usbip attach -r 127.0.0.1 -b 1-1", timeout=60)
     machine.wait_until_succeeds("lsusb -d 20a0:42b2", timeout=60)
     machine.wait_until_succeeds(
-        "mind-the-gap pgp status > /tmp/pgp-status && grep -q 'Card 000F:5EED5EED' /tmp/pgp-status",
+        "mind-the-gap list > /tmp/list && grep -q 'OpenPGP card 000F:5EED5EED' /tmp/list",
         timeout=60,
     )
-    identity = f"-s '{seed}' -n 'Usbip Test' -m usbip@example.com"
+    identity = f"{secret} -n 'Usbip Test' -m usbip@example.com"
+    options = "--app pgp"
     card = "-c 000F:5EED5EED"
-    machine.succeed(f"mind-the-gap {identity} pgp upload --yes {card} -o /tmp/cert.asc")
+    machine.succeed(f"mind-the-gap init {secret} {options} --yes {card}")
+    machine.succeed(f"mind-the-gap upload {identity} {options} --yes {card}")
+    machine.succeed(f"mind-the-gap publish {identity} {options} --to /tmp/cert.asc")
     machine.succeed("grep -q 'BEGIN PGP PUBLIC KEY BLOCK' /tmp/cert.asc")
-    machine.succeed(f"mind-the-gap {identity} pgp check {card}")
-    machine.fail(f"mind-the-gap {identity} -k other pgp check {card}")
+    machine.succeed(f"mind-the-gap check {identity} {options} {card}")
+    machine.fail(f"mind-the-gap check {identity} -k other {options} {card}")
 
     # Then the OpenPGP suite on every algorithm, as in virtual-pgp: provisioning, the card
     # read back independently, every key at work on the card

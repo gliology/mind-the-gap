@@ -86,16 +86,13 @@
 
     # Both cards, each in its own reader
     machine.wait_until_succeeds(
-        "mind-the-gap piv status > /tmp/piv-status && grep -q 'Serial: 5437251' /tmp/piv-status",
-        timeout=120,
-    )
-    machine.wait_until_succeeds(
-        "mind-the-gap pgp status > /tmp/pgp-status && grep -q 'Card 0000:00000000' /tmp/pgp-status",
+        "mind-the-gap list > /tmp/list && grep -q 'PIV card 5437251' /tmp/list "
+        "&& grep -q 'OpenPGP card 0000:00000000' /tmp/list",
         timeout=120,
     )
 
-    # A card is addressable by its reader as well, here the OpenPGP one
-    machine.succeed("grep -q \"Reader: Virtual PCD 00 01\" /tmp/pgp-status")
+    # The listing names each card under its reader, which addresses it as well
+    machine.succeed("grep -A1 '^Virtual PCD 00 01' /tmp/list | grep -q 'OpenPGP card 0000:00000000'")
 
     # Both suites at the same time: the PIV card-level suite on two algorithms, and the
     # OpenPGP suite with its gpg step, which waits for the PIV suite to let go of the

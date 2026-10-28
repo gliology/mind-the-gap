@@ -12,9 +12,21 @@ let
     ]
   );
 
-  # Keeps Cargo.{toml,lock} and every *.rs and *.toml -- build.rs, tests/ and
-  # rustfmt.toml all survive, while docs and nix files are no input to cargo
-  src = craneLib.cleanCargoSource ../.;
+  # The cargo sources: Cargo.{toml,lock} and every *.rs and *.toml, so build.rs, tests/ and
+  # rustfmt.toml survive, but for the hardware harness, whose expectations and results are no
+  # input of the crate and must not rebuild it. Of the book only the option reference, which
+  # a test holds to the command line; every other chapter can change without a rebuild.
+  src =
+    let
+      fs = pkgs.lib.fileset;
+    in
+    fs.toSource {
+      root = ../.;
+      fileset = fs.unions [
+        (fs.difference (fs.fromSource (craneLib.cleanCargoSource ../.)) ../harness)
+        ../docs/options-reference.md
+      ];
+    };
 
   commonArgs = {
     inherit src;
@@ -51,6 +63,7 @@ let
       name,
       test,
       tools ? [ ],
+      wrapperArgs ? [ ],
     }:
     craneLib.buildPackage (
       commonArgs
@@ -70,7 +83,9 @@ let
           cp "$(find target/release/deps -maxdepth 1 -type f -executable -name '${test}-*')" \
             $out/bin/${name}-suite
           wrapProgram "$out/bin/${name}-suite" --prefix LD_LIBRARY_PATH : "${libPath}" \
-            --prefix PATH : "${pkgs.lib.makeBinPath tools}"
+            --prefix PATH : "${pkgs.lib.makeBinPath tools}"${
+              pkgs.lib.optionalString (wrapperArgs != [ ]) " ${pkgs.lib.escapeShellArgs wrapperArgs}"
+            }
         '';
       }
     );
@@ -187,5 +202,27 @@ in
     name = "pgp";
     test = "pgp_hardware";
     tools = [ pkgs.gnupg ];
+  };
+
+  # The PIV suite as real cards run it, through the hardware test harness: with the tools
+  # of its end-use steps in the build, so that build.rs enables them, and on its path with
+  # the modules they load, as the dev shell has them
+  pivHardwareSuite = mkSuite {
+    name = "piv-hardware";
+    test = "piv_hardware";
+    tools = [
+      pkgs.openssl
+      pkgs.opensc
+      pkgs.openssh
+      pkgs.nss.tools
+    ];
+    wrapperArgs = [
+      "--set"
+      "PKCS11_MODULE"
+      "${pkgs.opensc}/lib/opensc-pkcs11.so"
+      "--set"
+      "OPENSSL_PKCS11_PROVIDER"
+      "${pkgs.pkcs11-provider}/lib/ossl-modules/pkcs11.so"
+    ];
   };
 }

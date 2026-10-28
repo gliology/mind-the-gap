@@ -18,3 +18,6 @@
 
 # Python bytecode from running the asset exporter in place
 __pycache__/
+
+# The serials of the spare cards the hardware harness may reset, by name: local only
+/.env

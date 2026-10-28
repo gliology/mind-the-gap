@@ -1,0 +1,21 @@
+# Written by `nix run .#hardware-tests`; committing it makes it the official run.
+
+card = "yubikey-5.7"
+name = "YubiKey 5 series, firmware 5.7"
+reader = "Yubico YubiKey FIDO+CCID"
+firmware = "5.7.4"
+openpgp = "3.4"
+applet = "OpenPGP"
+suite = "touch-free"
+date = "2026-10-23"
+tool = "1.0.0-rc.1"
+commit = "ed4c508"
+
+[tests]
+"provision_and_verify_card" = { expected = "pass", outcome = "pass" }
+"provision_and_verify_p256_card" = { expected = "pass", outcome = "pass" }
+"provision_and_verify_rsa_cards" = { expected = "pass", outcome = "pass" }
+"upload_in_place" = { expected = "pass", outcome = "pass" }
+"rotate_in_place" = { expected = "pass", outcome = "pass" }
+"change_user_pin" = { expected = "pass", outcome = "pass" }
+"touch_is_enforced" = { expected = "skip: needs a card whose touch the test refuses, a virtual one", outcome = "skipped" }

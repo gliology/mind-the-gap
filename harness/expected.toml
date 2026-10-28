@@ -1,0 +1,181 @@
+# What every card is expected to do in the hardware suites, and what every simulated card
+# covers. `nix run .#hardware-tests` compares each run with this file and records both in
+# harness/results/; a result that differs from its expectation is reported either way, a
+# failure where a pass was expected and a pass where a refusal was, so this file is changed
+# deliberately and never drifts.
+#
+# Outcomes of a test on a card:
+#   "pass"            the test passes
+#   "refused"         the card is turned away before anything is written: the test fails,
+#                     and says the card was not touched
+#   "skip: <reason>"  not run on this card, and why
+#
+# A card is named here as in the local .env, which holds its serial (see
+# docs/hardware-tests.md); the results in the repository name the card and its firmware,
+# never its serial.
+
+# ---------------------------------------------------------------- physical cards
+
+[cards."yubikey-5.7"]
+name = "YubiKey 5 series, firmware 5.7"
+# The firmware the card has to report, as a prefix; another one is refused before any test
+firmware = "5.7."
+
+[cards."yubikey-5.7".piv]
+provision_and_verify_card = "pass"
+provision_and_verify_p256_card = "skip: the checklist above is P-256, end use included"
+provision_and_verify_curve25519_card = "pass"
+provision_and_verify_p384_card = "pass"
+provision_and_verify_rsa2048_card = "pass"
+provision_and_verify_rsa3072_card = "pass"
+provision_and_verify_rsa4096_card = "pass"
+upload_in_place = "pass"
+rotate_in_place = "pass"
+change_user_pin = "pass"
+touch_is_enforced = "skip: needs a card whose touch the test refuses, a virtual one"
+
+[cards."yubikey-5.7".pgp]
+provision_and_verify_card = "pass"
+provision_and_verify_p256_card = "pass"
+provision_and_verify_rsa_cards = "pass"
+upload_in_place = "pass"
+rotate_in_place = "pass"
+change_user_pin = "pass"
+touch_is_enforced = "skip: needs a card whose touch the test refuses, a virtual one"
+
+[cards."yubikey-5.4"]
+name = "YubiKey 5 series, firmware 5.4"
+firmware = "5.4."
+
+[cards."yubikey-5.4".piv]
+provision_and_verify_card = "pass"
+provision_and_verify_p256_card = "skip: the checklist above is P-256, end use included"
+provision_and_verify_curve25519_card = "refused"
+provision_and_verify_p384_card = "pass"
+provision_and_verify_rsa2048_card = "pass"
+provision_and_verify_rsa3072_card = "refused"
+provision_and_verify_rsa4096_card = "refused"
+upload_in_place = "pass"
+rotate_in_place = "pass"
+change_user_pin = "pass"
+touch_is_enforced = "skip: needs a card whose touch the test refuses, a virtual one"
+
+[cards."yubikey-5.4".pgp]
+provision_and_verify_card = "pass"
+provision_and_verify_p256_card = "pass"
+provision_and_verify_rsa_cards = "pass"
+upload_in_place = "pass"
+rotate_in_place = "pass"
+change_user_pin = "pass"
+touch_is_enforced = "skip: needs a card whose touch the test refuses, a virtual one"
+
+[cards."yubikey-4"]
+name = "YubiKey 4 series, firmware 4.3"
+firmware = "4.3."
+
+[cards."yubikey-4".piv]
+provision_and_verify_card = "pass"
+provision_and_verify_p256_card = "skip: the checklist above is P-256, end use included"
+provision_and_verify_curve25519_card = "refused"
+provision_and_verify_p384_card = "pass"
+provision_and_verify_rsa2048_card = "pass"
+provision_and_verify_rsa3072_card = "refused"
+provision_and_verify_rsa4096_card = "refused"
+upload_in_place = "pass"
+rotate_in_place = "pass"
+change_user_pin = "pass"
+touch_is_enforced = "skip: needs a card whose touch the test refuses, a virtual one"
+
+# OpenPGP card 2.1: RSA keys only, so every test on the default Curve25519 is refused
+[cards."yubikey-4".pgp]
+provision_and_verify_card = "refused"
+provision_and_verify_p256_card = "refused"
+provision_and_verify_rsa_cards = "pass"
+upload_in_place = "refused"
+rotate_in_place = "refused"
+change_user_pin = "refused"
+touch_is_enforced = "skip: needs a card whose touch the test refuses, a virtual one"
+
+[cards."lpc55s69-evk"]
+name = "LPCXpresso55S69 dev kit, Solo 2 firmware (hw/solo2, card image)"
+firmware = ""
+
+[cards."lpc55s69-evk".piv]
+provision_and_verify_card = "pass"
+provision_and_verify_p256_card = "skip: the checklist above is P-256, end use included"
+provision_and_verify_curve25519_card = "pass"
+provision_and_verify_p384_card = "pass"
+provision_and_verify_rsa2048_card = "pass"
+provision_and_verify_rsa3072_card = "pass"
+provision_and_verify_rsa4096_card = "pass"
+upload_in_place = "pass"
+rotate_in_place = "pass"
+change_user_pin = "pass"
+touch_is_enforced = "skip: needs a card whose touch the test refuses, a virtual one"
+
+[cards."lpc55s69-evk".pgp]
+provision_and_verify_card = "pass"
+provision_and_verify_p256_card = "pass"
+provision_and_verify_rsa_cards = "pass"
+upload_in_place = "pass"
+rotate_in_place = "pass"
+change_user_pin = "pass"
+touch_is_enforced = "skip: needs a card whose touch the test refuses, a virtual one"
+
+# ---------------------------------------------------------------- simulated cards
+#
+# A check is a NixOS VM that provisions the card end to end and passes or fails as a
+# whole; `covers` is what it asserts, by algorithm, as the check's own script spells out:
+# "pass" provisioned and used, "refused" turned away before the reset, "open" possible but
+# not run yet, "-" not offered; a note in parentheses narrows it.
+# `sources` name the flake inputs and nixpkgs packages the card is built from, whose
+# revisions every run records.
+
+[simulated.virtual-piv]
+card = "piv-authenticator over vpcd"
+applet = "PIV"
+sources = ["piv-authenticator", "nixpkgs:vsmartcard-vpcd"]
+checks = ["virtual-piv", "virtual-piv-p384", "virtual-piv-curve25519", "virtual-piv-rsa2048", "virtual-piv-rsa3072", "virtual-piv-rsa4096"]
+covers = { p256 = "pass", p384 = "pass", curve25519 = "pass", rsa2048 = "pass", rsa3072 = "pass", rsa4096 = "pass", touch = "pass (P-256)" }
+
+[simulated.virtual-piv-builder]
+card = "piv-authenticator over vpcd, unattended host profile"
+applet = "PIV"
+sources = ["piv-authenticator", "nixpkgs:vsmartcard-vpcd"]
+checks = ["virtual-piv-builder", "virtual-piv-builder-tdes"]
+covers = { p256 = "-", p384 = "pass", curve25519 = "-", rsa2048 = "-", rsa3072 = "-", rsa4096 = "-", touch = "-" }
+
+[simulated.virtual-pgp]
+card = "opcard over vpcd"
+applet = "OpenPGP"
+sources = ["opcard", "nixpkgs:vsmartcard-vpcd"]
+checks = ["virtual-pgp"]
+covers = { p256 = "pass", p384 = "-", curve25519 = "pass", rsa2048 = "pass", rsa3072 = "pass", rsa4096 = "pass", touch = "pass" }
+
+[simulated.virtual-parallel]
+card = "piv-authenticator and opcard over two vpcd readers, both suites at once"
+applet = "PIV and OpenPGP"
+sources = ["piv-authenticator", "opcard", "nixpkgs:vsmartcard-vpcd"]
+checks = ["virtual-parallel"]
+covers = { p256 = "pass", p384 = "-", curve25519 = "pass (OpenPGP)", rsa2048 = "pass (PIV)", rsa3072 = "-", rsa4096 = "-", touch = "-" }
+
+[simulated.usbip-nk3]
+card = "Nitrokey 3 firmware over USB/IP"
+applet = "PIV and OpenPGP"
+sources = ["nitrokey-3-firmware", "usbip-device"]
+checks = ["usbip-nk3"]
+covers = { p256 = "pass", p384 = "pass", curve25519 = "pass", rsa2048 = "pass", rsa3072 = "pass", rsa4096 = "pass", touch = "open" }
+
+[simulated.usbip-gnuk]
+card = "Gnuk emulation over USB/IP"
+applet = "OpenPGP"
+sources = ["gnuk"]
+checks = ["usbip-gnuk"]
+covers = { p256 = "refused", p384 = "-", curve25519 = "pass", rsa2048 = "refused", rsa3072 = "refused", rsa4096 = "refused", touch = "open" }
+
+[simulated.canokey]
+card = "CanoKey emulated by QEMU"
+applet = "PIV and OpenPGP"
+sources = ["nixpkgs:canokey-qemu", "nixpkgs:qemu"]
+checks = ["canokey"]
+covers = { p256 = "pass", p384 = "pass", curve25519 = "pass", rsa2048 = "pass", rsa3072 = "pass", rsa4096 = "pass", touch = "-" }

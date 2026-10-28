@@ -1,0 +1,15 @@
+# Written by `nix run .#hardware-tests`; committing it makes it the official run.
+
+system = "x86_64-linux"
+date = "2026-10-23"
+tool = "1.0.0-rc.1"
+commit = "a971afb"
+
+[cards]
+"virtual-piv" = { outcome = "pass", checks = "virtual-piv pass, virtual-piv-p384 pass, virtual-piv-curve25519 pass, virtual-piv-rsa2048 pass, virtual-piv-rsa3072 pass, virtual-piv-rsa4096 pass", sources = "FlorianFranzen/piv-authenticator mind-the-gap @ edad62b10b29; vsmartcard-vpcd 0.10 (nixpkgs @ c508844df6c2)" }
+"virtual-piv-builder" = { outcome = "pass", checks = "virtual-piv-builder pass, virtual-piv-builder-tdes pass", sources = "FlorianFranzen/piv-authenticator mind-the-gap @ edad62b10b29; vsmartcard-vpcd 0.10 (nixpkgs @ c508844df6c2)" }
+"virtual-pgp" = { outcome = "pass", checks = "virtual-pgp pass", sources = "FlorianFranzen/opcard-rs mind-the-gap @ 5f2553697a01; vsmartcard-vpcd 0.10 (nixpkgs @ c508844df6c2)" }
+"virtual-parallel" = { outcome = "pass", checks = "virtual-parallel pass", sources = "FlorianFranzen/piv-authenticator mind-the-gap @ edad62b10b29; FlorianFranzen/opcard-rs mind-the-gap @ 5f2553697a01; vsmartcard-vpcd 0.10 (nixpkgs @ c508844df6c2)" }
+"usbip-nk3" = { outcome = "pass", checks = "usbip-nk3 pass", sources = "FlorianFranzen/nitrokey-3-firmware mind-the-gap @ f3419f975553; FlorianFranzen/usbip-device mind-the-gap @ dcda71e2cb2f" }
+"usbip-gnuk" = { outcome = "pass", checks = "usbip-gnuk pass", sources = "https://salsa.debian.org/gnuk-team/gnuk/gnuk.git release/2.2 @ de9652726b1c" }
+"canokey" = { outcome = "pass", checks = "canokey pass", sources = "canokey-qemu 0-unstable-2026-03-24 (nixpkgs @ c508844df6c2); qemu 10.2.4 (nixpkgs @ c508844df6c2)" }
