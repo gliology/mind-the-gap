@@ -53,6 +53,27 @@ What the virtual card cannot cover is exactly what the manual checklist and the
 destructive suites exist for: real readers and their quirks, touch prompts, and the
 vendor extensions above.
 
+### A missed touch reads as a bad PIN
+
+The OpenPGP card specification (3.4.1, §4.4.3.6) answers an operation whose touch never
+came with status `6600`, which GnuPG reports as a timeout. opcard 1.11.0, the Nitrokey 3's
+implementation, answers it with `6982`, security status not satisfied, after about 15
+seconds (`src/command/pso.rs`, which carries a FIXME saying so, and the timeout in
+`src/backend.rs`). GnuPG maps `6982` to `Bad PIN`. A missed touch on a Nitrokey 3
+therefore looks like a wrong PIN, which a user or a script must not answer by trying the
+PIN again.
+
+The two are told apart by time and by the log, not by the message:
+
+| scdaemon's log | after the request | meaning |
+| --- | --- | --- |
+| `verify CHV2 failed: Bad PIN` | at once | a wrong PIN, and a try is spent |
+| `app_auth failed: Bad PIN` alone | about 15 s | the touch didn't come |
+| `app_auth failed: Bad PIN` alone | at once | the card lost its verified PIN, for example after a reset; the next attempt sends a real VERIFY |
+
+Only the first one costs a try. In the other two nothing was spent, and the user simply
+touches or re-enters the PIN next time.
+
 ## The virtual PIV check
 
 Since the fork of trussed's
