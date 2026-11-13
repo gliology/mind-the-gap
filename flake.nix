@@ -248,6 +248,10 @@
               "/share/man"
             ];
           };
+
+          # - The virtual cards of the checks, for other flakes' VM tests to provision the
+          #   same way
+          inherit (perSystem.${system}.cards) opcard-vpicc piv-vpicc;
         }
       );
     };
