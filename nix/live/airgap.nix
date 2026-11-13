@@ -89,5 +89,8 @@
     "nls_cp437"
     "nls_iso8859-1"
     "btrfs"
+    # btrfs's checksums come from the crypto API (its softdep, crc32c_cryptoapi since 6.15),
+    # which no mount can load once the lock is on: without it no btrfs mounts at all
+    "crc32c"
   ];
 }
