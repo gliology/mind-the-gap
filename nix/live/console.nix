@@ -12,8 +12,8 @@
   options.mind-the-gap.banner = lib.mkOption {
     type = lib.types.lines;
     description = ''
-      The pre-login reminder, shown by the serial gettys and printed by interactive login
-      shells on kmscon, which runs no getty. The VT and kmscon both speak truecolor escapes.
+      The pre-login reminder, in /etc/issue: the serial gettys show it before login, and
+      kmscon shows it above its session. The VT and kmscon both speak truecolor escapes.
     '';
   };
 
@@ -60,12 +60,8 @@
       extraConfig = "font-size=12";
     };
 
-    # The gettys (serial console) show the banner before login; kmscon runs no getty, so
-    # interactive shells print it themselves once per login.
+    # The banner, in /etc/issue: the gettys (serial console) show it before login, and
+    # kmscon (9.x) shows it as well, so no shell prints it again
     services.getty.helpLine = config.mind-the-gap.banner;
-    environment.loginShellInit = ''
-          cat <<'BANNER'
-      ${config.mind-the-gap.banner}BANNER
-    '';
   };
 }
