@@ -183,17 +183,41 @@
         inherit (self.packages.${prev.stdenv.hostPlatform.system}) mind-the-gap;
       };
 
-      # The NixOS module: the package, and the defaults and ceremony a machine ships with
-      nixosModules.default = {
-        imports = [ ./nix/module.nix ];
-        nixpkgs.overlays = [ self.overlays.default ];
+      # The NixOS module: the package, and the defaults and ceremony a machine ships with.
+      # Beside it the live system and its parts, for hosts of their own: an installed
+      # air-gapped machine takes airgap, hardening, smartcards, console and tools, and leaves
+      # the live image's account, autologin and missing nix daemon to the image
+      nixosModules = {
+        # Provides pkgs.mind-the-gap; keyed, so importing several parts adds it once
+        overlay = {
+          key = "mind-the-gap#overlay";
+          nixpkgs.overlays = [ self.overlays.default ];
+        };
+        default.imports = [
+          self.nixosModules.overlay
+          ./nix/module.nix
+        ];
+
+        airgap = ./nix/live/airgap.nix;
+        hardening = ./nix/live/hardening.nix;
+        smartcards = ./nix/live/smartcards.nix;
+        console = ./nix/live/console.nix;
+        tools.imports = [
+          self.nixosModules.overlay
+          ./nix/live/tools.nix
+        ];
+
+        live.imports = [
+          self.nixosModules.overlay
+          ./nix/live/system.nix
+        ];
       };
 
       # Buildable outputs are:
       packages = forEachSystem (
         system:
         let
-          inherit (perSystem.${system}) rust docs;
+          inherit (perSystem.${system}) pkgs rust docs;
         in
         {
           # - Provide command line interface as default package
@@ -212,6 +236,18 @@
 
           # - Build the command line interface with crane
           mind-the-gap = rust.package;
+
+          # - The ceremony tools as one environment, for a host that receives them as a
+          #   profile of their own rather than in its system
+          tools = pkgs.buildEnv {
+            name = "mind-the-gap-tools-${rust.package.version}";
+            paths = [ rust.package ] ++ import ./nix/live/tool-packages.nix pkgs;
+            pathsToLink = [
+              "/bin"
+              "/share/bash-completion"
+              "/share/man"
+            ];
+          };
         }
       );
     };
